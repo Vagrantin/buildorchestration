@@ -1,0 +1,13 @@
+[Unit]
+Description=XCP-ng Agentic Orchestration Automation Run
+After=network-online.target ollama.service
+
+[Service]
+Type=oneshot
+User=root
+# Securely injects GitHub API Token using systemd sandbox file allocation
+LoadCredential=GH_TOKEN:/etc/xcp-orchestrator/github.token
+ExecStart=/usr/local/bin/xcp-orchestrator
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+# ==========================================================
+#  Infrastructure & Target VM Configuration Variables
+# ==========================================================
+
+# XCP-ng Hypervisor Connection
+XCPNG_IP="192.168.0.1"
+XCPNG_USER="root"
+XCPNG_PASSWORD="MYSTRONGXCPPASSWORD"
+SR_NAME="Local storage"
+VM_NETWORK_NAME="LAN"
+
+# Target Orchestrator VM Specifications
+VM_NAME="xcp-ai-orchestrator"
+VM_CPU_COUNT=8
+VM_MEMORY_MB=16384  # 16GB Allocation
+VM_DISK_SIZE_MB=51200 # 50GB Space
+
+# Target VM OS Security Accounts
+DEBIAN_ROOT_PASSWORD="MYSTRONGDebianPassw0rd"
+DEBIAN_SUDO_USER="orchestrator"
+DEBIAN_USER_PASSWORD="MYSTRONGUserPassw0rd"
+
+
+# Installation Media (Debian 13 Netinst)
+DEBIAN_ISO_URL="${DEBIAN_ISO_URL:-https://ftp.jaist.ac.jp/pub/Linux/debian-cd/current/amd64/iso-cd/debian-13.5.0-amd64-netinst.iso}"

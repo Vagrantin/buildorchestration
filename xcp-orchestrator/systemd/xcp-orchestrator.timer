@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger XCP-ng Agentic Orchestration Daily at 5 AM
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+Unit=xcp-orchestrator.service
+
+[Install]
+WantedBy=timers.target

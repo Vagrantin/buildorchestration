@@ -1,0 +1,153 @@
+# XCP-ng Agentic Automation Pipeline Suite
+
+An automated end-to-end framework designed to build, provision, and orchestrate containerized platform layers and system appliances for **XCP-ng Home-laber Edition**.
+
+The architecture consists of two key components:
+
+1. **Host Provisioner (`/orchestratorhost`)**: Uses HashiCorp Packer to build a specialized, headless Debian VM on an XCP-ng hypervisor, pre-configured with GPU-passthrough compute stacks (NVIDIA drivers, CUDA), Docker, and a local Ollama instance running specialized LLMs.
+2. **Orchestration Agent (`/xcp-orchestrator`)**: A Rust daemon that runs as a systemd service triggered by a daily cron loop. It orchestrates downstream builds via the GitHub Actions API, monitors pipelines concurrently, processes log traces via local AI inference if faults occur, and generates an updated monitoring dashboard.
+
+---
+
+## Directory Tree Structure
+
+```text
+.
+├── LICENSE
+├── orchestratorhost/
+│   ├── build.config.sample     # Infrastructure and security credentials layout
+│   └── build-orchestrator.sh   # Packer HCL automation script (NVIDIA + Docker + Ollama setup)
+└── xcp-orchestrator/
+    ├── Cargo.lock
+    ├── Cargo.toml
+    ├── deploy.sh               # Compilation and local systemd unit deployment script
+    ├── src/
+    │   └── main.rs             # Core Rust orchestrator and local AI analyzer engine
+    └── systemd/
+        ├── xcp-orchestrator.service   # Oneshot runtime systemd configuration
+        └── xcp-orchestrator.timer     # Daily 5:00 AM automation loop timer
+
+```
+
+---
+
+## Architecture & Automated Pipeline Flow
+
+1. **Daily Trigger**: The systemd timer executes `xcp-orchestrator.service` every morning at `05:00 AM`.
+2. **Parallel Upstream Trigger**: The Rust agent reads a local GitHub token asset, sends authenticated `workflow_dispatch` API signals concurrently to independent repositories (`xolite-ce` and `xoa-proxy`), and hooks their specific remote run contexts.
+3. **State Monitoring**: The daemon polls both workflows every 20 seconds.
+4. **Agentic Diagnostics Fallback**: If either compilation pipeline crashes on the GitHub Actions runners, the agent intercepts the failure state, pulls the last 250 lines of raw standard error/output logs from the failed job via API, and targets a local inference call to Ollama (`qwen3-coder:30b`). The local model diagnoses the compilation problem and writes an actionable fix.
+5. **Downstream Execution**: If the code bases build successfully, the agent proceeds to trigger the third stage (`xcp-ng-ce-iso`) to compile and package the custom bootable deployment media.
+6. **Dashboard Export**: Current execution records are stored locally at `/var/lib/xcp-hl-orchestrator/history.json`, and an status report dashboard is rendered directly to `/var/www/html/orchestrator/build_report.html`.
+
+---
+
+## Initial Configuration Setup
+
+Before deploying the host or daemon, copy `build.config.sample` to a configuration file named `build.config` within the `orchestratorhost/` directory and configure your infrastructure metrics:
+
+```bash
+# XCP-ng Hypervisor Connection
+XCPNG_IP="192.168.0.1"
+XCPNG_USER="root"
+XCPNG_PASSWORD="YOUR_SECRET_HYPERVISOR_PASSWORD"
+SR_NAME="Local storage"
+VM_NETWORK_NAME="LAN"
+
+# Target Orchestrator VM Hardware Specs
+VM_NAME="xcp-ai-orchestrator"
+VM_CPU_COUNT=8
+VM_MEMORY_MB=16384     # 16GB Allocation
+VM_DISK_SIZE_MB=51200   # 50GB Space
+
+# Target VM OS Security Accounts
+DEBIAN_ROOT_PASSWORD="YOUR_SECURE_ROOT_PASSWORD"
+DEBIAN_SUDO_USER="orchestrator"
+DEBIAN_USER_PASSWORD="YOUR_SECURE_USER_PASSWORD"
+
+# Installation Media Source
+DEBIAN_ISO_URL="${DEBIAN_ISO_URL:-https://ftp.jaist.ac.jp/pub/Linux/debian-cd/current/amd64/iso-cd/debian-13.5.0-amd64-netinst.iso}"
+
+```
+
+---
+
+## Component Deployment
+
+### 1. Provisioning the Host Environment (`orchestratorhost`)
+
+Run this provisioning block directly from your local control station. It verifies requirements, updates local configurations for system image templates, automatically downloads the `ddelnano/xenserver` plugin for HashiCorp Packer, extracts safe image checksum matrices, and starts execution.
+
+```bash
+cd orchestratorhost/
+chmod +x build-orchestrator.sh
+./build-orchestrator.sh
+
+```
+
+**What this installs automatically on the target VM:**
+
+* Core packages (`openssh-server`, `sudo`, `curl`, `wget`, `jq`, `build-essential`).
+* Official XCP-ng Guest Utilities (`xe-guest-utilities`).
+* Production NVIDIA Linux Non-Free drivers and native `nvidia-cuda-toolkit` for full physical GPU virtualization/passthrough compute access.
+* Modern Docker Enterprise Engine runtime and system toolchains.
+* Active localized `ollama` server container instance preloaded with the `qwen3-coder:30b` execution image.
+
+---
+
+### 2. Deploying the Rust Automation Daemon (`xcp-orchestrator`)
+
+Log into your newly created orchestration host environment, clone this repository tree, and initiate the deployment handler:
+
+```bash
+cd xcp-orchestrator/
+chmod +x deploy.sh
+./deploy.sh
+
+```
+
+The script will compile the native binary payload with release optimizations, migrate runtime assets into local binary trees, request a valid GitHub Personal Access Token (PAT) with repository access rights if one isn't already stored, structure secure system directories, and activate the systemd timer loops.
+
+#### GitHub Token Permissions Checklist
+
+Ensure that the token used has accurate access bounds. The application requires Read and Write access to **Actions** and Read-only access to **Metadata** across your targeted infrastructure projects (`xcp-ng-ce-iso`, `xoa-proxy`, `xolite-ce`).
+
+---
+
+## Operational Management
+
+### Monitor Automation Timers
+
+To ensure the automated schedule is loaded and active:
+
+```bash
+systemctl status xcp-orchestrator.timer
+
+```
+
+### Force an Immediate Manual Pipeline Run
+
+To bypass the cron timer and trigger an orchestration cycle immediately:
+
+```bash
+sudo systemctl start xcp-orchestrator.service
+
+```
+
+### Inspect Live Pipeline Execution Traces
+
+To tail runtime automation logs and monitor active API dispatches:
+
+```bash
+journalctl -u xcp-orchestrator.service -f
+
+```
+
+### Accessing the Dashboard Reports
+
+The agent automatically outputs static analytics reports directly onto your local HTTP directory structure. You can view progress charts and AI diagnostics summaries by pointing your browser to:
+
+```text
+http://<YOUR_ORCHESTRATOR_IP>/orchestrator/build_report.html
+
+```
