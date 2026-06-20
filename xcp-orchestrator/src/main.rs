@@ -198,24 +198,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tag = format!("v{}-ce1", upstream_version);
             version_state.xolite_ce.upstream_version = upstream_version;
             version_state.xolite_ce.ce_counter = 1;
-            create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
-            let (id, url) = locate_tag_triggered_run(&client, "xolite-ce", &tag, trigger_time).await?;
+            let actual_tag = create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
+            let (id, url) = locate_tag_triggered_run(&client, "xolite-ce", &actual_tag, trigger_time).await?;
             state.xolite_id = Some(id);
             state.xolite_url = url;
             state.xolite_status = "In Progress".to_string();
             xolite_head_sha = head_sha;
-            xolite_tag = Some(tag);
+            xolite_tag = Some(actual_tag);
         }
         Ok((head_sha, BumpDecision::PatchBump { upstream_version, next_counter })) => {
             let tag = format!("v{}-ce{}", upstream_version, next_counter);
             version_state.xolite_ce.ce_counter = next_counter;
-            create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
-            let (id, url) = locate_tag_triggered_run(&client, "xolite-ce", &tag, trigger_time).await?;
+            let actual_tag = create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
+            let (id, url) = locate_tag_triggered_run(&client, "xolite-ce", &actual_tag, trigger_time).await?;
             state.xolite_id = Some(id);
             state.xolite_url = url;
             state.xolite_status = "In Progress".to_string();
             xolite_head_sha = head_sha;
-            xolite_tag = Some(tag);
+            xolite_tag = Some(actual_tag);
         }
         Err(e) => {
             println!("⚠ xolite-ce bump detection failed: {}. Skipping build this run.", e);
@@ -289,11 +289,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iso_tag = format!("v{}-ce{}", XCPNG_TARGET_VERSION, next_counter);
 
             let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
-            create_and_push_tag(&client, "xcp-ng-ce-iso", &iso_tag, &iso_head_sha).await?;
+            let actual_iso_tag = create_and_push_tag(&client, "xcp-ng-ce-iso", &iso_tag, &iso_head_sha).await?;
 
             let post_iso_trigger = Utc::now();
             let (iso_id, iso_url) =
-                locate_tag_triggered_run(&client, "xcp-ng-ce-iso", &iso_tag, post_iso_trigger).await?;
+                locate_tag_triggered_run(&client, "xcp-ng-ce-iso", &actual_iso_tag, post_iso_trigger).await?;
             state.iso_id = Some(iso_id);
             state.iso_url = iso_url;
             state.iso_status = "In Progress".to_string();
@@ -308,14 +308,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if state.iso_status == "success" {
                 version_state.iso.xcpng_version = XCPNG_TARGET_VERSION.to_string();
                 version_state.iso.ce_counter = next_counter;
-                version_state.iso.last_tag = iso_tag.clone();
+                version_state.iso.last_tag = actual_iso_tag.clone();
                 version_state.iso.last_xolite_tag = xolite_version.clone();
                 version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
                 save_version_state(&version_state)?;
 
                 if let Err(e) = append_release_matrix_entry(
                     &client,
-                    &iso_tag,
+                    &actual_iso_tag,
                     &xolite_version,
                     &version_state.xolite_ce.upstream_version,
                     &xoa_proxy_version,
@@ -367,21 +367,64 @@ async fn dispatch_and_locate(client: &reqwest::Client, repo: &str, workflow: &st
 async fn create_and_push_tag(
     client: &reqwest::Client,
     repo: &str,
-    tag: &str,
+    base_tag: &str,
     sha: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("https://api.github.com/repos/{}/{}/git/refs", OWNER, repo);
-    let payload = serde_json::json!({
-        "ref": format!("refs/tags/{}", tag),
-        "sha": sha,
-    });
-    let res = client.post(&url).json(&payload).send().await?;
-    if !res.status().is_success() {
-        let body = res.text().await.unwrap_or_default();
+) -> Result<String, Box<dyn std::error::Error>> {
+    // If the base_tag already exists, increment the counter suffix until
+    // we find one that doesn't. Caps at 99 to prevent infinite loops.
+    let mut tag = base_tag.to_string();
+    let mut attempt = 0;
+    const MAX_ATTEMPTS: u32 = 99;
+
+    loop {
+        let url = format!("https://api.github.com/repos/{}/{}/git/refs", OWNER, repo);
+        let payload = serde_json::json!({
+            "ref": format!("refs/tags/{}", tag),
+            "sha": sha,
+        });
+        let res = client.post(&url).json(&payload).send().await?;
+
+        if res.status().is_success() {
+            println!("▶ Pushed tag {} on {} (sha {})", tag, repo, &sha[..7.min(sha.len())]);
+            return Ok(tag);
+        }
+
+        let status = res.status();
+        let body = res.text().await?;
+
+        // "Reference already exists" means the tag is already taken — increment and retry
+        if status == 422 && body.contains("Reference already exists") {
+            attempt += 1;
+            if attempt >= MAX_ATTEMPTS {
+                return Err(format!(
+                    "Failed to create tag on {}: tried {} through {} (all exist), giving up",
+                    repo, base_tag, tag
+                )
+                .into());
+            }
+
+            // Parse base_tag to extract and increment the counter.
+            // Expected format: "v8.3-ce1" or "v0.22.0-ce3" → extract the ce number and increment.
+            if let Some(ce_pos) = tag.rfind("-ce") {
+                let prefix = &tag[..ce_pos + 3]; // "v8.3-ce"
+                let counter_str = &tag[ce_pos + 3..]; // "1"
+                if let Ok(counter) = counter_str.parse::<u32>() {
+                    tag = format!("{}{}", prefix, counter + 1);
+                    println!("⚠ Tag {} already exists, retrying with {}", &tag[..tag.len()-1], tag);
+                    continue;
+                }
+            }
+            // If we can't parse the counter, fail with a clearer message
+            return Err(format!(
+                "Tag {} already exists and could not parse counter suffix to increment",
+                tag
+            )
+            .into());
+        }
+
+        // Any other error (404 on repo, 403 permission, etc.)
         return Err(format!("Failed to create tag {} on {}: {}", tag, repo, body).into());
     }
-    println!("▶ Pushed tag {} on {} (sha {})", tag, repo, &sha[..7.min(sha.len())]);
-    Ok(())
 }
 
 /// Like dispatch_and_locate, but for workflows triggered by a tag push rather
