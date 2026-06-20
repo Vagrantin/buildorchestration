@@ -288,41 +288,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let iso_tag = format!("v{}-ce{}", XCPNG_TARGET_VERSION, next_counter);
 
-            let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
-            let actual_iso_tag = create_and_push_tag(&client, "xcp-ng-ce-iso", &iso_tag, &iso_head_sha).await?;
+            // Everything in this block can fail mid-flight (tag creation, run
+            // location, or the monitoring loop's API calls). Previously these
+            // used `?` directly, which unwinds straight out of main() on
+            // failure — skipping write_history_and_render_dashboard()
+            // entirely, so a Phase 3 error left no trace in build_report.html.
+            // Capturing the Result locally and falling through to the
+            // dashboard write either way fixes that, mirroring the pattern
+            // already used for xolite-ce's bump-detection failure in Phase 1.
+            let iso_build_result: Result<(u64, String, String), Box<dyn std::error::Error>> = async {
+                let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
+                let actual_iso_tag =
+                    create_and_push_tag(&client, "xcp-ng-ce-iso", &iso_tag, &iso_head_sha).await?;
 
-            let post_iso_trigger = Utc::now();
-            let (iso_id, iso_url) =
-                locate_tag_triggered_run(&client, "xcp-ng-ce-iso", &actual_iso_tag, post_iso_trigger).await?;
-            state.iso_id = Some(iso_id);
-            state.iso_url = iso_url;
-            state.iso_status = "In Progress".to_string();
+                let post_iso_trigger = Utc::now();
+                let (iso_id, iso_url) =
+                    locate_tag_triggered_run(&client, "xcp-ng-ce-iso", &actual_iso_tag, post_iso_trigger).await?;
 
-            loop {
-                sleep(Duration::from_secs(30)).await;
-                state.iso_status = query_run_conclusion(&client, "xcp-ng-ce-iso", state.iso_id.unwrap()).await?;
-                println!("Current ISO State -> {}", state.iso_status);
-                if state.iso_status != "In Progress" { break; }
+                Ok((iso_id, iso_url, actual_iso_tag))
             }
+            .await;
 
-            if state.iso_status == "success" {
-                version_state.iso.xcpng_version = XCPNG_TARGET_VERSION.to_string();
-                version_state.iso.ce_counter = next_counter;
-                version_state.iso.last_tag = actual_iso_tag.clone();
-                version_state.iso.last_xolite_tag = xolite_version.clone();
-                version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
-                save_version_state(&version_state)?;
+            match iso_build_result {
+                Err(e) => {
+                    println!("⚠ xcp-ng-ce-iso build failed to start: {}", e);
+                    state.iso_status = format!("Error: {}", e);
+                }
+                Ok((iso_id, iso_url, actual_iso_tag)) => {
+                    state.iso_id = Some(iso_id);
+                    state.iso_url = iso_url;
+                    state.iso_status = "In Progress".to_string();
 
-                if let Err(e) = append_release_matrix_entry(
-                    &client,
-                    &actual_iso_tag,
-                    &xolite_version,
-                    &version_state.xolite_ce.upstream_version,
-                    &xoa_proxy_version,
-                )
-                .await
-                {
-                    println!("⚠ Failed to update release matrix: {}", e);
+                    let monitor_result: Result<(), Box<dyn std::error::Error>> = async {
+                        loop {
+                            sleep(Duration::from_secs(30)).await;
+                            state.iso_status =
+                                query_run_conclusion(&client, "xcp-ng-ce-iso", state.iso_id.unwrap()).await?;
+                            println!("Current ISO State -> {}", state.iso_status);
+                            if state.iso_status != "In Progress" {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    }
+                    .await;
+
+                    if let Err(e) = monitor_result {
+                        println!("⚠ Error while monitoring xcp-ng-ce-iso build: {}", e);
+                        state.iso_status = format!("Error: {}", e);
+                    }
+
+                    if state.iso_status == "success" {
+                        version_state.iso.xcpng_version = XCPNG_TARGET_VERSION.to_string();
+                        version_state.iso.ce_counter = next_counter;
+                        version_state.iso.last_tag = actual_iso_tag.clone();
+                        version_state.iso.last_xolite_tag = xolite_version.clone();
+                        version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
+                        if let Err(e) = save_version_state(&version_state) {
+                            println!("⚠ Failed to save version state: {}", e);
+                        }
+
+                        if let Err(e) = append_release_matrix_entry(
+                            &client,
+                            &actual_iso_tag,
+                            &xolite_version,
+                            &version_state.xolite_ce.upstream_version,
+                            &xoa_proxy_version,
+                        )
+                        .await
+                        {
+                            println!("⚠ Failed to update release matrix: {}", e);
+                        }
+                    }
                 }
             }
         }
