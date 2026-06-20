@@ -43,6 +43,7 @@ struct GHRun {
     status: String,
     conclusion: Option<String>,
     created_at: DateTime<Utc>,
+    head_branch: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -349,7 +350,8 @@ async fn dispatch_and_locate(client: &reqwest::Client, repo: &str, workflow: &st
 
     while Instant::now() < timeout_limit {
         sleep(Duration::from_secs(4)).await;
-        let response = client.get(&check_url).send().await?.json::<GHRunsResponse>().await?;
+        let response: GHRunsResponse =
+            parse_github_response(client.get(&check_url).send().await?, "dispatch_and_locate runs list").await?;
 
         for run in response.workflow_runs {
             if run.created_at >= (trigger_marker - Duration::from_secs(5)) {
@@ -394,23 +396,30 @@ async fn locate_tag_triggered_run(
         "https://api.github.com/repos/{}/{}/actions/runs?event=push&per_page=5",
         OWNER, repo
     );
-    let timeout_limit = Instant::now() + Duration::from_secs(45);
+    // Tag-push runs are triggered by GitHub's async webhook/event pipeline
+    // rather than the synchronous workflow_dispatch API, and have historically
+    // shown longer, more variable registration latency. 45s (the window used
+    // for workflow_dispatch, where it's proven reliable) wasn't enough here —
+    // widened to 3 minutes, polling less aggressively since we have more
+    // budget. head_branch matching added now that the window is wider, so a
+    // longer wait doesn't risk picking up an unrelated concurrent run.
+    let timeout_limit = Instant::now() + Duration::from_secs(180);
 
     while Instant::now() < timeout_limit {
-        sleep(Duration::from_secs(4)).await;
-        let response = client
-            .get(&check_url)
-            .send()
-            .await?
-            .json::<GHRunsResponse>()
-            .await?;
+        sleep(Duration::from_secs(6)).await;
+        let response: GHRunsResponse = parse_github_response(
+            client.get(&check_url).send().await?,
+            &format!("locate_tag_triggered_run for {} on {}", tag, repo),
+        )
+        .await?;
 
         for run in response.workflow_runs {
-            if run.created_at >= (trigger_marker - Duration::from_secs(5)) {
+            let branch_matches = run.head_branch.as_deref() == Some(tag);
+            let time_matches = run.created_at >= (trigger_marker - Duration::from_secs(5));
+            if branch_matches || (run.head_branch.is_none() && time_matches) {
                 return Ok((run.id, run.html_url));
             }
         }
-        let _ = tag; // reserved for stricter head_branch matching if ever needed
     }
     Err(format!(
         "Timeout waiting for tag-push run matching {} in repo {}",
@@ -421,7 +430,7 @@ async fn locate_tag_triggered_run(
 
 async fn query_run_conclusion(client: &reqwest::Client, repo: &str, run_id: u64) -> Result<String, Box<dyn std::error::Error>> {
     let url = format!("https://api.github.com/repos/{}/{}/actions/runs/{}", OWNER, repo, run_id);
-    let run = client.get(&url).send().await?.json::<GHRun>().await?;
+    let run: GHRun = parse_github_response(client.get(&url).send().await?, "query_run_conclusion").await?;
     if run.status == "completed" {
         Ok(run.conclusion.unwrap_or_else(|| "unknown".to_string()))
     } else {
@@ -431,7 +440,8 @@ async fn query_run_conclusion(client: &reqwest::Client, repo: &str, run_id: u64)
 
 async fn extract_failed_log_context(client: &reqwest::Client, repo: &str, run_id: u64) -> Result<String, Box<dyn std::error::Error>> {
     let jobs_url = format!("https://api.github.com/repos/{}/{}/actions/runs/{}/jobs", OWNER, repo, run_id);
-    let res = client.get(&jobs_url).send().await?.json::<GHJobsResponse>().await?;
+    let res: GHJobsResponse =
+        parse_github_response(client.get(&jobs_url).send().await?, "extract_failed_log_context jobs list").await?;
 
     if let Some(failed_job) = res.jobs.iter().find(|j| j.conclusion.as_deref() == Some("failure")) {
         let log_url = format!("https://api.github.com/repos/{}/{}/actions/jobs/{}/logs", OWNER, repo, failed_job.id);
@@ -473,7 +483,8 @@ async fn fetch_latest_upstream_xolite_tag(
     client: &reqwest::Client,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let url = "https://api.github.com/repos/vatesfr/xen-orchestra/git/refs/tags";
-    let refs: Vec<GHTagRef> = client.get(url).send().await?.json().await?;
+    let refs: Vec<GHTagRef> =
+        parse_github_response(client.get(url).send().await?, "fetch_latest_upstream_xolite_tag").await?;
 
     let mut tags: Vec<String> = refs
         .into_iter()
@@ -505,13 +516,18 @@ async fn fetch_upstream_xolite_version(
     struct ContentResp {
         content: String,
     }
-    let resp: ContentResp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github.raw+json")
-        .send()
-        .await?
-        .json()
-        .await?;
+    // NOTE: previously sent `Accept: application/vnd.github.raw+json` here, which
+    // tells GitHub to return the raw file bytes instead of the standard Contents
+    // API envelope ({content, sha, ...}) — that's what produced the "missing
+    // field `content`" crash, since the response was real package.json text
+    // (hence the multi-line parse error), not the expected base64 envelope.
+    // The client's default Accept (application/vnd.github+json, set globally
+    // in main()) already gives us the envelope shape ContentResp expects.
+    let resp: ContentResp = parse_github_response(
+        client.get(&url).send().await?,
+        &format!("fetch_upstream_xolite_version for tag xo-lite-v{}", upstream_tag),
+    )
+    .await?;
 
     // Contents API returns base64 with embedded newlines.
     use base64::{engine::general_purpose, Engine as _};
@@ -538,7 +554,11 @@ async fn fetch_repo_head_sha(
     struct CommitResp {
         sha: String,
     }
-    let resp: CommitResp = client.get(&url).send().await?.json().await?;
+    let resp: CommitResp = parse_github_response(
+        client.get(&url).send().await?,
+        &format!("fetch_repo_head_sha for {}", repo),
+    )
+    .await?;
     Ok(resp.sha)
 }
 
@@ -592,7 +612,8 @@ async fn append_release_matrix_entry(
         "https://api.github.com/repos/{}/{}/contents/{}",
         OWNER, DOCS_REPO, RELEASES_DATA_PATH
     );
-    let existing: GHFileContent = client.get(&url).send().await?.json().await?;
+    let existing: GHFileContent =
+        parse_github_response(client.get(&url).send().await?, "append_release_matrix_entry GET").await?;
     let cleaned: String = existing.content.chars().filter(|c| !c.is_whitespace()).collect();
     let current_yaml = String::from_utf8(general_purpose::STANDARD.decode(cleaned)?)?;
 
@@ -632,7 +653,11 @@ async fn fetch_latest_repo_tag(
     struct TagEntry {
         name: String,
     }
-    let tags: Vec<TagEntry> = client.get(&url).send().await?.json().await?;
+    let tags: Vec<TagEntry> = parse_github_response(
+        client.get(&url).send().await?,
+        &format!("fetch_latest_repo_tag for {}", repo),
+    )
+    .await?;
     tags.into_iter()
         .next()
         .map(|t| t.name)
@@ -693,6 +718,36 @@ async fn write_history_and_render_dashboard(current: PipelineState) -> Result<()
     fs::write(format!("{}/build_report.html", TARGET_REPORT_DIR), html)?;
     println!("Dashboard successfully rendered to {}/build_report.html", TARGET_REPORT_DIR);
     Ok(())
+}
+
+// ── Shared response parsing — checks status before deserializing ──────────
+// Every GitHub API call in this file was previously doing
+// `.send().await?.json::<T>().await?`, which attempts to deserialize error
+// bodies (404/403/etc) as if they were success payloads. This centralizes
+// the fix: read the body once, check status, give a useful error either way.
+async fn parse_github_response<T: serde::de::DeserializeOwned>(
+    res: reqwest::Response,
+    context: &str,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let status = res.status();
+    let body = res.text().await?;
+    if !status.is_success() {
+        return Err(format!(
+            "GitHub API error ({}) during {}: {}",
+            status, context, body
+        )
+        .into());
+    }
+    serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "Failed to parse JSON during {} (status {}): {}\nBody (first 500 chars): {}",
+            context,
+            status,
+            e,
+            &body[..body.len().min(500)]
+        )
+        .into()
+    })
 }
 
 fn get_badge_class(status: &str) -> &'static str {
