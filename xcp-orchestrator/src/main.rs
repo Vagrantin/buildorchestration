@@ -245,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             xoa_tag = Some(actual_tag);
         }
         Ok((head_sha, BumpDecision::PatchBump { upstream_version, next_counter })) => {
-            let tag = format!("v{}-ce{}", upstream_version, next_counter);
+            let tag = format!("v{}.{}", upstream_version, next_counter);
             version_state.xoa_proxy.ce_counter = next_counter;
             let actual_tag = create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
             let (id, url) = locate_tag_triggered_run(&client, "xoa-proxy", &actual_tag, trigger_time).await?;
@@ -319,8 +319,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let xoa_proxy_version = &version_state.xoa_proxy.last_tag;
 
         let needs_iso_build = version_state.iso.xcpng_version != XCPNG_TARGET_VERSION
-            || version_state.iso.last_xolite_tag != xolite_version
-            || version_state.iso.last_xoa_proxy_tag != xoa_proxy_version;
+            || version_state.iso.last_xolite_tag != *xolite_version
+            || version_state.iso.last_xoa_proxy_tag != *xoa_proxy_version;
 
         if !needs_iso_build {
             println!("▶ xcp-ng-ce-iso: no component change since last ISO build, skipping.");
@@ -737,26 +737,6 @@ async fn append_release_matrix_entry(
     }
     println!("▶ Release matrix updated with {} (push will trigger pages.yml)", iso_tag);
     Ok(())
-}
-
-async fn fetch_latest_repo_tag(
-    client: &reqwest::Client,
-    repo: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let url = format!("https://api.github.com/repos/{}/{}/tags?per_page=1", OWNER, repo);
-    #[derive(Deserialize)]
-    struct TagEntry {
-        name: String,
-    }
-    let tags: Vec<TagEntry> = parse_github_response(
-        client.get(&url).send().await?,
-        &format!("fetch_latest_repo_tag for {}", repo),
-    )
-    .await?;
-    tags.into_iter()
-        .next()
-        .map(|t| t.name)
-        .ok_or_else(|| format!("No tags found on {}", repo).into())
 }
 
 // ── Dashboard rendering ────────────────────────────────────────────────────
