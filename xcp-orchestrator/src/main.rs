@@ -409,35 +409,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// ── Dispatch / run-location (workflow_dispatch path — used by xoa-proxy) ──
-
-async fn dispatch_and_locate(client: &reqwest::Client, repo: &str, workflow: &str, trigger_marker: DateTime<Utc>) -> Result<(u64, String), Box<dyn std::error::Error>> {
-    let url = format!("https://api.github.com/repos/{}/{}/actions/workflows/{}/dispatches", OWNER, repo, workflow);
-    let payload = serde_json::json!({ "ref": DEFAULT_BRANCH });
-
-    let res = client.post(&url).json(&payload).send().await?;
-    if res.status() != reqwest::StatusCode::NO_CONTENT {
-        return Err(format!("Dispatch rejection for repo: {}. Code: {}", repo, res.status()).into());
-    }
-
-    // Mitigate 204 Race Condition: Poll runs array until the newest target registers
-    let check_url = format!("https://api.github.com/repos/{}/{}/actions/runs?event=workflow_dispatch&per_page=5", OWNER, repo);
-    let timeout_limit = Instant::now() + Duration::from_secs(45);
-
-    while Instant::now() < timeout_limit {
-        sleep(Duration::from_secs(4)).await;
-        let response: GHRunsResponse =
-            parse_github_response(client.get(&check_url).send().await?, "dispatch_and_locate runs list").await?;
-
-        for run in response.workflow_runs {
-            if run.created_at >= (trigger_marker - Duration::from_secs(5)) {
-                return Ok((run.id, run.html_url));
-            }
-        }
-    }
-    Err(format!("Timeout waiting for run matching dispatch trigger in repo {}", repo).into())
-}
-
 // ── Tag creation + locating the run it triggers (tag-push path) ───────────
 
 async fn create_and_push_tag(
