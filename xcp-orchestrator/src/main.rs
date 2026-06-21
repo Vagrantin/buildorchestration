@@ -315,8 +315,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // PHASE 3: ISO generation — only if xolite-ce or xoa-proxy actually advanced,
         // or the targeted XCP-ng base version changed (Axis 3: ISO always uses latest tags).
-        let xolite_version = fetch_latest_repo_tag(&client, "xolite-ce").await.unwrap_or_default();
-        let xoa_proxy_version = fetch_latest_repo_tag(&client, "xoa-proxy").await.unwrap_or_default();
+        let xolite_version = &version_state.xolite_ce.last_tag;
+        let xoa_proxy_version = &version_state.xoa_proxy.last_tag;
 
         let needs_iso_build = version_state.iso.xcpng_version != XCPNG_TARGET_VERSION
             || version_state.iso.last_xolite_tag != xolite_version
