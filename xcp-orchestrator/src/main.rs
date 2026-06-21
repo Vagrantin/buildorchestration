@@ -22,7 +22,7 @@ const RELEASES_DATA_PATH: &str = "docs/_data/releases.yml";
 /// this constant manually when you decide to target a new XCP-ng release.
 const XCPNG_TARGET_VERSION: &str = "8.3";
 
-// ── History / dashboard types (unchanged) ──────────────────────────────────
+// ── History / dashboard types ──────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct RunHistoryItem {
@@ -88,7 +88,6 @@ struct PipelineState {
 }
 
 // ── Version state: persisted source of truth for tag derivation ───────────
-// Separate from history.json (which is run telemetry/dashboard data).
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct ComponentVersionState {
@@ -120,6 +119,7 @@ struct IsoVersionState {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct VersionState {
     xolite_ce: ComponentVersionState,
+    xoa_proxy: ComponentVersionState,
     iso: IsoVersionState,
     // xoa_hl: ComponentVersionState,  // added when the XVA flow is designed
 }
@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut version_state = load_version_state();
     let trigger_time = Utc::now();
 
-    // PHASE 1: Decide xolite-ce's tag (if any) and dispatch xoa-proxy, concurrently.
+    // PHASE 1: Decide component tags and dispatch builds concurrently.
     println!("PHASE 1: Evaluating component changes and triggering builds...");
 
     let xolite_branch = async {
@@ -177,14 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let decision = decide_xolite_bump(&client, &version_state.xolite_ce).await?;
         Ok::<(String, BumpDecision), Box<dyn std::error::Error>>((head_sha, decision))
     };
-    let xoa_branch = dispatch_and_locate(&client, "xoa-proxy", "xoa-proxy.yml", trigger_time);
+    let xoa_branch = async {
+        let head_sha = fetch_repo_head_sha(&client, "xoa-proxy").await?;
+        let decision = decide_xoa_proxy_bump(&client, &version_state.xoa_proxy).await?;
+        Ok::<(String, BumpDecision), Box<dyn std::error::Error>>((head_sha, decision))
+    };
 
     let (xolite_res, xoa_res) = tokio::join!(xolite_branch, xoa_branch);
-
-    let (xoa_id, xoa_url) = xoa_res.expect("Failed to link xoa proxy execution thread");
-    state.xoa_id = Some(xoa_id);
-    state.xoa_url = xoa_url;
-    state.xoa_status = "In Progress".to_string();
 
     let xolite_head_sha: String;
     let mut xolite_tag: Option<String> = None;
@@ -220,6 +219,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => {
             println!("⚠ xolite-ce bump detection failed: {}. Skipping build this run.", e);
             xolite_head_sha = fetch_repo_head_sha(&client, "xolite-ce")
+                .await
+                .unwrap_or_default();
+        }
+    }
+
+    let xoa_head_sha: String;
+    let mut xoa_tag: Option<String> = None;
+
+    match xoa_res {
+        Ok((head_sha, BumpDecision::NoChange)) => {
+            println!("▶ xoa-proxy: no version or local change detected, skipping build.");
+            xoa_head_sha = head_sha;
+        }
+        Ok((head_sha, BumpDecision::UpstreamBump { upstream_version })) => {
+            let tag = format!("v{}", upstream_version);
+            version_state.xoa_proxy.upstream_version = upstream_version;
+            version_state.xoa_proxy.ce_counter = 1;
+            let actual_tag = create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
+            let (id, url) = locate_tag_triggered_run(&client, "xoa-proxy", &actual_tag, trigger_time).await?;
+            state.xoa_id = Some(id);
+            state.xoa_url = url;
+            state.xoa_status = "In Progress".to_string();
+            xoa_head_sha = head_sha;
+            xoa_tag = Some(actual_tag);
+        }
+        Ok((head_sha, BumpDecision::PatchBump { upstream_version, next_counter })) => {
+            let tag = format!("v{}-ce{}", upstream_version, next_counter);
+            version_state.xoa_proxy.ce_counter = next_counter;
+            let actual_tag = create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
+            let (id, url) = locate_tag_triggered_run(&client, "xoa-proxy", &actual_tag, trigger_time).await?;
+            state.xoa_id = Some(id);
+            state.xoa_url = url;
+            state.xoa_status = "In Progress".to_string();
+            xoa_head_sha = head_sha;
+            xoa_tag = Some(actual_tag);
+        }
+        Err(e) => {
+            println!("⚠ xoa-proxy bump detection failed: {}. Skipping build this run.", e);
+            xoa_head_sha = fetch_repo_head_sha(&client, "xoa-proxy")
                 .await
                 .unwrap_or_default();
         }
@@ -266,6 +304,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Persist xoa-proxy version state now that its build (if any) succeeded.
+        if state.xoa_status == "success" {
+            if let Some(tag) = xoa_tag {
+                version_state.xoa_proxy.last_tag = tag;
+                version_state.xoa_proxy.last_built_sha = xoa_head_sha;
+                save_version_state(&version_state)?;
+            }
+        }
+
         // PHASE 3: ISO generation — only if xolite-ce or xoa-proxy actually advanced,
         // or the targeted XCP-ng base version changed (Axis 3: ISO always uses latest tags).
         let xolite_version = fetch_latest_repo_tag(&client, "xolite-ce").await.unwrap_or_default();
@@ -288,14 +335,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let iso_tag = format!("v{}-ce{}", XCPNG_TARGET_VERSION, next_counter);
 
-            // Everything in this block can fail mid-flight (tag creation, run
-            // location, or the monitoring loop's API calls). Previously these
-            // used `?` directly, which unwinds straight out of main() on
-            // failure — skipping write_history_and_render_dashboard()
-            // entirely, so a Phase 3 error left no trace in build_report.html.
-            // Capturing the Result locally and falling through to the
-            // dashboard write either way fixes that, mirroring the pattern
-            // already used for xolite-ce's bump-detection failure in Phase 1.
             let iso_build_result: Result<(u64, String, String), Box<dyn std::error::Error>> = async {
                 let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
                 let actual_iso_tag =
@@ -407,8 +446,6 @@ async fn create_and_push_tag(
     base_tag: &str,
     sha: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // If the base_tag already exists, increment the counter suffix until
-    // we find one that doesn't. Caps at 99 to prevent infinite loops.
     let mut tag = base_tag.to_string();
     let mut attempt = 0;
     const MAX_ATTEMPTS: u32 = 99;
@@ -429,7 +466,6 @@ async fn create_and_push_tag(
         let status = res.status();
         let body = res.text().await?;
 
-        // "Reference already exists" means the tag is already taken — increment and retry
         if status == 422 && body.contains("Reference already exists") {
             attempt += 1;
             if attempt >= MAX_ATTEMPTS {
@@ -440,18 +476,15 @@ async fn create_and_push_tag(
                 .into());
             }
 
-            // Parse base_tag to extract and increment the counter.
-            // Expected format: "v8.3-ce1" or "v0.22.0-ce3" → extract the ce number and increment.
             if let Some(ce_pos) = tag.rfind("-ce") {
-                let prefix = &tag[..ce_pos + 3]; // "v8.3-ce"
-                let counter_str = &tag[ce_pos + 3..]; // "1"
+                let prefix = &tag[..ce_pos + 3];
+                let counter_str = &tag[ce_pos + 3..];
                 if let Ok(counter) = counter_str.parse::<u32>() {
                     tag = format!("{}{}", prefix, counter + 1);
                     println!("⚠ Tag {} already exists, retrying with {}", &tag[..tag.len()-1], tag);
                     continue;
                 }
             }
-            // If we can't parse the counter, fail with a clearer message
             return Err(format!(
                 "Tag {} already exists and could not parse counter suffix to increment",
                 tag
@@ -459,13 +492,10 @@ async fn create_and_push_tag(
             .into());
         }
 
-        // Any other error (404 on repo, 403 permission, etc.)
         return Err(format!("Failed to create tag {} on {}: {}", tag, repo, body).into());
     }
 }
 
-/// Like dispatch_and_locate, but for workflows triggered by a tag push rather
-/// than workflow_dispatch — polls runs filtered to event=push.
 async fn locate_tag_triggered_run(
     client: &reqwest::Client,
     repo: &str,
@@ -476,13 +506,6 @@ async fn locate_tag_triggered_run(
         "https://api.github.com/repos/{}/{}/actions/runs?event=push&per_page=5",
         OWNER, repo
     );
-    // Tag-push runs are triggered by GitHub's async webhook/event pipeline
-    // rather than the synchronous workflow_dispatch API, and have historically
-    // shown longer, more variable registration latency. 45s (the window used
-    // for workflow_dispatch, where it's proven reliable) wasn't enough here —
-    // widened to 3 minutes, polling less aggressively since we have more
-    // budget. head_branch matching added now that the window is wider, so a
-    // longer wait doesn't risk picking up an unrelated concurrent run.
     let timeout_limit = Instant::now() + Duration::from_secs(180);
 
     while Instant::now() < timeout_limit {
@@ -549,16 +572,14 @@ async fn evaluate_log_via_ollama(client: &reqwest::Client, raw_logs: &str) -> Re
     Ok(json_res.response)
 }
 
-// ── Upstream + own-repo change detection (xolite-ce) ───────────────────────
+// ── Upstream + own-repo change detection ───────────────────────────────────
 
 #[derive(Deserialize, Debug)]
 struct GHTagRef {
     #[serde(rename = "ref")]
-    git_ref: String, // "refs/tags/xo-lite-v0.34.2"
+    git_ref: String,
 }
 
-/// Mirrors the workflow's "git ls-remote --tags --sort=v:refname ... xo-lite-v*"
-/// step, via the GitHub API instead of a clone, against vatesfr/xen-orchestra.
 async fn fetch_latest_upstream_xolite_tag(
     client: &reqwest::Client,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -571,8 +592,6 @@ async fn fetch_latest_upstream_xolite_tag(
         .filter_map(|r| r.git_ref.strip_prefix("refs/tags/xo-lite-v").map(String::from))
         .collect();
 
-    // Semver-ish sort: split on '.', compare numerically. Good enough for
-    // "0.34.2" style tags; falls back to lexicographic if parsing fails.
     tags.sort_by(|a, b| {
         let pa: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
         let pb: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -582,8 +601,6 @@ async fn fetch_latest_upstream_xolite_tag(
     tags.pop().ok_or_else(|| "No xo-lite-v* tags found upstream".into())
 }
 
-/// Mirrors the workflow's "jq -r .version package.json" step, via Contents API
-/// against the upstream tag (no clone needed).
 async fn fetch_upstream_xolite_version(
     client: &reqwest::Client,
     upstream_tag: &str,
@@ -596,20 +613,13 @@ async fn fetch_upstream_xolite_version(
     struct ContentResp {
         content: String,
     }
-    // NOTE: previously sent `Accept: application/vnd.github.raw+json` here, which
-    // tells GitHub to return the raw file bytes instead of the standard Contents
-    // API envelope ({content, sha, ...}) — that's what produced the "missing
-    // field `content`" crash, since the response was real package.json text
-    // (hence the multi-line parse error), not the expected base64 envelope.
-    // The client's default Accept (application/vnd.github+json, set globally
-    // in main()) already gives us the envelope shape ContentResp expects.
+
     let resp: ContentResp = parse_github_response(
         client.get(&url).send().await?,
         &format!("fetch_upstream_xolite_version for tag xo-lite-v{}", upstream_tag),
     )
     .await?;
 
-    // Contents API returns base64 with embedded newlines.
     use base64::{engine::general_purpose, Engine as _};
     let cleaned: String = resp.content.chars().filter(|c| !c.is_whitespace()).collect();
     let decoded = general_purpose::STANDARD.decode(cleaned)?;
@@ -620,8 +630,6 @@ async fn fetch_upstream_xolite_version(
         .to_string())
 }
 
-/// Latest commit SHA on our own repo's main branch — used to tell "patches/spec
-/// changed since we last built" apart from "nothing changed, don't rebuild".
 async fn fetch_repo_head_sha(
     client: &reqwest::Client,
     repo: &str,
@@ -643,12 +651,50 @@ async fn fetch_repo_head_sha(
 }
 
 enum BumpDecision {
-    /// Nothing changed upstream or locally — skip the build entirely.
     NoChange,
-    /// Upstream moved to a new version — reset counter to 1.
     UpstreamBump { upstream_version: String },
-    /// Same upstream version, but our own patches/spec changed — bump counter.
     PatchBump { upstream_version: String, next_counter: u32 },
+}
+
+async fn decide_xoa_proxy_bump(
+    client: &reqwest::Client,
+    state: &ComponentVersionState,
+) -> Result<BumpDecision, Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://api.github.com/repos/{}/xoa-proxy/contents/Cargo.toml?ref={}",
+        OWNER, DEFAULT_BRANCH
+    );
+    let cargo_content: GHFileContent =
+        parse_github_response(client.get(&url).send().await?, "decide_xoa_proxy_bump Cargo.toml").await?;
+
+    use base64::{engine::general_purpose, Engine as _};
+    let cleaned: String = cargo_content.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let cargo_toml = String::from_utf8(general_purpose::STANDARD.decode(cleaned)?)?;
+
+    let cargo_version = cargo_toml
+        .lines()
+        .find(|line| line.starts_with("version"))
+        .and_then(|line| {
+            line.split('"')
+                .nth(1)
+                .map(|v| v.to_string())
+        })
+        .ok_or("Could not parse version from Cargo.toml")?;
+
+    let head_sha = fetch_repo_head_sha(client, "xoa-proxy").await?;
+
+    if cargo_version != state.upstream_version {
+        return Ok(BumpDecision::UpstreamBump {
+            upstream_version: cargo_version,
+        });
+    }
+    if head_sha != state.last_built_sha {
+        return Ok(BumpDecision::PatchBump {
+            upstream_version: cargo_version,
+            next_counter: state.ce_counter + 1,
+        });
+    }
+    Ok(BumpDecision::NoChange)
 }
 
 async fn decide_xolite_bump(
@@ -722,8 +768,6 @@ async fn append_release_matrix_entry(
     Ok(())
 }
 
-/// Fetch the latest tag on a repo (used to read xoa-proxy's manually-set version
-/// for the matrix, and to read xolite-ce's version back after a build/skip).
 async fn fetch_latest_repo_tag(
     client: &reqwest::Client,
     repo: &str,
@@ -744,7 +788,7 @@ async fn fetch_latest_repo_tag(
         .ok_or_else(|| format!("No tags found on {}", repo).into())
 }
 
-// ── Dashboard rendering (unchanged) ─────────────────────────────────────────
+// ── Dashboard rendering ────────────────────────────────────────────────────
 
 async fn write_history_and_render_dashboard(current: PipelineState) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(Path::new(STATE_FILE).parent().unwrap())?;
@@ -800,11 +844,8 @@ async fn write_history_and_render_dashboard(current: PipelineState) -> Result<()
     Ok(())
 }
 
-// ── Shared response parsing — checks status before deserializing ──────────
-// Every GitHub API call in this file was previously doing
-// `.send().await?.json::<T>().await?`, which attempts to deserialize error
-// bodies (404/403/etc) as if they were success payloads. This centralizes
-// the fix: read the body once, check status, give a useful error either way.
+// ── Shared response parsing ────────────────────────────────────────────────
+
 async fn parse_github_response<T: serde::de::DeserializeOwned>(
     res: reqwest::Response,
     context: &str,
