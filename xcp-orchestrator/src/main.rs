@@ -545,31 +545,29 @@ async fn evaluate_log_via_ollama(client: &reqwest::Client, raw_logs: &str) -> Re
 
 // ── Upstream + own-repo change detection ───────────────────────────────────
 
-#[derive(Deserialize, Debug)]
-struct GHTagRef {
-    #[serde(rename = "ref")]
-    git_ref: String,
-}
-
 async fn fetch_latest_upstream_xolite_tag(
     client: &reqwest::Client,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let url = "https://api.github.com/repos/vatesfr/xen-orchestra/git/refs/tags";
-    let refs: Vec<GHTagRef> =
-        parse_github_response(client.get(url).send().await?, "fetch_latest_upstream_xolite_tag").await?;
+    // Releases API returns newest-first by creation date.
+    // We take the first xo-lite-v* release that actually has uploaded assets —
+    // this matches the workflow's strategy and skips tags like v0.22.0 that were
+    // tagged but never successfully published.
+    #[derive(Deserialize)]
+    struct GHRelease {
+        tag_name: String,
+        assets: Vec<serde_json::Value>,
+    }
 
-    let mut tags: Vec<String> = refs
+    let url = "https://api.github.com/repos/vatesfr/xen-orchestra/releases?per_page=10";
+    let releases: Vec<GHRelease> =
+        parse_github_response(client.get(url).send().await?, "fetch_latest_upstream_xolite_tag")
+            .await?;
+
+    releases
         .into_iter()
-        .filter_map(|r| r.git_ref.strip_prefix("refs/tags/xo-lite-v").map(String::from))
-        .collect();
-
-    tags.sort_by(|a, b| {
-        let pa: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-        let pb: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
-        pa.cmp(&pb)
-    });
-
-    tags.pop().ok_or_else(|| "No xo-lite-v* tags found upstream".into())
+        .filter(|r| r.tag_name.starts_with("xo-lite-v") && !r.assets.is_empty())
+        .find_map(|r| r.tag_name.strip_prefix("xo-lite-v").map(String::from))
+        .ok_or_else(|| "No released xo-lite-v* tag with assets found upstream".into())
 }
 
 async fn fetch_upstream_xolite_version(
