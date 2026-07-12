@@ -1,0 +1,21 @@
+[package]
+name = "iso-agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "iso-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { workspace = true }
+reqwest     = { workspace = true }
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+chrono      = { workspace = true, features = ["serde"] }
+shared      = { path = "../shared" }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# FIX #3 / #18: anyhow was in the original Cargo.toml but the crate returns
+# OrchestratorError throughout — mixing the two caused the incorrect import.
+# Removed. If anyhow is ever added back, the main() return type must also change.

@@ -1,0 +1,23 @@
+[package]
+name = "xoa-vm-agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "xoa-vm-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { workspace = true, features = ["full"] }  # "full" already includes "process"
+tokio-util  = { version = "0.7", features = ["io"] }     # FIX #4: streaming upload via ReaderStream
+reqwest     = { workspace = true }
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+chrono      = { workspace = true, features = ["serde"] }
+shared      = { path = "../shared" }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+base64      = { workspace = true }
+libc        = "0.2"   # FIX #10: SIGTERM before SIGKILL on packer timeout (Unix only)
