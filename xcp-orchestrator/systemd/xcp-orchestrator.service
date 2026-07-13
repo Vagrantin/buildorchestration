@@ -7,7 +7,7 @@ Type=oneshot
 User=root
 # Securely injects GitHub API Token using systemd sandbox file allocation
 LoadCredential=GITHUB_TOKEN:/etc/xcp-hl-credentials/github_token
-ExecStart=/usr/local/bin/xcp-orchestrator
+ExecStart=/usr/local/bin/orchestrator
 
 [Install]
 WantedBy=multi-user.target
