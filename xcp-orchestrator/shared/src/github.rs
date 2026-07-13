@@ -230,6 +230,44 @@ pub async fn fetch_tag_commit_sha(
     Ok(deref.object.sha)
 }
 
+/// An uploaded release asset.
+#[derive(Deserialize, Debug, Clone)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
+
+/// A published release, trimmed to what the agents need to decide whether an
+/// artefact already exists.
+#[derive(Deserialize, Debug, Clone)]
+pub struct ReleaseInfo {
+    pub tag_name: String,
+    pub html_url: String,
+    #[serde(default)]
+    pub assets: Vec<ReleaseAsset>,
+}
+
+/// List a repo's releases, newest first.
+pub async fn fetch_releases(
+    client: &Client,
+    repo: &str,
+    per_page: u8,
+) -> Result<Vec<ReleaseInfo>, OrchestratorError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/releases?per_page={}",
+        OWNER, repo, per_page
+    );
+    parse_github_response(
+        client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::GitHubApi(format!("releases for {}", repo), e.to_string()))?,
+        &format!("fetch_releases for {}", repo),
+    )
+    .await
+}
+
 /// Parse a `v{version}-ce{N}` tag (xolite-ce, xcp-ng-ce-iso) into
 /// `(version, ce_counter)`, e.g. `v0.21.0-ce6` → `("0.21.0", 6)`.
 pub fn parse_ce_tag(tag: &str) -> Option<(String, u32)> {

@@ -21,9 +21,8 @@ use chrono::{DateTime, Utc};
 use shared::{
     AgentStatus, WorkflowStatus,
     create_github_client, load_github_token,
-    fetch_repo_head_sha, fetch_latest_release_ref,
+    fetch_repo_head_sha, fetch_releases, fetch_tag_commit_sha, ReleaseInfo,
     locate_dispatch_triggered_run, query_run_conclusion,
-    parse_github_response,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -49,6 +48,10 @@ const XOA_HL_REPO: &str = "Vagrantin/xoa-hl";
 
 /// Workflow file that builds the RPM and creates a GitHub Release.
 const XOA_HL_WORKFLOW_FILE: &str = "build-xoa.yml";
+
+/// Tag prefix distinguishing this agent's VM-image releases (xoa-image-{date}-{sha7})
+/// from the RPM releases created by the workflow (v{version}_{sha}).
+const IMAGE_TAG_PREFIX: &str = "xoa-image-";
 
 const ALMALINUX_VERSION: &str = "9";
 const ALMALINUX_ISO_URL: &str =
@@ -101,28 +104,6 @@ impl XoaHlVersionState {
         debug!("XOA-HL version state saved");
         Ok(())
     }
-}
-
-// ── Error types kept for internal structured errors ───────────────────────────
-
-#[derive(thiserror::Error, Debug)]
-enum XoaVmAgentError {
-    #[error("Prerequisite validation failed: {0}")]
-    PrerequisiteValidation(String),
-    #[error("Repository sync failed: {0}")]
-    RepositorySync(String),
-    #[error("Dynamic value resolution failed: {0}")]
-    DynamicValueResolution(String),
-    #[error("Build file generation failed: {0}")]
-    BuildFileGeneration(String),
-    #[error("Packer command failed: {0}")]
-    PackerCommand(String),
-    #[error("XVA not found in output directory")]
-    XvaNotFound,
-    #[error("GitHub upload failed: {0}")]
-    GitHubUpload(String),
-    #[error("Timeout: {0}")]
-    Timeout(String),
 }
 
 // ── Build Config ──────────────────────────────────────────────────────────────
@@ -190,11 +171,16 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to fetch xoa-hl HEAD SHA")?;
 
+    // A skip requires a *published image* for HEAD, not just unchanged code:
+    // the workflow's RPM release and this agent's XVA image release are
+    // separate artefacts, and the image is the one this agent exists to ship.
     if !version_state.last_built_sha.is_empty()
         && repo_head_sha == version_state.last_built_sha
+        && version_state.last_tag.starts_with(IMAGE_TAG_PREFIX)
     {
         info!(
-            "No changes since last build (SHA: {}), skipping.",
+            "No changes since image {} was built (SHA: {}), skipping.",
+            version_state.last_tag,
             &repo_head_sha[..7]
         );
         status.status = WorkflowStatus::Skipped;
@@ -203,70 +189,96 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Local state is empty or stale — cross-check the latest GitHub release
-    // (ground truth). This prevents pointless rebuilds after state loss.
-    match fetch_latest_release_ref(&client, "xoa-hl").await {
-        Ok(Some((tag, release_sha))) if release_sha == repo_head_sha => {
-            info!(
-                "No changes: latest release {} already matches HEAD (SHA: {}), skipping.",
-                tag,
-                &repo_head_sha[..7]
-            );
-            version_state.last_built_sha = repo_head_sha.clone();
-            version_state.last_tag = tag.clone();
-            version_state.save()?;
-            status.status = WorkflowStatus::Skipped;
-            status.detail = format!("Already released as {} (SHA: {})", tag, &repo_head_sha[..7]);
-            status.write_to_file(STATUS_FILE)?;
-            return Ok(());
+    // Local state is empty or untrustworthy — check the published releases
+    // (ground truth). An xoa-image-* release with an XVA asset for HEAD means
+    // everything is done; a current RPM release without one means only the
+    // workflow can be skipped and the image must still be built.
+    let short_sha = repo_head_sha[..7.min(repo_head_sha.len())].to_string();
+    let mut rpm_is_current = false;
+    match fetch_releases(&client, "xoa-hl", 30).await {
+        Ok(releases) => {
+            if let Some(image) = releases.iter().find(|r| is_image_release_for(r, &short_sha)) {
+                info!(
+                    "Image {} already published for HEAD (SHA: {}), skipping.",
+                    image.tag_name, short_sha
+                );
+                version_state.last_built_sha = repo_head_sha.clone();
+                version_state.last_tag = image.tag_name.clone();
+                version_state.last_built_at = Some(Utc::now());
+                version_state.save()?;
+                status.status = WorkflowStatus::Skipped;
+                status.detail =
+                    format!("Image {} already published (SHA: {})", image.tag_name, short_sha);
+                status.set_component("xoa-hl", WorkflowStatus::Skipped, String::new());
+                status.set_component("xoa-image", WorkflowStatus::Success, image.html_url.clone());
+                status.write_to_file(STATUS_FILE)?;
+                return Ok(());
+            }
+
+            // No image for HEAD — does the newest RPM release already cover it?
+            if let Some(rpm) = releases.iter().find(|r| !r.tag_name.starts_with(IMAGE_TAG_PREFIX)) {
+                match fetch_tag_commit_sha(&client, "xoa-hl", &rpm.tag_name).await {
+                    Ok(sha) if sha == repo_head_sha => {
+                        info!(
+                            "RPM release {} matches HEAD (SHA: {}) — skipping workflow, building missing image.",
+                            rpm.tag_name, short_sha
+                        );
+                        rpm_is_current = true;
+                        status.set_component("xoa-hl", WorkflowStatus::Skipped, rpm.html_url.clone());
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        "Could not resolve RPM release tag {} ({}); proceeding with full build.",
+                        rpm.tag_name, e
+                    ),
+                }
+            }
         }
-        Ok(_) => {}
         Err(e) => warn!(
-            "Could not check latest xoa-hl release ({}); proceeding with build.",
+            "Could not list xoa-hl releases ({}); proceeding with full build.",
             e
         ),
     }
 
-    info!(
-        "Changes detected (SHA: {}), proceeding with build.",
-        &repo_head_sha[..7]
-    );
-
     // ── PHASE 2: Trigger GA workflow and wait ────────────────────────────────
-    info!("PHASE 2: Triggering xoa-hl build workflow...");
-    status.phase = "phase_2_trigger_workflow".to_string();
-    status.detail = "Dispatching xoa-hl GitHub Actions workflow".to_string();
-    status.write_to_file(STATUS_FILE)?;
+    if rpm_is_current {
+        info!("PHASE 2: Skipped — RPM release already covers HEAD.");
+    } else {
+        info!("PHASE 2: Triggering xoa-hl build workflow...");
+        status.phase = "phase_2_trigger_workflow".to_string();
+        status.detail = "Dispatching xoa-hl GitHub Actions workflow".to_string();
+        status.write_to_file(STATUS_FILE)?;
 
-    let (run_id, run_url) = match trigger_xoa_hl_workflow(&client).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Workflow dispatch failed: {}", e);
-            status.status = WorkflowStatus::Failure;
-            status.detail = format!("Workflow dispatch failed: {}", e);
-            status.set_component("xoa-hl", WorkflowStatus::Failure, String::new());
-            status.write_to_file(STATUS_FILE)?;
-            return Err(e);
-        }
-    };
+        let (run_id, run_url) = match trigger_xoa_hl_workflow(&client).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Workflow dispatch failed: {}", e);
+                status.status = WorkflowStatus::Failure;
+                status.detail = format!("Workflow dispatch failed: {}", e);
+                status.set_component("xoa-hl", WorkflowStatus::Failure, String::new());
+                status.write_to_file(STATUS_FILE)?;
+                return Err(e);
+            }
+        };
 
-    status.url = run_url.clone();
-    status.detail = format!("Waiting for workflow: {}", run_url);
-    status.set_component("xoa-hl", WorkflowStatus::InProgress, run_url.clone());
-    status.write_to_file(STATUS_FILE)?;
+        status.url = run_url.clone();
+        status.detail = format!("Waiting for workflow: {}", run_url);
+        status.set_component("xoa-hl", WorkflowStatus::InProgress, run_url.clone());
+        status.write_to_file(STATUS_FILE)?;
 
-    match wait_for_workflow(&client, run_id, &run_url, WORKFLOW_TIMEOUT).await {
-        Ok(()) => {
-            info!("xoa-hl workflow completed successfully");
-            status.set_component("xoa-hl", WorkflowStatus::Success, run_url.clone());
-        }
-        Err(e) => {
-            error!("xoa-hl workflow failed: {}", e);
-            status.status = WorkflowStatus::Failure;
-            status.detail = format!("Workflow failed: {}", e);
-            status.set_component("xoa-hl", WorkflowStatus::Failure, run_url.clone());
-            status.write_to_file(STATUS_FILE)?;
-            return Err(e);
+        match wait_for_workflow(&client, run_id, &run_url, WORKFLOW_TIMEOUT).await {
+            Ok(()) => {
+                info!("xoa-hl workflow completed successfully");
+                status.set_component("xoa-hl", WorkflowStatus::Success, run_url.clone());
+            }
+            Err(e) => {
+                error!("xoa-hl workflow failed: {}", e);
+                status.status = WorkflowStatus::Failure;
+                status.detail = format!("Workflow failed: {}", e);
+                status.set_component("xoa-hl", WorkflowStatus::Failure, run_url.clone());
+                status.write_to_file(STATUS_FILE)?;
+                return Err(e);
+            }
         }
     }
 
@@ -733,36 +745,18 @@ async fn resolve_almalinux_checksum(client: &reqwest::Client) -> Result<String> 
 }
 
 async fn resolve_xoa_hl_rpm_url(client: &reqwest::Client) -> Result<String> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        XOA_HL_REPO
-    );
+    // releases/latest may be one of this agent's xoa-image-* releases, which
+    // carries no RPM — scan the list for the newest release that has one.
+    let releases = fetch_releases(client, "xoa-hl", 30)
+        .await
+        .context("Failed to fetch xoa-hl releases")?;
 
-    #[derive(serde::Deserialize)]
-    struct GitHubRelease {
-        assets: Vec<GitHubAsset>,
-    }
-    #[derive(serde::Deserialize)]
-    struct GitHubAsset {
-        browser_download_url: String,
-    }
-
-    let release: GitHubRelease = parse_github_response(
-        client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch xoa-hl releases")?,
-        "resolve_xoa_hl_rpm_url",
-    )
-    .await?;
-
-    release
-        .assets
+    releases
         .into_iter()
-        .find(|a| a.browser_download_url.ends_with(".rpm"))
+        .flat_map(|r| r.assets)
+        .find(|a| a.name.ends_with(".rpm"))
         .map(|a| a.browser_download_url)
-        .ok_or_else(|| anyhow::anyhow!("No RPM asset found in latest xoa-hl release"))
+        .ok_or_else(|| anyhow::anyhow!("No RPM asset found in recent xoa-hl releases"))
 }
 
 // ── PHASE 6: Generate build files ─────────────────────────────────────────────
@@ -1110,7 +1104,19 @@ async fn locate_xva() -> Result<PathBuf> {
 fn generate_image_tag(head_sha: &str) -> String {
     let date = Utc::now().format("%Y%m%d");
     let short = &head_sha[..7.min(head_sha.len())];
-    format!("xoa-image-{}-{}", date, short)
+    format!("{}{}-{}", IMAGE_TAG_PREFIX, date, short)
+}
+
+/// Does this release carry the published VM image for the given commit?
+/// The tag encodes the short SHA (see generate_image_tag) and the XVA asset
+/// must be present — a release whose upload failed doesn't count.
+fn is_image_release_for(release: &ReleaseInfo, short_sha: &str) -> bool {
+    release.tag_name.starts_with(IMAGE_TAG_PREFIX)
+        && release.tag_name.ends_with(&format!("-{}", short_sha))
+        && release
+            .assets
+            .iter()
+            .any(|a| a.name.ends_with(".xva") || a.name.ends_with(".xva.gz"))
 }
 
 /// Create a GitHub Release, or reuse the existing one (idempotent).
@@ -1236,3 +1242,48 @@ async fn upload_asset(
 // FIX #17: `type Result<T> = anyhow::Result<T>` that was at line 1002 has been
 // removed entirely. `use anyhow::Result` at the top of the file already brings
 // anyhow::Result into scope — the alias was redundant and confusing.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::ReleaseAsset;
+
+    fn release(tag: &str, asset_names: &[&str]) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: tag.to_string(),
+            html_url: format!("https://github.com/Vagrantin/xoa-hl/releases/tag/{}", tag),
+            assets: asset_names
+                .iter()
+                .map(|n| ReleaseAsset {
+                    name: n.to_string(),
+                    browser_download_url: format!("https://example.com/{}", n),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn image_release_requires_prefix_sha_and_xva_asset() {
+        let sha = "cb65556";
+        // The real thing: image tag for this SHA with an XVA asset
+        assert!(is_image_release_for(&release("xoa-image-20260713-cb65556", &["xoa.xva.gz"]), sha));
+        assert!(is_image_release_for(&release("xoa-image-20260713-cb65556", &["xoa.xva"]), sha));
+        // RPM release at the same SHA is NOT an image
+        assert!(!is_image_release_for(
+            &release("v5.113.2_e281c536", &["xoa-hl-5.113.2.el9.noarch.rpm"]),
+            sha
+        ));
+        // Image release for a different commit
+        assert!(!is_image_release_for(&release("xoa-image-20260701-090ce7e", &["xoa.xva.gz"]), sha));
+        // Image release whose XVA upload failed (no asset) doesn't count
+        assert!(!is_image_release_for(&release("xoa-image-20260713-cb65556", &[]), sha));
+        assert!(!is_image_release_for(&release("xoa-image-20260713-cb65556", &["notes.txt"]), sha));
+    }
+
+    #[test]
+    fn generated_image_tag_matches_its_own_release_check() {
+        let sha = "cb65556aabbccdd";
+        let tag = generate_image_tag(sha);
+        assert!(is_image_release_for(&release(&tag, &["xoa.xva.gz"]), &sha[..7]));
+    }
+}

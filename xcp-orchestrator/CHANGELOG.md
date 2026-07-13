@@ -2,6 +2,37 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-07-13 (third batch)
+
+### Fixed
+
+- **xoa-vm-agent**: "code unchanged" no longer implies "nothing to do". The xoa-hl
+  repo carries two kinds of releases — RPM releases from the `build-xoa.yml`
+  workflow and this agent's own `xoa-image-{date}-{sha7}` XVA releases — and the
+  previous skip check ("latest release matches HEAD") only proved the RPM was
+  current, skipping before the VM image was ever built. The agent now skips only
+  when an `xoa-image-*` release **with an XVA asset** exists for HEAD; if the RPM
+  release covers HEAD but the image is missing, it skips just the workflow
+  dispatch and proceeds with the Packer build and image upload. The local
+  fast-path also requires `last_tag` to be an image tag, which self-heals the
+  state poisoned by the previous backfill.
+- **xoa-vm-agent**: `resolve_xoa_hl_rpm_url` used `releases/latest`, which breaks
+  once an image release becomes the latest (no RPM asset). It now scans the
+  release list for the newest release carrying an `.rpm` asset.
+- **orchestrator**: the Ollama diagnostic was never actually called since the
+  workspace split — `llm_hint` was a hardcoded string, which is why no analysis
+  appeared despite `ollama serve` running. On failure the orchestrator now pulls
+  the failed run's job-log tail from GitHub Actions and feeds it to
+  `qwen3-coder:30b` at `localhost:11434` (restoring the `1f87fe4` behaviour),
+  logging the attempt and outcome to the journal. Any GitHub/Ollama error is
+  non-fatal: it logs a warning, falls back to a static hint, and still renders
+  the dashboard.
+
+### Added
+
+- `shared::fetch_releases` (release list with tags, URLs and asset names) and
+  unit tests for the image-release matching and run-URL parsing logic.
+
 ## 2026-07-13 (second batch)
 
 ### Fixed

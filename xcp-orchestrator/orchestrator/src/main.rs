@@ -3,12 +3,14 @@
 use chrono::{DateTime, Utc};
 use shared::{
     AgentStatus, PipelineStatus, WorkflowStatus,
-    TARGET_REPORT_DIR, HISTORY_FILE,
+    MODEL_NAME, OWNER, TARGET_REPORT_DIR, HISTORY_FILE,
+    create_github_client, load_github_token,
+    extract_failed_log_context, evaluate_log_via_ollama,
     storage::{write_atomic_json, load_json_with_default},
     OrchestratorError,
 };
 use tokio::fs;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct RunHistoryItem {
@@ -64,12 +66,92 @@ fn component_or_agent(status: &AgentStatus, name: &str) -> (String, String) {
     }
 }
 
-fn log_agent_failure(agent_name: &str, status: &AgentStatus) {
-    let is_failure = matches!(
-        status.status,
+fn is_failed(status: &WorkflowStatus) -> bool {
+    matches!(
+        status,
         WorkflowStatus::Failure | WorkflowStatus::Timeout | WorkflowStatus::Aborted
+    )
+}
+
+/// Parse a GitHub Actions run URL ("https://github.com/{OWNER}/{repo}/actions/runs/{id}")
+/// into `(repo, run_id)`. Release pages, "#" placeholders etc. yield `None`.
+fn parse_run_url(url: &str) -> Option<(String, u64)> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    if parts.next()? != OWNER {
+        return None;
+    }
+    let repo = parts.next()?;
+    if parts.next()? != "actions" || parts.next()? != "runs" {
+        return None;
+    }
+    let run_id: u64 = parts.next()?.parse().ok()?;
+    Some((repo.to_string(), run_id))
+}
+
+/// URLs worth diagnosing from one agent: failed components first, then the
+/// agent-level URL as fallback for old status files without components.
+fn failed_run_candidates(status: &AgentStatus) -> Vec<String> {
+    let mut urls: Vec<String> = status
+        .components
+        .iter()
+        .filter(|c| is_failed(&c.status) && !c.url.is_empty())
+        .map(|c| c.url.clone())
+        .collect();
+    if is_failed(&status.status) && !status.url.is_empty() {
+        urls.push(status.url.clone());
+    }
+    urls
+}
+
+const FALLBACK_HINT: &str =
+    "Automated analysis unavailable — inspect the linked GitHub Actions logs.";
+
+async fn try_ollama_analysis(repo: &str, run_id: u64) -> Result<String, OrchestratorError> {
+    let token = load_github_token()?;
+    let gh_client = create_github_client(&token)?;
+    let log_tail = extract_failed_log_context(&gh_client, repo, run_id).await?;
+
+    // Plain client for Ollama — the GitHub auth header must not go to localhost.
+    let ollama_client = reqwest::Client::new();
+    evaluate_log_via_ollama(&ollama_client, &log_tail).await
+}
+
+/// Feed the first failed run's log tail to the local Ollama model. Every step
+/// is non-fatal: the dashboard must render even when GitHub or Ollama is down.
+async fn analyze_failure_via_ollama(
+    iso: Option<&AgentStatus>,
+    xoa: Option<&AgentStatus>,
+) -> String {
+    let target = [iso, xoa]
+        .into_iter()
+        .flatten()
+        .flat_map(failed_run_candidates)
+        .find_map(|url| parse_run_url(&url));
+
+    let Some((repo, run_id)) = target else {
+        warn!("No failed GitHub Actions run URL found; skipping Ollama analysis");
+        return FALLBACK_HINT.to_string();
+    };
+
+    info!(
+        "Analyzing failed run {}/{}/actions/runs/{} via Ollama ({})...",
+        OWNER, repo, run_id, MODEL_NAME
     );
-    if !is_failure {
+    match try_ollama_analysis(&repo, run_id).await {
+        Ok(hint) => {
+            info!("Ollama analysis complete ({} chars)", hint.len());
+            hint
+        }
+        Err(e) => {
+            warn!("Ollama analysis failed: {}", e);
+            FALLBACK_HINT.to_string()
+        }
+    }
+}
+
+fn log_agent_failure(agent_name: &str, status: &AgentStatus) {
+    if !is_failed(&status.status) {
         return;
     }
     let logs = if status.url.is_empty() { "n/a" } else { status.url.as_str() };
@@ -78,10 +160,7 @@ fn log_agent_failure(agent_name: &str, status: &AgentStatus) {
         agent_name, status.status, status.phase, status.detail, logs
     );
     for c in &status.components {
-        if matches!(
-            c.status,
-            WorkflowStatus::Failure | WorkflowStatus::Timeout | WorkflowStatus::Aborted
-        ) {
+        if is_failed(&c.status) {
             let logs = if c.url.is_empty() { "n/a" } else { c.url.as_str() };
             error!("  component {}: {} — logs: {}", c.name, c.status, logs);
         }
@@ -118,7 +197,10 @@ async fn main() -> Result<(), OrchestratorError> {
         if let Some(ref status) = xoa_vm_agent_status {
             log_agent_failure("xoa-vm-agent", status);
         }
-        llm_hint = Some("Verify network interfaces and upstream tag validity fields.".to_string());
+        llm_hint = Some(
+            analyze_failure_via_ollama(iso_agent_status.as_ref(), xoa_vm_agent_status.as_ref())
+                .await,
+        );
     }
 
     // 3. Formulate structural history tracking context
@@ -265,6 +347,38 @@ mod tests {
         assert!(html.contains(r#"class="badge failure">Failure"#));
         assert!(html.contains(r#"class="badge progress">In Progress"#));
         assert!(html.contains("check the spec file"));
+    }
+
+    #[test]
+    fn parse_run_url_accepts_actions_runs_only() {
+        assert_eq!(
+            parse_run_url("https://github.com/Vagrantin/xolite-ce/actions/runs/29237679214"),
+            Some(("xolite-ce".to_string(), 29237679214))
+        );
+        assert_eq!(parse_run_url("https://github.com/Vagrantin/xoa-hl/releases/tag/v1"), None);
+        assert_eq!(parse_run_url("https://github.com/other/xoa-hl/actions/runs/1"), None);
+        assert_eq!(parse_run_url("#"), None);
+        assert_eq!(parse_run_url(""), None);
+    }
+
+    #[test]
+    fn failed_candidates_prefer_components_then_agent_url() {
+        let mut status = AgentStatus::new("failed", WorkflowStatus::Failure);
+        status.url = "https://github.com/Vagrantin/xolite-ce/actions/runs/2".to_string();
+        status.set_component(
+            "xoa-proxy",
+            WorkflowStatus::Failure,
+            "https://github.com/Vagrantin/xoa-proxy/actions/runs/1",
+        );
+        status.set_component("xolite-ce", WorkflowStatus::Success, "https://x/3");
+        let urls = failed_run_candidates(&status);
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/Vagrantin/xoa-proxy/actions/runs/1".to_string(),
+                "https://github.com/Vagrantin/xolite-ce/actions/runs/2".to_string(),
+            ]
+        );
     }
 
     #[test]
