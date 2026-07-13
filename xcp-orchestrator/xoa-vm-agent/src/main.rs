@@ -45,6 +45,7 @@ const OUTPUT_DIR: &str = "/var/lib/xcp-hl-orchestrator/output/xoa-hl";
 /// Full "owner/repo" path — used directly in API URLs that do not go through
 /// the shared helpers (which prepend OWNER themselves).
 const XOA_HL_REPO: &str = "Vagrantin/xoa-hl";
+const BUILD_XOA_HL_REPO: &str = "Vagrantin/build-xoa-hl";
 
 /// Workflow file that builds the RPM and creates a GitHub Release.
 const XOA_HL_WORKFLOW_FILE: &str = "build-xoa.yml";
@@ -624,7 +625,7 @@ async fn sync_repository() -> Result<()> {
 
     if !repo_path.exists() {
         let status = AsyncCommand::new("git")
-            .args(["clone", &format!("https://github.com/{}", XOA_HL_REPO)])
+            .args(["clone", &format!("https://github.com/{}", BUILD_XOA_HL_REPO)])
             .arg(repo_path)
             .status()
             .await
