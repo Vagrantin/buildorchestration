@@ -37,6 +37,9 @@ use tracing::{debug, error, info, warn};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const STATUS_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa-vm-agent.status.json";
+/// Infrastructure config (non-secret) — installed by deploy.sh from
+/// xoa-vm-agent/build.config.sample. Missing file = baked-in defaults.
+const BUILD_CONFIG_FILE: &str = "/etc/xcp-orchestrator/build.config";
 const VERSION_STATE_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa_agent_version_state.json";
 const REPO_DIR: &str = "/var/lib/xcp-hl-orchestrator/repos/build-xoa-hl";
 const BUILD_DIR: &str = "/var/lib/xcp-hl-orchestrator/build/xoa-hl";
@@ -114,8 +117,11 @@ struct BuildConfig {
     xcpng_ip: String,
     xcpng_user: String,
     xcpng_password: String,
+    sr_name: String,
     vm_network_name: String,
     vm_name: String,
+    vm_disk_size_mb: u32,
+    vm_memory_mb: u32,
     almalinux_root_password: String,
     almalinux_iso_url: String,
     almalinux_iso_checksum: String,
@@ -130,8 +136,11 @@ impl Default for BuildConfig {
             xcpng_ip: "192.168.1.10".to_string(),
             xcpng_user: "root".to_string(),
             xcpng_password: String::new(),
+            sr_name: "Local storage".to_string(),
             vm_network_name: "Pool-wide network associated with eth0".to_string(),
             vm_name: "xoa-almalinux".to_string(),
+            vm_disk_size_mb: 10000,
+            vm_memory_mb: 2048,
             almalinux_root_password: String::new(),
             almalinux_iso_url: ALMALINUX_ISO_URL.to_string(),
             almalinux_iso_checksum: String::new(),
@@ -144,6 +153,90 @@ impl Default for BuildConfig {
                     .to_string(),
         }
     }
+}
+
+impl BuildConfig {
+    /// Defaults overlaid with /etc/xcp-orchestrator/build.config when present.
+    /// A missing file is non-fatal (baked-in defaults keep working); a file
+    /// that exists but fails to parse is fatal — a half-applied config
+    /// pointing at the wrong host is worse than stopping.
+    fn load() -> Result<Self> {
+        let mut config = Self::default();
+        match std::fs::read_to_string(BUILD_CONFIG_FILE) {
+            Ok(content) => {
+                apply_build_config(&mut config, &content)
+                    .with_context(|| format!("Failed to parse {}", BUILD_CONFIG_FILE))?;
+                info!(
+                    "Build config loaded from {}: xcpng_ip={}, xcpng_user={}, sr_name={:?}, \
+                     network={:?}, vm_name={}, disk={}MB, memory={}MB",
+                    BUILD_CONFIG_FILE,
+                    config.xcpng_ip,
+                    config.xcpng_user,
+                    config.sr_name,
+                    config.vm_network_name,
+                    config.vm_name,
+                    config.vm_disk_size_mb,
+                    config.vm_memory_mb,
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    "No {} found — using baked-in default build config. \
+                     Run deploy.sh to install one from build.config.sample.",
+                    BUILD_CONFIG_FILE
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to read {}", BUILD_CONFIG_FILE));
+            }
+        }
+        Ok(config)
+    }
+}
+
+/// Overlay shell-style KEY="VALUE" lines onto a BuildConfig. Blank lines and
+/// `#` comments are skipped, surrounding quotes are stripped (the file stays
+/// `source`-able from a shell). Unknown keys warn but don't fail; secrets are
+/// deliberately not accepted here (LoadCredential only).
+fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .with_context(|| format!("line {}: expected KEY=VALUE, got {:?}", lineno + 1, raw))?;
+        let key = key.trim();
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+
+        let parse_mb = |v: &str| {
+            v.parse::<u32>()
+                .with_context(|| format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v))
+        };
+
+        match key {
+            "XCPNG_IP" => config.xcpng_ip = value.to_string(),
+            "XCPNG_USER" => config.xcpng_user = value.to_string(),
+            "SR_NAME" => config.sr_name = value.to_string(),
+            "VM_NETWORK_NAME" => config.vm_network_name = value.to_string(),
+            "VM_NAME" => config.vm_name = value.to_string(),
+            "VM_DISK_SIZE_MB" => config.vm_disk_size_mb = parse_mb(value)?,
+            "VM_MEMORY_MB" => config.vm_memory_mb = parse_mb(value)?,
+            "ALMALINUX_ISO_URL" => config.almalinux_iso_url = value.to_string(),
+            "XE_GUEST_UTILITIES_URL" => config.xe_guest_utilities_url = value.to_string(),
+            "XE_GUEST_UTILITIES_XENSTORE_URL" => {
+                config.xe_guest_utilities_xenstore_url = value.to_string()
+            }
+            _ => warn!("build.config line {}: unknown key {:?} ignored", lineno + 1, key),
+        }
+    }
+    Ok(())
 }
 
 // ── Main Workflow ─────────────────────────────────────────────────────────────
@@ -312,7 +405,15 @@ async fn main() -> Result<()> {
     status.phase = "phase_5_resolve_values".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    let mut config = BuildConfig::default();
+    let mut config = match BuildConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("Build config invalid: {}", e);
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
+        }
+    };
     if let Err(e) = resolve_dynamic_values(&client, &mut config).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Value resolution failed: {}", e);
@@ -864,11 +965,11 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "remote_password": "{xcpng_pass}",
     "iso_url": "{iso_url}",
     "iso_checksum": "{iso_chk}",
-    "sr_name": "Local storage",
+    "sr_name": "{sr_name}",
     "vm_name": "{vm_name}",
     "vm_description": "XOA HomeLab Edition — AlmaLinux {ver}",
-    "disk_size": 10000,
-    "vm_memory": 2048,
+    "disk_size": {disk_mb},
+    "vm_memory": {mem_mb},
     "http_directory": ".",
     "network_names": ["{net}"],
     "boot_command": [
@@ -924,7 +1025,10 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         xcpng_pass = config.xcpng_password,
         iso_url = config.almalinux_iso_url,
         iso_chk = config.almalinux_iso_checksum,
+        sr_name = config.sr_name,
         vm_name = config.vm_name,
+        disk_mb = config.vm_disk_size_mb,
+        mem_mb = config.vm_memory_mb,
         ver = ALMALINUX_VERSION,
         net = config.vm_network_name,
         rootpw = config.almalinux_root_password,
@@ -1286,5 +1390,71 @@ mod tests {
         let sha = "cb65556aabbccdd";
         let tag = generate_image_tag(sha);
         assert!(is_image_release_for(&release(&tag, &["xoa.xva.gz"]), &sha[..7]));
+    }
+
+    #[test]
+    fn build_config_overlays_known_keys() {
+        let mut config = BuildConfig::default();
+        apply_build_config(
+            &mut config,
+            r#"
+# XCP-ng Hypervisor Connection
+XCPNG_IP="192.168.7.42"
+XCPNG_USER=admin
+SR_NAME='NVMe storage'
+VM_NETWORK_NAME="LAN"
+
+VM_DISK_SIZE_MB=20000
+VM_MEMORY_MB="4096"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.xcpng_ip, "192.168.7.42");
+        assert_eq!(config.xcpng_user, "admin");
+        assert_eq!(config.sr_name, "NVMe storage");
+        assert_eq!(config.vm_network_name, "LAN");
+        assert_eq!(config.vm_disk_size_mb, 20000);
+        assert_eq!(config.vm_memory_mb, 4096);
+        // Untouched keys keep their defaults
+        assert_eq!(config.vm_name, "xoa-almalinux");
+    }
+
+    #[test]
+    fn build_config_empty_file_keeps_defaults() {
+        let mut config = BuildConfig::default();
+        apply_build_config(&mut config, "\n# comments only\n").unwrap();
+        assert_eq!(config.xcpng_ip, BuildConfig::default().xcpng_ip);
+    }
+
+    #[test]
+    fn build_config_unknown_key_is_ignored() {
+        let mut config = BuildConfig::default();
+        apply_build_config(&mut config, "DEBIAN_ISO_URL=\"http://example.com\"\nVM_NAME=xoa\n")
+            .unwrap();
+        assert_eq!(config.vm_name, "xoa");
+    }
+
+    #[test]
+    fn shipped_sample_parses_and_matches_defaults() {
+        let mut config = BuildConfig::default();
+        apply_build_config(&mut config, include_str!("../build.config.sample")).unwrap();
+        let d = BuildConfig::default();
+        assert_eq!(config.xcpng_ip, d.xcpng_ip);
+        assert_eq!(config.xcpng_user, d.xcpng_user);
+        assert_eq!(config.sr_name, d.sr_name);
+        assert_eq!(config.vm_network_name, d.vm_network_name);
+        assert_eq!(config.vm_name, d.vm_name);
+        assert_eq!(config.vm_disk_size_mb, d.vm_disk_size_mb);
+        assert_eq!(config.vm_memory_mb, d.vm_memory_mb);
+        assert_eq!(config.almalinux_iso_url, d.almalinux_iso_url);
+        assert_eq!(config.xe_guest_utilities_url, d.xe_guest_utilities_url);
+        assert_eq!(config.xe_guest_utilities_xenstore_url, d.xe_guest_utilities_xenstore_url);
+    }
+
+    #[test]
+    fn build_config_rejects_garbage() {
+        let mut config = BuildConfig::default();
+        assert!(apply_build_config(&mut config, "not a key value line\n").is_err());
+        assert!(apply_build_config(&mut config, "VM_MEMORY_MB=lots\n").is_err());
     }
 }

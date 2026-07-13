@@ -51,13 +51,22 @@ prompt_secret_if_missing "github_token"            "Enter your GitHub Personal A
 prompt_secret_if_missing "xcpng_password"           "Enter the XCP-ng host root password"
 prompt_secret_if_missing "almalinux_root_password"  "Enter the AlmaLinux VM root password to bake into images"
 
-# 5. Sync systemd unit files
+# 5. Install the non-secret build config if not already present (never overwritten)
+CONFIG_DIR="/etc/xcp-orchestrator"
+sudo mkdir -p "$CONFIG_DIR"
+if [ ! -f "$CONFIG_DIR/build.config" ]; then
+    sudo cp xoa-vm-agent/build.config.sample "$CONFIG_DIR/build.config"
+    sudo chmod 644 "$CONFIG_DIR/build.config"
+    echo "NOTICE: installed default $CONFIG_DIR/build.config — review/edit it for your infrastructure."
+fi
+
+# 6. Sync systemd unit files
 echo "---> Syncing systemd configurations..."
 for unit in "${UNITS[@]}"; do
     sudo cp "systemd/${unit}" "/etc/systemd/system/"
 done
 
-# 6. Reload and activate all timer loops
+# 7. Reload and activate all timer loops
 sudo systemctl daemon-reload
 for timer in xcp-orchestrator.timer iso-agent.timer xoa-vm-agent.timer; do
     sudo systemctl enable "$timer"

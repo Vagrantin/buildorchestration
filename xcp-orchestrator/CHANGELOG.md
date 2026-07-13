@@ -2,6 +2,21 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-07-13 (fifth batch)
+
+### Fixed
+
+- **xoa-vm-agent**: infrastructure values (XCP-ng host/user, SR, network, VM
+  name/disk/memory, ISO and xe-guest-utilities URLs) were baked into
+  `BuildConfig::default()` — the `build.config` concept from the old shell
+  orchestrator was lost in the Rust rewrite. The agent now overlays
+  `/etc/xcp-orchestrator/build.config` (shell-style KEY="VALUE", installed by
+  `deploy.sh` from `xoa-vm-agent/build.config.sample` if missing, never
+  overwritten) on those defaults. A missing file warns and keeps the old
+  defaults; a malformed file is fatal. Secrets stay exclusively in systemd
+  `LoadCredential`. `SR_NAME`, `VM_DISK_SIZE_MB` and `VM_MEMORY_MB` are newly
+  configurable (they were literals in the Packer template).
+
 ## 2026-07-13 (fourth batch)
 
 ### Changed

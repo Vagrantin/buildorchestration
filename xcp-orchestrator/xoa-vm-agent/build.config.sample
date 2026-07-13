@@ -1,0 +1,29 @@
+# ==========================================================
+#  xoa-vm-agent — Infrastructure & Target VM Configuration
+# ==========================================================
+# Deployed by deploy.sh to /etc/xcp-orchestrator/build.config
+# (only if missing — an existing file is never overwritten).
+# Edit the deployed copy to match your infrastructure; the agent
+# falls back to these baked-in defaults when the file is absent.
+#
+# NO SECRETS HERE. Passwords are loaded exclusively via systemd
+# LoadCredential= from /etc/xcp-hl-credentials/ (github_token,
+# xcpng_password, almalinux_root_password).
+
+# XCP-ng Hypervisor Connection
+XCPNG_IP="192.168.1.10"
+XCPNG_USER="root"
+SR_NAME="Local storage"
+VM_NETWORK_NAME="Pool-wide network associated with eth0"
+
+# Target XOA VM Specifications
+VM_NAME="xoa-almalinux"
+VM_DISK_SIZE_MB=10000
+VM_MEMORY_MB=2048
+
+# Installation Media (AlmaLinux 9 minimal)
+ALMALINUX_ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
+
+# Xen guest tools baked into the image
+XE_GUEST_UTILITIES_URL="https://github.com/xcp-ng/xcp/releases/download/v8.3.0/xe-guest-utilities-8.3.0-1.x86_64.rpm"
+XE_GUEST_UTILITIES_XENSTORE_URL="https://github.com/xcp-ng/xcp/releases/download/v8.3.0/xe-guest-utilities-xenstore-8.3.0-1.x86_64.rpm"
