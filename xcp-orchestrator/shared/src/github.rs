@@ -155,6 +155,111 @@ pub async fn create_and_push_tag(
     }
 }
 
+/// Fetch the latest published release of a repo and resolve its tag to a
+/// commit SHA. Returns `Ok(None)` when the repo has no releases yet.
+///
+/// This is the ground truth for "what did we last build successfully" — unlike
+/// the local version-state files it survives state loss and failed runs.
+pub async fn fetch_latest_release_ref(
+    client: &Client,
+    repo: &str,
+) -> Result<Option<(String, String)>, OrchestratorError> {
+    let url = format!("https://api.github.com/repos/{}/{}/releases/latest", OWNER, repo);
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| OrchestratorError::GitHubApi(format!("latest release for {}", repo), e.to_string()))?;
+
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    let release: GHRelease =
+        parse_github_response(res, &format!("fetch_latest_release_ref for {}", repo)).await?;
+    let sha = fetch_tag_commit_sha(client, repo, &release.tag_name).await?;
+    Ok(Some((release.tag_name, sha)))
+}
+
+/// Resolve a tag name to the commit SHA it points at, dereferencing annotated
+/// tags (the agents push lightweight tags, so the extra hop is a fallback).
+pub async fn fetch_tag_commit_sha(
+    client: &Client,
+    repo: &str,
+    tag: &str,
+) -> Result<String, OrchestratorError> {
+    #[derive(Deserialize)]
+    struct RefObject {
+        sha: String,
+        #[serde(rename = "type")]
+        object_type: String,
+    }
+    #[derive(Deserialize)]
+    struct RefResp {
+        object: RefObject,
+    }
+
+    let url = format!("https://api.github.com/repos/{}/{}/git/ref/tags/{}", OWNER, repo, tag);
+    let resp: RefResp = parse_github_response(
+        client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::GitHubApi(tag.to_string(), e.to_string()))?,
+        &format!("fetch_tag_commit_sha for {} on {}", tag, repo),
+    )
+    .await?;
+
+    if resp.object.object_type != "tag" {
+        return Ok(resp.object.sha);
+    }
+
+    let deref_url = format!(
+        "https://api.github.com/repos/{}/{}/git/tags/{}",
+        OWNER, repo, resp.object.sha
+    );
+    let deref: RefResp = parse_github_response(
+        client
+            .get(&deref_url)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::GitHubApi(tag.to_string(), e.to_string()))?,
+        &format!("dereference annotated tag {} on {}", tag, repo),
+    )
+    .await?;
+    Ok(deref.object.sha)
+}
+
+/// Parse a `v{version}-ce{N}` tag (xolite-ce, xcp-ng-ce-iso) into
+/// `(version, ce_counter)`, e.g. `v0.21.0-ce6` → `("0.21.0", 6)`.
+pub fn parse_ce_tag(tag: &str) -> Option<(String, u32)> {
+    let body = tag.strip_prefix('v')?;
+    let ce_pos = body.rfind("-ce")?;
+    let counter: u32 = body[ce_pos + 3..].parse().ok()?;
+    let version = &body[..ce_pos];
+    if version.is_empty() {
+        return None;
+    }
+    Some((version.to_string(), counter))
+}
+
+/// Parse a plain xoa-proxy tag `v{X.Y.Z}` or `v{X.Y.Z.N}` into
+/// `(version, counter)`, e.g. `v0.1.1` → `("0.1.1", 0)`, `v0.1.1.3` → `("0.1.1", 3)`.
+pub fn parse_plain_version_tag(tag: &str) -> Option<(String, u32)> {
+    let segments: Vec<&str> = tag.strip_prefix('v')?.split('.').collect();
+    if !segments
+        .iter()
+        .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    match segments.len() {
+        3 => Some((segments.join("."), 0)),
+        4 => Some((segments[..3].join("."), segments[3].parse().ok()?)),
+        _ => None,
+    }
+}
+
 /// Compute the next tag to try when `tag` already exists on the remote.
 ///
 /// Two tag schemes are in use:
@@ -198,7 +303,25 @@ fn next_tag_candidate(tag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::next_tag_candidate;
+    use super::{next_tag_candidate, parse_ce_tag, parse_plain_version_tag};
+
+    #[test]
+    fn ce_tags_parse() {
+        assert_eq!(parse_ce_tag("v0.21.0-ce6"), Some(("0.21.0".to_string(), 6)));
+        assert_eq!(parse_ce_tag("v8.3-ce9"), Some(("8.3".to_string(), 9)));
+        assert_eq!(parse_ce_tag("v0.1.1"), None);
+        assert_eq!(parse_ce_tag("v-ce3"), None);
+        assert_eq!(parse_ce_tag("v1-cebad"), None);
+    }
+
+    #[test]
+    fn plain_version_tags_parse() {
+        assert_eq!(parse_plain_version_tag("v0.1.1"), Some(("0.1.1".to_string(), 0)));
+        assert_eq!(parse_plain_version_tag("v0.1.1.3"), Some(("0.1.1".to_string(), 3)));
+        assert_eq!(parse_plain_version_tag("v0.21.0-ce6"), None);
+        assert_eq!(parse_plain_version_tag("v5.113.2_e281c536"), None);
+        assert_eq!(parse_plain_version_tag("v0.1"), None);
+    }
 
     #[test]
     fn ce_suffix_increments() {

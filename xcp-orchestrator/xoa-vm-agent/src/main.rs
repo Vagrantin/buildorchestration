@@ -21,7 +21,8 @@ use chrono::{DateTime, Utc};
 use shared::{
     AgentStatus, WorkflowStatus,
     create_github_client, load_github_token,
-    fetch_repo_head_sha, locate_dispatch_triggered_run, query_run_conclusion,
+    fetch_repo_head_sha, fetch_latest_release_ref,
+    locate_dispatch_triggered_run, query_run_conclusion,
     parse_github_response,
 };
 use std::path::{Path, PathBuf};
@@ -202,6 +203,30 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Local state is empty or stale — cross-check the latest GitHub release
+    // (ground truth). This prevents pointless rebuilds after state loss.
+    match fetch_latest_release_ref(&client, "xoa-hl").await {
+        Ok(Some((tag, release_sha))) if release_sha == repo_head_sha => {
+            info!(
+                "No changes: latest release {} already matches HEAD (SHA: {}), skipping.",
+                tag,
+                &repo_head_sha[..7]
+            );
+            version_state.last_built_sha = repo_head_sha.clone();
+            version_state.last_tag = tag.clone();
+            version_state.save()?;
+            status.status = WorkflowStatus::Skipped;
+            status.detail = format!("Already released as {} (SHA: {})", tag, &repo_head_sha[..7]);
+            status.write_to_file(STATUS_FILE)?;
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(e) => warn!(
+            "Could not check latest xoa-hl release ({}); proceeding with build.",
+            e
+        ),
+    }
+
     info!(
         "Changes detected (SHA: {}), proceeding with build.",
         &repo_head_sha[..7]
@@ -219,6 +244,7 @@ async fn main() -> Result<()> {
             error!("Workflow dispatch failed: {}", e);
             status.status = WorkflowStatus::Failure;
             status.detail = format!("Workflow dispatch failed: {}", e);
+            status.set_component("xoa-hl", WorkflowStatus::Failure, String::new());
             status.write_to_file(STATUS_FILE)?;
             return Err(e);
         }
@@ -226,14 +252,19 @@ async fn main() -> Result<()> {
 
     status.url = run_url.clone();
     status.detail = format!("Waiting for workflow: {}", run_url);
+    status.set_component("xoa-hl", WorkflowStatus::InProgress, run_url.clone());
     status.write_to_file(STATUS_FILE)?;
 
     match wait_for_workflow(&client, run_id, &run_url, WORKFLOW_TIMEOUT).await {
-        Ok(()) => info!("xoa-hl workflow completed successfully"),
+        Ok(()) => {
+            info!("xoa-hl workflow completed successfully");
+            status.set_component("xoa-hl", WorkflowStatus::Success, run_url.clone());
+        }
         Err(e) => {
             error!("xoa-hl workflow failed: {}", e);
             status.status = WorkflowStatus::Failure;
             status.detail = format!("Workflow failed: {}", e);
+            status.set_component("xoa-hl", WorkflowStatus::Failure, run_url.clone());
             status.write_to_file(STATUS_FILE)?;
             return Err(e);
         }
@@ -332,23 +363,30 @@ async fn main() -> Result<()> {
     let image_tag = generate_image_tag(&repo_head_sha);
     let image_name = format!("XOA HomeLab Edition - {}", image_tag);
 
-    let upload_url =
+    let (upload_url, release_url) =
         match create_github_release(&client, &image_tag, &image_name, &repo_head_sha).await {
             Ok(u) => u,
             Err(e) => {
                 status.status = WorkflowStatus::Failure;
                 status.detail = format!("Release creation failed: {}", e);
+                status.set_component("xoa-image", WorkflowStatus::Failure, String::new());
                 status.write_to_file(STATUS_FILE)?;
                 return Err(e);
             }
         };
 
+    status.set_component("xoa-image", WorkflowStatus::InProgress, release_url.clone());
+    status.write_to_file(STATUS_FILE)?;
+
     if let Err(e) = upload_asset(&client, &upload_url, &xva_path).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Asset upload failed: {}", e);
+        status.set_component("xoa-image", WorkflowStatus::Failure, release_url.clone());
         status.write_to_file(STATUS_FILE)?;
         return Err(e);
     }
+
+    status.set_component("xoa-image", WorkflowStatus::Success, release_url.clone());
 
     // ── PHASE 10: Persist version state ──────────────────────────────────────
     info!("PHASE 10: Persisting version state...");
@@ -1075,7 +1113,8 @@ fn generate_image_tag(head_sha: &str) -> String {
     format!("xoa-image-{}-{}", date, short)
 }
 
-/// Create a GitHub Release, or return the existing one's upload URL (idempotent).
+/// Create a GitHub Release, or reuse the existing one (idempotent).
+/// Returns `(upload_url, html_url)`.
 ///
 /// The tag is created by the GitHub API using `target_sha` as `target_commitish`.
 async fn create_github_release(
@@ -1083,7 +1122,7 @@ async fn create_github_release(
     tag: &str,
     name: &str,
     target_sha: &str,
-) -> Result<String> {
+) -> Result<(String, String)> {
     #[derive(serde::Deserialize)]
     struct ReleaseResp {
         upload_url: String,
@@ -1099,7 +1138,10 @@ async fn create_github_release(
         if res.status().is_success() {
             if let Ok(r) = res.json::<ReleaseResp>().await {
                 info!("Release {} already exists, reusing: {}", tag, r.html_url);
-                return Ok(r.upload_url.trim_end_matches("{?name,label}").to_string());
+                return Ok((
+                    r.upload_url.trim_end_matches("{?name,label}").to_string(),
+                    r.html_url,
+                ));
             }
         }
     }
@@ -1137,7 +1179,10 @@ async fn create_github_release(
         .context("Failed to parse GitHub Release response")?;
 
     info!("Created GitHub Release: {}", release.html_url);
-    Ok(release.upload_url.trim_end_matches("{?name,label}").to_string())
+    Ok((
+        release.upload_url.trim_end_matches("{?name,label}").to_string(),
+        release.html_url,
+    ))
 }
 
 /// Stream-upload `xva_path` to an existing GitHub Release upload URL.

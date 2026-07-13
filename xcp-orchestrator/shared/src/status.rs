@@ -44,6 +44,15 @@ impl Default for WorkflowStatus {
     }
 }
 
+/// Status of one component handled by an agent (e.g. "xolite-ce", "xoa-image"),
+/// with a link to its GitHub Actions run or release page.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ComponentStatus {
+    pub name: String,
+    pub status: WorkflowStatus,
+    pub url: String,
+}
+
 /// Status information for a single agent
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AgentStatus {
@@ -57,6 +66,9 @@ pub struct AgentStatus {
     pub detail: String,
     /// Timestamp of the last status update
     pub timestamp: DateTime<Utc>,
+    /// Per-component statuses — the dashboard links each entry's URL as "Logs"
+    #[serde(default)]
+    pub components: Vec<ComponentStatus>,
 }
 
 impl AgentStatus {
@@ -68,7 +80,32 @@ impl AgentStatus {
             url: String::new(),
             detail: String::new(),
             timestamp: Utc::now(),
+            components: Vec::new(),
         }
+    }
+
+    /// Insert or update a component entry by name.
+    pub fn set_component(
+        &mut self,
+        name: impl Into<String>,
+        status: WorkflowStatus,
+        url: impl Into<String>,
+    ) {
+        let name = name.into();
+        let url = url.into();
+        if let Some(existing) = self.components.iter_mut().find(|c| c.name == name) {
+            existing.status = status;
+            if !url.is_empty() {
+                existing.url = url;
+            }
+        } else {
+            self.components.push(ComponentStatus { name, status, url });
+        }
+    }
+
+    /// Look up a component's (status, url), if recorded.
+    pub fn component(&self, name: &str) -> Option<&ComponentStatus> {
+        self.components.iter().find(|c| c.name == name)
     }
 
     /// Write status to a JSON file atomically

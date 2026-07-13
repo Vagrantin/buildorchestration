@@ -12,8 +12,9 @@ use shared::{
     create_github_client, load_github_token,
     AgentStatus, WorkflowStatus, OrchestratorError,
     ComponentVersionState, IsoVersionState,
-    fetch_repo_head_sha,
+    fetch_repo_head_sha, fetch_latest_release_ref,
     fetch_latest_upstream_xolite_tag, fetch_upstream_xolite_version, fetch_xoa_proxy_version,
+    parse_ce_tag, parse_plain_version_tag,
     create_and_push_tag, locate_tag_triggered_run, query_run_conclusion,
     append_release_matrix_entry,
     XCPNG_TARGET_VERSION,
@@ -80,41 +81,97 @@ enum BumpDecision {
 
 async fn decide_xoa_proxy_bump(
     client: &reqwest::Client,
-    state: &ComponentVersionState,
+    state: &mut ComponentVersionState,
 ) -> Result<BumpDecision, OrchestratorError> {
     let cargo_version = fetch_xoa_proxy_version(client).await?;
     let head_sha = fetch_repo_head_sha(client, "xoa-proxy").await?;
 
+    if cargo_version == state.upstream_version && head_sha == state.last_built_sha {
+        return Ok(BumpDecision::NoChange);
+    }
+
+    // Local state says rebuild — cross-check the latest release (ground truth)
+    // so a lost or stale state file cannot trigger a pointless rebuild.
+    if latest_release_matches(client, "xoa-proxy", &head_sha, &cargo_version, state, |tag| {
+        parse_plain_version_tag(tag)
+    })
+    .await
+    {
+        return Ok(BumpDecision::NoChange);
+    }
+
     if cargo_version != state.upstream_version {
         return Ok(BumpDecision::UpstreamBump { upstream_version: cargo_version });
     }
-    if head_sha != state.last_built_sha {
-        return Ok(BumpDecision::PatchBump {
-            upstream_version: cargo_version,
-            next_counter: state.ce_counter + 1,
-        });
-    }
-    Ok(BumpDecision::NoChange)
+    Ok(BumpDecision::PatchBump {
+        upstream_version: cargo_version,
+        next_counter: state.ce_counter + 1,
+    })
 }
 
 async fn decide_xolite_bump(
     client: &reqwest::Client,
-    state: &ComponentVersionState,
+    state: &mut ComponentVersionState,
 ) -> Result<BumpDecision, OrchestratorError> {
     let upstream_tag = fetch_latest_upstream_xolite_tag(client).await?;
     let upstream_version = fetch_upstream_xolite_version(client, &upstream_tag).await?;
     let head_sha = fetch_repo_head_sha(client, "xolite-ce").await?;
 
+    if upstream_version == state.upstream_version && head_sha == state.last_built_sha {
+        return Ok(BumpDecision::NoChange);
+    }
+
+    if latest_release_matches(client, "xolite-ce", &head_sha, &upstream_version, state, |tag| {
+        parse_ce_tag(tag)
+    })
+    .await
+    {
+        return Ok(BumpDecision::NoChange);
+    }
+
     if upstream_version != state.upstream_version {
         return Ok(BumpDecision::UpstreamBump { upstream_version });
     }
-    if head_sha != state.last_built_sha {
-        return Ok(BumpDecision::PatchBump {
-            upstream_version,
-            next_counter: state.ce_counter + 1,
-        });
+    Ok(BumpDecision::PatchBump {
+        upstream_version,
+        next_counter: state.ce_counter + 1,
+    })
+}
+
+/// Check whether the repo's latest GitHub release already covers the current
+/// HEAD and expected version. If so, backfill `state` from it (making local
+/// state self-healing) and return true — nothing needs rebuilding.
+async fn latest_release_matches(
+    client: &reqwest::Client,
+    repo: &str,
+    head_sha: &str,
+    expected_version: &str,
+    state: &mut ComponentVersionState,
+    parse_tag: impl Fn(&str) -> Option<(String, u32)>,
+) -> bool {
+    match fetch_latest_release_ref(client, repo).await {
+        Ok(Some((tag, release_sha))) if release_sha == head_sha => {
+            match parse_tag(&tag) {
+                Some((version, counter)) if version == expected_version => {
+                    info!(
+                        "{}: latest release {} already matches HEAD, backfilling state.",
+                        repo, tag
+                    );
+                    state.upstream_version = version;
+                    state.ce_counter = counter;
+                    state.last_tag = tag;
+                    state.last_built_sha = head_sha.to_string();
+                    true
+                }
+                _ => false,
+            }
+        }
+        Ok(_) => false,
+        Err(e) => {
+            warn!("Could not check latest {} release ({}); trusting local state.", repo, e);
+            false
+        }
     }
-    Ok(BumpDecision::NoChange)
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -139,18 +196,25 @@ async fn main() -> Result<(), OrchestratorError> {
     // ── PHASE 1: Evaluate component changes and dispatch builds ───────────────
     info!("PHASE 1: Evaluating component changes and dispatching builds...");
 
+    // The decide functions may backfill state from the latest GitHub release,
+    // so each branch works on its own clone, merged back after the join.
+    let mut xolite_state = version_state.xolite_ce.clone();
+    let mut xoa_state = version_state.xoa_proxy.clone();
+
     let xolite_branch = async {
         let head_sha = fetch_repo_head_sha(&client, "xolite-ce").await?;
-        let decision = decide_xolite_bump(&client, &version_state.xolite_ce).await?;
+        let decision = decide_xolite_bump(&client, &mut xolite_state).await?;
         Ok::<(String, BumpDecision), OrchestratorError>((head_sha, decision))
     };
     let xoa_branch = async {
         let head_sha = fetch_repo_head_sha(&client, "xoa-proxy").await?;
-        let decision = decide_xoa_proxy_bump(&client, &version_state.xoa_proxy).await?;
+        let decision = decide_xoa_proxy_bump(&client, &mut xoa_state).await?;
         Ok::<(String, BumpDecision), OrchestratorError>((head_sha, decision))
     };
 
     let (xolite_res, xoa_res) = tokio::join!(xolite_branch, xoa_branch);
+    version_state.xolite_ce = xolite_state;
+    version_state.xoa_proxy = xoa_state;
 
     // ── Process XO Lite CE ────────────────────────────────────────────────────
     let xolite_head_sha: String;
@@ -261,6 +325,8 @@ async fn main() -> Result<(), OrchestratorError> {
         } else {
             WorkflowStatus::Skipped
         };
+    status.set_component("xolite-ce", xolite_status.clone(), xolite_url.clone());
+    status.set_component("xoa-proxy", xoa_status.clone(), xoa_url.clone());
     status.write_to_file(STATUS_FILE)?;
 
     // ── PHASE 2: Monitor component builds ────────────────────────────────────
@@ -286,6 +352,8 @@ async fn main() -> Result<(), OrchestratorError> {
             }
             status.status = WorkflowStatus::Timeout;
             status.detail = "Component monitoring timed out".to_string();
+            status.set_component("xolite-ce", xolite_status.clone(), String::new());
+            status.set_component("xoa-proxy", xoa_status.clone(), String::new());
             status.write_to_file(STATUS_FILE)?;
             break;
         }
@@ -365,6 +433,8 @@ async fn main() -> Result<(), OrchestratorError> {
         } else {
             WorkflowStatus::Success
         };
+        status.set_component("xolite-ce", xolite_status.clone(), String::new());
+        status.set_component("xoa-proxy", xoa_status.clone(), String::new());
         status.write_to_file(STATUS_FILE)?;
 
         if xolite_status != WorkflowStatus::InProgress
@@ -413,6 +483,33 @@ async fn main() -> Result<(), OrchestratorError> {
     let xolite_version = version_state.xolite_ce.last_tag.clone();
     let xoa_proxy_version = version_state.xoa_proxy.last_tag.clone();
 
+    // Seed empty ISO state from the latest xcp-ng-ce-iso release — a lost
+    // state file must not force a pointless ISO rebuild when no component
+    // advanced this run.
+    if version_state.iso.last_tag.is_empty()
+        && xolite_status == WorkflowStatus::Skipped
+        && xoa_status == WorkflowStatus::Skipped
+    {
+        match fetch_latest_release_ref(&client, "xcp-ng-ce-iso").await {
+            Ok(Some((tag, _sha))) => {
+                if let Some((xcpng_version, ce_counter)) = parse_ce_tag(&tag) {
+                    info!("Seeding ISO state from latest release {}.", tag);
+                    version_state.iso.xcpng_version = xcpng_version;
+                    version_state.iso.ce_counter = ce_counter;
+                    version_state.iso.last_tag = tag;
+                    version_state.iso.last_xolite_tag = xolite_version.clone();
+                    version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
+                    version_state.save()?;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(
+                "Could not check latest xcp-ng-ce-iso release ({}); trusting local state.",
+                e
+            ),
+        }
+    }
+
     let needs_iso_build = version_state.iso.xcpng_version != XCPNG_TARGET_VERSION
         || version_state.iso.last_xolite_tag != xolite_version
         || version_state.iso.last_xoa_proxy_tag != xoa_proxy_version;
@@ -422,6 +519,7 @@ async fn main() -> Result<(), OrchestratorError> {
         status.phase = "completed".to_string();
         status.status = WorkflowStatus::Skipped;
         status.detail = "No component changes".to_string();
+        status.set_component("iso", WorkflowStatus::Skipped, String::new());
         status.write_to_file(STATUS_FILE)?;
         return Ok(());
     }
@@ -458,17 +556,19 @@ async fn main() -> Result<(), OrchestratorError> {
             status.phase = "iso_build".to_string();
             status.status = WorkflowStatus::Failure;
             status.detail = format!("Failed to start ISO build: {}", e);
+            status.set_component("iso", WorkflowStatus::Failure, String::new());
             status.write_to_file(STATUS_FILE)?;
             return Err(e);
         }
         Ok((iso_id, iso_url, actual_iso_tag)) => {
             status.url = iso_url.clone();
             status.detail = format!("ISO build running: {}", actual_iso_tag);
+            status.set_component("iso", WorkflowStatus::InProgress, iso_url.clone());
             status.write_to_file(STATUS_FILE)?;
 
             // FIX #13: same deadline pattern applied to the ISO monitoring loop
             let iso_deadline = Instant::now() + ISO_MONITOR_TIMEOUT;
-            let mut iso_final_status = WorkflowStatus::InProgress;
+            let mut iso_final_status;
             let mut iso_poll_failures: u32 = 0;
 
             loop {
@@ -480,6 +580,7 @@ async fn main() -> Result<(), OrchestratorError> {
                     iso_final_status = WorkflowStatus::Timeout;
                     status.status = WorkflowStatus::Timeout;
                     status.detail = "ISO build monitoring timed out".to_string();
+                    status.set_component("iso", WorkflowStatus::Timeout, String::new());
                     status.write_to_file(STATUS_FILE)?;
                     break;
                 }
@@ -515,6 +616,7 @@ async fn main() -> Result<(), OrchestratorError> {
 
                 info!("ISO build state: {}", iso_final_status);
                 status.status = iso_final_status.clone();
+                status.set_component("iso", iso_final_status.clone(), String::new());
                 status.write_to_file(STATUS_FILE)?;
 
                 if iso_final_status != WorkflowStatus::InProgress {
