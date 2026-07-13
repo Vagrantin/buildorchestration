@@ -146,10 +146,10 @@ impl Default for BuildConfig {
             almalinux_iso_checksum: String::new(),
             xoa_hl_rpm_url: String::new(),
             xe_guest_utilities_url:
-                "https://github.com/xcp-ng/xcp/releases/download/v8.3.0/xe-guest-utilities-8.3.0-1.x86_64.rpm"
+                "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-10.0.0-1.x86_64.rpm"
                     .to_string(),
             xe_guest_utilities_xenstore_url:
-                "https://github.com/xcp-ng/xcp/releases/download/v8.3.0/xe-guest-utilities-xenstore-8.3.0-1.x86_64.rpm"
+                "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-xenstore-10.0.0-1.x86_64.rpm"
                     .to_string(),
         }
     }
