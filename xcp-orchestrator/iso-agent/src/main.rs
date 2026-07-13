@@ -36,6 +36,11 @@ const COMPONENT_MONITOR_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hour
 /// Hard cap on the ISO build monitoring loop.
 const ISO_MONITOR_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 
+/// Consecutive status-poll failures tolerated before giving up. GitHub API
+/// blips are routine over a multi-hour monitor; only a sustained outage
+/// should abort the run.
+const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 5;
+
 // ── Version State ─────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
@@ -264,6 +269,7 @@ async fn main() -> Result<(), OrchestratorError> {
     // FIX #13: add a hard deadline so the agent cannot loop forever if a
     //          GitHub Actions run is stuck in "In Progress" indefinitely.
     let component_deadline = Instant::now() + COMPONENT_MONITOR_TIMEOUT;
+    let mut poll_failures: u32 = 0;
 
     loop {
         // FIX #13: check deadline before sleeping so we exit promptly
@@ -288,27 +294,55 @@ async fn main() -> Result<(), OrchestratorError> {
 
         if xolite_status == WorkflowStatus::InProgress {
             if let Some(id) = xolite_id {
-                let conclusion = query_run_conclusion(&client, "xolite-ce", id).await?;
-                xolite_status = match conclusion.as_str() {
-                    "success"    => WorkflowStatus::Success,
-                    "failure"    => WorkflowStatus::Failure,
-                    "timed_out"  => WorkflowStatus::Timeout,
-                    "cancelled"  => WorkflowStatus::Aborted,
-                    _            => WorkflowStatus::InProgress,
-                };
+                match query_run_conclusion(&client, "xolite-ce", id).await {
+                    Ok(conclusion) => {
+                        poll_failures = 0;
+                        xolite_status = match conclusion.as_str() {
+                            "success"    => WorkflowStatus::Success,
+                            "failure"    => WorkflowStatus::Failure,
+                            "timed_out"  => WorkflowStatus::Timeout,
+                            "cancelled"  => WorkflowStatus::Aborted,
+                            _            => WorkflowStatus::InProgress,
+                        };
+                    }
+                    Err(e) => {
+                        poll_failures += 1;
+                        warn!(
+                            "xolite-ce status poll failed ({}/{}): {}",
+                            poll_failures, MAX_CONSECUTIVE_POLL_FAILURES, e
+                        );
+                        if poll_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
 
         if xoa_status == WorkflowStatus::InProgress {
             if let Some(id) = xoa_id {
-                let conclusion = query_run_conclusion(&client, "xoa-proxy", id).await?;
-                xoa_status = match conclusion.as_str() {
-                    "success"    => WorkflowStatus::Success,
-                    "failure"    => WorkflowStatus::Failure,
-                    "timed_out"  => WorkflowStatus::Timeout,
-                    "cancelled"  => WorkflowStatus::Aborted,
-                    _            => WorkflowStatus::InProgress,
-                };
+                match query_run_conclusion(&client, "xoa-proxy", id).await {
+                    Ok(conclusion) => {
+                        poll_failures = 0;
+                        xoa_status = match conclusion.as_str() {
+                            "success"    => WorkflowStatus::Success,
+                            "failure"    => WorkflowStatus::Failure,
+                            "timed_out"  => WorkflowStatus::Timeout,
+                            "cancelled"  => WorkflowStatus::Aborted,
+                            _            => WorkflowStatus::InProgress,
+                        };
+                    }
+                    Err(e) => {
+                        poll_failures += 1;
+                        warn!(
+                            "xoa-proxy status poll failed ({}/{}): {}",
+                            poll_failures, MAX_CONSECUTIVE_POLL_FAILURES, e
+                        );
+                        if poll_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
 
@@ -435,6 +469,7 @@ async fn main() -> Result<(), OrchestratorError> {
             // FIX #13: same deadline pattern applied to the ISO monitoring loop
             let iso_deadline = Instant::now() + ISO_MONITOR_TIMEOUT;
             let mut iso_final_status = WorkflowStatus::InProgress;
+            let mut iso_poll_failures: u32 = 0;
 
             loop {
                 if Instant::now() > iso_deadline {
@@ -451,8 +486,24 @@ async fn main() -> Result<(), OrchestratorError> {
 
                 sleep(Duration::from_secs(30)).await;
 
-                let conclusion =
-                    query_run_conclusion(&client, "xcp-ng-ce-iso", iso_id).await?;
+                let conclusion = match query_run_conclusion(&client, "xcp-ng-ce-iso", iso_id).await
+                {
+                    Ok(c) => {
+                        iso_poll_failures = 0;
+                        c
+                    }
+                    Err(e) => {
+                        iso_poll_failures += 1;
+                        warn!(
+                            "ISO build status poll failed ({}/{}): {}",
+                            iso_poll_failures, MAX_CONSECUTIVE_POLL_FAILURES, e
+                        );
+                        if iso_poll_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                };
 
                 iso_final_status = match conclusion.as_str() {
                     "success"   => WorkflowStatus::Success,

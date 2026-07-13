@@ -47,7 +47,7 @@ const OUTPUT_DIR: &str = "/var/lib/xcp-hl-orchestrator/output/xoa-hl";
 const XOA_HL_REPO: &str = "Vagrantin/xoa-hl";
 
 /// Workflow file that builds the RPM and creates a GitHub Release.
-const XOA_HL_WORKFLOW_FILE: &str = "build.yml";
+const XOA_HL_WORKFLOW_FILE: &str = "build-xoa.yml";
 
 const ALMALINUX_VERSION: &str = "9";
 const ALMALINUX_ISO_URL: &str =
@@ -419,6 +419,10 @@ async fn trigger_xoa_hl_workflow(client: &reqwest::Client) -> Result<(u64, Strin
 }
 
 /// Poll a run until it completes or `timeout` elapses.
+/// Consecutive status-poll failures tolerated before giving up — GitHub API
+/// blips are routine over a long monitor and must not abort the build.
+const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 5;
+
 async fn wait_for_workflow(
     client: &reqwest::Client,
     run_id: u64,
@@ -426,6 +430,7 @@ async fn wait_for_workflow(
     timeout: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut poll_failures: u32 = 0;
 
     loop {
         if Instant::now() > deadline {
@@ -438,9 +443,23 @@ async fn wait_for_workflow(
 
         sleep(Duration::from_secs(30)).await;
 
-        let conclusion = query_run_conclusion(client, "xoa-hl", run_id)
-            .await
-            .context("Failed to query workflow conclusion")?;
+        let conclusion = match query_run_conclusion(client, "xoa-hl", run_id).await {
+            Ok(c) => {
+                poll_failures = 0;
+                c
+            }
+            Err(e) => {
+                poll_failures += 1;
+                warn!(
+                    "xoa-hl status poll failed ({}/{}): {}",
+                    poll_failures, MAX_CONSECUTIVE_POLL_FAILURES, e
+                );
+                if poll_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                    return Err(e).context("Failed to query workflow conclusion");
+                }
+                continue;
+            }
+        };
 
         info!("xoa-hl workflow: {}", conclusion);
 

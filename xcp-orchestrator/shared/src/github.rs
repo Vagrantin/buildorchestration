@@ -133,29 +133,95 @@ pub async fn create_and_push_tag(
                 )));
             }
 
-            if let Some(ce_pos) = tag.rfind("-ce") {
-                let prefix = &tag[..ce_pos + 3];
-                let counter_str = &tag[ce_pos + 3..];
-                if let Ok(counter) = counter_str.parse::<u32>() {
-                    tag = format!("{}{}", prefix, counter + 1);
-                    tracing::warn!(
-                        "Tag {} already exists, retrying with {}",
-                        &tag[..tag.len() - 1],
-                        tag
-                    );
+            match next_tag_candidate(&tag) {
+                Some(next) => {
+                    tracing::warn!("Tag {} already exists, retrying with {}", tag, next);
+                    tag = next;
                     continue;
                 }
+                None => {
+                    return Err(OrchestratorError::TagCreation(format!(
+                        "Tag {} already exists and no increment strategy applies to it",
+                        tag
+                    )));
+                }
             }
-            return Err(OrchestratorError::TagCreation(format!(
-                "Tag {} already exists and could not parse counter suffix to increment",
-                tag
-            )));
         }
 
         return Err(OrchestratorError::GitHubApi(
             format!("create_and_push_tag for {}", repo),
             format!("Failed to create tag {}: {}", tag, body),
         ));
+    }
+}
+
+/// Compute the next tag to try when `tag` already exists on the remote.
+///
+/// Two tag schemes are in use:
+/// - `-ceN` suffix (xolite-ce, xcp-ng-ce-iso): `v0.23.0-ce1` → `v0.23.0-ce2`
+/// - plain version tags (xoa-proxy, which carries no `-ce`): a fourth numeric
+///   segment acts as the collision counter, matching the PatchBump format
+///   `v{version}.{counter}`: `v0.1.1` → `v0.1.1.1`, `v0.1.1.2` → `v0.1.1.3`
+///
+/// Returns `None` when the tag matches neither scheme.
+fn next_tag_candidate(tag: &str) -> Option<String> {
+    if let Some(ce_pos) = tag.rfind("-ce") {
+        let (prefix, counter_str) = tag.split_at(ce_pos + 3);
+        return counter_str
+            .parse::<u32>()
+            .ok()
+            .map(|counter| format!("{}{}", prefix, counter + 1));
+    }
+
+    let segments: Vec<&str> = tag.strip_prefix('v')?.split('.').collect();
+    if !segments
+        .iter()
+        .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    match segments.len() {
+        3 => Some(format!("{}.1", tag)),
+        4 => {
+            let counter: u32 = segments[3].parse().ok()?;
+            Some(format!(
+                "v{}.{}.{}.{}",
+                segments[0],
+                segments[1],
+                segments[2],
+                counter + 1
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_tag_candidate;
+
+    #[test]
+    fn ce_suffix_increments() {
+        assert_eq!(next_tag_candidate("v0.23.0-ce1").as_deref(), Some("v0.23.0-ce2"));
+        assert_eq!(next_tag_candidate("v8.3-ce12").as_deref(), Some("v8.3-ce13"));
+    }
+
+    #[test]
+    fn plain_version_gains_counter_segment() {
+        assert_eq!(next_tag_candidate("v0.1.1").as_deref(), Some("v0.1.1.1"));
+    }
+
+    #[test]
+    fn counter_segment_increments() {
+        assert_eq!(next_tag_candidate("v0.1.1.2").as_deref(), Some("v0.1.1.3"));
+    }
+
+    #[test]
+    fn unrecognized_schemes_return_none() {
+        assert_eq!(next_tag_candidate("release-foo"), None);
+        assert_eq!(next_tag_candidate("v1-cebad"), None);
+        assert_eq!(next_tag_candidate("v8.3-ce202605.5"), None);
+        assert_eq!(next_tag_candidate("v0.1"), None);
     }
 }
 
