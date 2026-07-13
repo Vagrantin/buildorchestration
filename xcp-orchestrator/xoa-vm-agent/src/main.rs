@@ -15,23 +15,16 @@
 //! 10. Persist version state
 //! 11. Write final status
 
-// FIX #17: type alias was at the bottom of the file (line 1002) — moved here.
-// `use anyhow::Result` already brings anyhow::Result into scope, so the alias
-// below is redundant; keep only the `use` import and remove the alias entirely.
 use anyhow::{Context, Result, bail};
 
 use chrono::{DateTime, Utc};
 use shared::{
     AgentStatus, WorkflowStatus,
     create_github_client, load_github_token,
-    fetch_repo_head_sha, locate_tag_triggered_run, query_run_conclusion,
+    fetch_repo_head_sha, locate_dispatch_triggered_run, query_run_conclusion,
     parse_github_response,
-    OWNER,
 };
 use std::path::{Path, PathBuf};
-// FIX #16: removed `use std::process::Command` — the blocking variant must not
-//          be used inside async functions.  std::process::Stdio is still needed
-//          because tokio::process::Command accepts it for stdout/stderr piping.
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::fs as async_fs;
@@ -411,11 +404,13 @@ async fn trigger_xoa_hl_workflow(client: &reqwest::Client) -> Result<(u64, Strin
 
     info!("Workflow dispatched, waiting for run to appear...");
 
-    // locate_tag_triggered_run polls until a run whose head_branch == "main"
-    // appears after trigger_time. Passing "main" here works because that
-    // function's branch_matches check is `run.head_branch.as_deref() == Some(tag)`.
+    // FIX (P0-1): workflow_dispatch runs are filed under event=workflow_dispatch,
+    // not event=push, and carry no head_branch/tag to match against. Using
+    // locate_tag_triggered_run here (event=push filter) meant this call always
+    // timed out after 180s. locate_dispatch_triggered_run polls the correct
+    // event type and matches purely on created_at >= trigger_time.
     let (run_id, run_url) =
-        locate_tag_triggered_run(client, "xoa-hl", "main", trigger_time)
+        locate_dispatch_triggered_run(client, "xoa-hl", trigger_time)
             .await
             .context("Failed to locate triggered workflow run")?;
 
@@ -834,7 +829,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "ssh_timeout": "30m",
     "format": "xva_compressed",
     "keep_vm": "always",
-    "skip_set_template": "true"
+    "skip_set_template": "true",
+    "output_directory": "{output_dir}"
   }}],
   "provisioners": [
     {{"type":"shell","inline":["dnf update -y"]}},
@@ -883,6 +879,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         xe_xenstore_url = config.xe_guest_utilities_xenstore_url,
         xe_url = config.xe_guest_utilities_url,
         rpm_url = config.xoa_hl_rpm_url,
+        output_dir = OUTPUT_DIR,
     )
 }
 

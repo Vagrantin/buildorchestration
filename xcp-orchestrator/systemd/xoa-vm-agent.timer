@@ -1,0 +1,10 @@
+[Unit]
+Description=Trigger XOA VM Image Build Agent Daily at 6 AM
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+Unit=xoa-vm-agent.service
+
+[Install]
+WantedBy=timers.target

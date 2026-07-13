@@ -199,6 +199,48 @@ pub async fn locate_tag_triggered_run(
     )))
 }
 
+/// Locate a workflow run triggered by a `workflow_dispatch` API call.
+///
+/// Unlike `locate_tag_triggered_run` (which matches on `head_branch` for
+/// tag-push events), `workflow_dispatch` runs are filed under
+/// `event=workflow_dispatch` and carry no tag to match against — so the only
+/// reliable signal is `created_at` relative to the moment we dispatched.
+pub async fn locate_dispatch_triggered_run(
+    client: &Client,
+    repo: &str,
+    trigger_marker: DateTime<Utc>,
+) -> Result<(u64, String), OrchestratorError> {
+    let check_url = format!(
+        "https://api.github.com/repos/{}/{}/actions/runs?event=workflow_dispatch&per_page=10",
+        OWNER, repo
+    );
+    let timeout_limit = Instant::now() + Duration::from_secs(180);
+
+    while Instant::now() < timeout_limit {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let response: GHRunsResponse = parse_github_response(
+            client
+                .get(&check_url)
+                .send()
+                .await
+                .map_err(|e| OrchestratorError::GitHubApi(repo.to_string(), e.to_string()))?,
+            &format!("locate_dispatch_triggered_run for {}", repo),
+        )
+        .await?;
+
+        for run in response.workflow_runs {
+            if run.created_at >= (trigger_marker - Duration::from_secs(5)) {
+                return Ok((run.id, run.html_url));
+            }
+        }
+    }
+
+    Err(OrchestratorError::WorkflowRunNotFound(format!(
+        "Timeout waiting for workflow_dispatch-triggered run in repo {}",
+        repo
+    )))
+}
+
 /// Query the conclusion of a workflow run
 pub async fn query_run_conclusion(
     client: &Client,

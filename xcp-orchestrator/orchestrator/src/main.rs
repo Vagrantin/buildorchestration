@@ -2,14 +2,13 @@
 
 use chrono::{DateTime, Utc};
 use shared::{
-    AgentStatus, PipelineStatus, WorkflowStatus, create_github_client,
+    AgentStatus, PipelineStatus, WorkflowStatus,
     TARGET_REPORT_DIR, HISTORY_FILE,
     storage::{write_atomic_json, load_json_with_default},
     OrchestratorError,
 };
-use std::path::Path;
 use tokio::fs;
-use tracing::{info, warn, debug};
+use tracing::info;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct RunHistoryItem {

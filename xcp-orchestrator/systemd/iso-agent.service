@@ -1,0 +1,13 @@
+[Unit]
+Description=XCP-ng ISO / XO Lite CE / xoa-proxy Build Agent
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# Credentials loaded via systemd sandbox file allocation from /etc/xcp-hl-credentials/
+LoadCredential=GITHUB_TOKEN:/etc/xcp-hl-credentials/github_token
+ExecStart=/usr/local/bin/iso-agent
+
+[Install]
+WantedBy=multi-user.target

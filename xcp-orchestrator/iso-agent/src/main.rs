@@ -7,7 +7,7 @@
 //! - Write status to xcp-iso-agent.status.json
 //! - Write version state to iso_agent_version_state.json
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use shared::{
     create_github_client, load_github_token,
     AgentStatus, WorkflowStatus, OrchestratorError,
@@ -22,7 +22,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use tracing::{info, warn, error, debug};
+use tracing::{info, warn, debug};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 

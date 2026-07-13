@@ -6,7 +6,7 @@ After=network-online.target ollama.service
 Type=oneshot
 User=root
 # Securely injects GitHub API Token using systemd sandbox file allocation
-LoadCredential=GH_TOKEN:/etc/xcp-orchestrator/github.token
+LoadCredential=GITHUB_TOKEN:/etc/xcp-hl-credentials/github_token
 ExecStart=/usr/local/bin/xcp-orchestrator
 
 [Install]

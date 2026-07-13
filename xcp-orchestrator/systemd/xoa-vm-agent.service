@@ -1,0 +1,19 @@
+[Unit]
+Description=XOA VM Image Build Agent
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# Credentials loaded via systemd sandbox file allocation from /etc/xcp-hl-credentials/
+LoadCredential=GITHUB_TOKEN:/etc/xcp-hl-credentials/github_token
+LoadCredential=XCPNG_PASSWORD:/etc/xcp-hl-credentials/xcpng_password
+LoadCredential=ALMALINUX_ROOT_PASSWORD:/etc/xcp-hl-credentials/almalinux_root_password
+ExecStart=/usr/local/bin/xoa-vm-agent
+
+# Packer needs a shared /tmp for VNC sockets and kickstart staging
+PrivateTmp=false
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
