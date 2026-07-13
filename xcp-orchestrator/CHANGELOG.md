@@ -2,6 +2,24 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-07-13 (fourth batch)
+
+### Changed
+
+- **iso-agent**: xolite-ce builds no longer float to the newest upstream
+  xo-lite release (v0.23.0 broke every build since July 12). Like xoa-hl's
+  `XO_COMMIT` pin, the upstream ref is now pinned in an `UPSTREAM_TAG` file at
+  the root of the xolite-ce repo (initially `xo-lite-v0.21.0`, the last
+  known-good version); the agent reads that pin to decide versions/rebuilds,
+  and the `build-xolite-ce.yml` workflow clones the same pin. Bumping the pin
+  is a normal commit, which the existing HEAD-change detection turns into an
+  `UpstreamBump`. If the pin file is missing the agent warns and falls back to
+  the old latest-release behaviour, so deployment order doesn't matter.
+
+### Added
+
+- `shared::fetch_pinned_xolite_tag` / `parse_pinned_xolite_tag` (+ unit tests).
+
 ## 2026-07-13 (third batch)
 
 ### Fixed

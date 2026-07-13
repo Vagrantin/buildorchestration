@@ -13,7 +13,8 @@ use shared::{
     AgentStatus, WorkflowStatus, OrchestratorError,
     ComponentVersionState, IsoVersionState,
     fetch_repo_head_sha, fetch_latest_release_ref,
-    fetch_latest_upstream_xolite_tag, fetch_upstream_xolite_version, fetch_xoa_proxy_version,
+    fetch_latest_upstream_xolite_tag, fetch_pinned_xolite_tag, fetch_upstream_xolite_version,
+    fetch_xoa_proxy_version,
     parse_ce_tag, parse_plain_version_tag,
     create_and_push_tag, locate_tag_triggered_run, query_run_conclusion,
     append_release_matrix_entry,
@@ -113,7 +114,18 @@ async fn decide_xolite_bump(
     client: &reqwest::Client,
     state: &mut ComponentVersionState,
 ) -> Result<BumpDecision, OrchestratorError> {
-    let upstream_tag = fetch_latest_upstream_xolite_tag(client).await?;
+    // Prefer the UPSTREAM_TAG pin committed in the xolite-ce repo — builds only
+    // move when that file is bumped, not on every upstream xo-lite release.
+    let upstream_tag = match fetch_pinned_xolite_tag(client).await? {
+        Some(tag) => {
+            info!("xolite-ce: using pinned upstream tag xo-lite-v{}", tag);
+            tag
+        }
+        None => {
+            warn!("xolite-ce: no UPSTREAM_TAG pin found, falling back to latest upstream release.");
+            fetch_latest_upstream_xolite_tag(client).await?
+        }
+    };
     let upstream_version = fetch_upstream_xolite_version(client, &upstream_tag).await?;
     let head_sha = fetch_repo_head_sha(client, "xolite-ce").await?;
 

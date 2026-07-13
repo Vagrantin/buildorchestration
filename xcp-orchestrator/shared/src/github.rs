@@ -341,7 +341,7 @@ fn next_tag_candidate(tag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_tag_candidate, parse_ce_tag, parse_plain_version_tag};
+    use super::{next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag};
 
     #[test]
     fn ce_tags_parse() {
@@ -383,6 +383,16 @@ mod tests {
         assert_eq!(next_tag_candidate("v1-cebad"), None);
         assert_eq!(next_tag_candidate("v8.3-ce202605.5"), None);
         assert_eq!(next_tag_candidate("v0.1"), None);
+    }
+
+    #[test]
+    fn pinned_xolite_tags_parse() {
+        assert_eq!(parse_pinned_xolite_tag("xo-lite-v0.21.0\n"), Some("0.21.0".to_string()));
+        assert_eq!(parse_pinned_xolite_tag("  xo-lite-v0.23.0  "), Some("0.23.0".to_string()));
+        assert_eq!(parse_pinned_xolite_tag(""), None);
+        assert_eq!(parse_pinned_xolite_tag("xo-lite-v"), None);
+        assert_eq!(parse_pinned_xolite_tag("v0.21.0"), None);
+        assert_eq!(parse_pinned_xolite_tag("xo-server-v5.113.2"), None);
     }
 }
 
@@ -599,6 +609,51 @@ pub async fn fetch_upstream_xolite_version(
         .as_str()
         .ok_or_else(|| OrchestratorError::VersionFormat("package.json missing version field".into()))?
         .to_string())
+}
+
+/// Parse the contents of xolite-ce's UPSTREAM_TAG pin file into the bare
+/// version part of the tag ("xo-lite-v0.21.0" -> "0.21.0").
+pub fn parse_pinned_xolite_tag(content: &str) -> Option<String> {
+    let version = content.trim().strip_prefix("xo-lite-v")?;
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+/// Fetch the pinned upstream XO Lite tag from the UPSTREAM_TAG file at the root
+/// of the xolite-ce repo. Returns Ok(None) when the pin file does not exist so
+/// callers can fall back to the latest upstream release.
+pub async fn fetch_pinned_xolite_tag(client: &Client) -> Result<Option<String>, OrchestratorError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/xolite-ce/contents/UPSTREAM_TAG?ref={}",
+        OWNER, DEFAULT_BRANCH
+    );
+    let res = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| OrchestratorError::GitHubApi("fetch UPSTREAM_TAG".to_string(), e.to_string()))?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let file: GHFileContent = parse_github_response(res, "fetch_pinned_xolite_tag").await?;
+
+    use base64::{engine::general_purpose, Engine as _};
+    let cleaned: String = file.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let decoded = general_purpose::STANDARD
+        .decode(cleaned)
+        .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
+    let content = String::from_utf8(decoded)
+        .map_err(|e| OrchestratorError::VersionFormat(format!("UPSTREAM_TAG is not UTF-8: {}", e)))?;
+
+    parse_pinned_xolite_tag(&content).map(Some).ok_or_else(|| {
+        OrchestratorError::VersionFormat(format!(
+            "UPSTREAM_TAG does not contain an xo-lite-v* tag: {:?}",
+            content.trim()
+        ))
+    })
 }
 
 /// Fetch xoa-proxy version from Cargo.toml
