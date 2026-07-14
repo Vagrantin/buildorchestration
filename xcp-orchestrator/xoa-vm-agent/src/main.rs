@@ -922,7 +922,7 @@ part /boot --fstype="ext4" --size=1024
 part / --fstype="ext4" --size=1 --grow
 reboot
 
-%packages
+%packages --excludedocs --exclude-weakdeps
 @^minimal-environment
 @core
 chrony
@@ -932,6 +932,13 @@ curl
 tar
 net-tools
 iproute
+-linux-firmware
+-*-firmware
+-lvm2
+-dracut-config-rescue
+-tuned
+-microcode_ctl
+-plymouth*
 %end
 
 %post --log=/root/ks-post.log
@@ -943,6 +950,8 @@ sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 systemctl restart sshd
 systemctl enable chronyd --now
+echo "tsflags=nodocs" >> /etc/dnf/dnf.conf
+echo "install_weak_deps=False" >> /etc/dnf/dnf.conf
 dnf install -y epel-release
 dnf install -y wget nc vim
 groupadd -f xo
@@ -1013,10 +1022,14 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     ]}},
     {{"type":"shell","inline":[
       "dnf remove -y firewalld firewalld-filesystem python3-firewall selinux-policy selinux-policy-targeted policycoreutils",
+      "dnf remove -y $(dnf repoquery --installonly --latest-limit=-1 -q) || true",
+      "dnf remove -y linux-firmware lvm2 2>/dev/null || true",
       "dnf autoremove -y",
       "dnf clean all",
-      "rm -rf /var/cache/dnf/ /var/log/*.log /usr/share/doc/* /usr/share/man/*",
-      "echo -n > /etc/machine-id"
+      "rm -rf /var/cache/dnf/ /var/log/*.log /var/log/journal/* /var/lib/dnf/history* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/licenses/*",
+      "rm -f /boot/*rescue*",
+      "echo -n > /etc/machine-id",
+      "dd if=/dev/zero of=/ZERO bs=1M status=none || true; rm -f /ZERO; dd if=/dev/zero of=/boot/ZERO bs=1M status=none || true; rm -f /boot/ZERO; sync"
     ]}}
   ]
 }}"#,
