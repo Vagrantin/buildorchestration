@@ -1023,7 +1023,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     {{"type":"shell","inline":[
       "dnf remove -y firewalld firewalld-filesystem python3-firewall selinux-policy selinux-policy-targeted policycoreutils",
       "dnf remove -y $(dnf repoquery --installonly --latest-limit=-1 -q) || true",
-      "dnf remove -y linux-firmware lvm2 2>/dev/null || true",
+      "dnf remove -y linux-firmware 2>/dev/null || true",
+      "dnf mark install nfs-utils cifs-utils || true",
       "dnf autoremove -y",
       "dnf clean all",
       "rm -rf /var/cache/dnf/ /var/log/*.log /var/log/journal/* /var/lib/dnf/history* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/licenses/*",
