@@ -67,8 +67,12 @@ run_agent() {
     done
 
     echo "==> Running $agent ${args[*]:-}"
+    # User=/Environment= mirror the installed units: without User= a transient
+    # unit gets no $HOME, which breaks packer's config-directory lookup.
     systemd-run --wait --pty --collect \
         --unit "manual-$agent-$$" \
+        -p User=root \
+        -p "Environment=HOME=/root" \
         "${cred_opts[@]}" \
         "$BIN_DIR/$agent" "${args[@]}"
 }
