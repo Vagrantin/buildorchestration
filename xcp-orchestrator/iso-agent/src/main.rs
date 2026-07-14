@@ -80,23 +80,57 @@ enum BumpDecision {
     PatchBump { upstream_version: String, next_counter: u32 },
 }
 
+/// Dev override: force a rebuild even when the version/SHA rules say nothing
+/// changed. Forcing a component pushes a fresh -ceN tag (a real release).
+#[derive(Default, Clone, Copy)]
+struct ForceFlags {
+    xolite: bool,
+    xoa_proxy: bool,
+    iso: bool,
+}
+
+fn parse_force_flags() -> Result<ForceFlags, OrchestratorError> {
+    let mut force = ForceFlags::default();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--force" => {
+                force.xolite = true;
+                force.xoa_proxy = true;
+                force.iso = true;
+            }
+            "--force-xolite" => force.xolite = true,
+            "--force-xoa-proxy" => force.xoa_proxy = true,
+            "--force-iso" => force.iso = true,
+            other => {
+                return Err(OrchestratorError::InvalidArgument(format!(
+                    "{} (usage: iso-agent [--force] [--force-xolite] [--force-xoa-proxy] [--force-iso])",
+                    other
+                )));
+            }
+        }
+    }
+    Ok(force)
+}
+
 async fn decide_xoa_proxy_bump(
     client: &reqwest::Client,
     state: &mut ComponentVersionState,
+    force: bool,
 ) -> Result<BumpDecision, OrchestratorError> {
     let cargo_version = fetch_xoa_proxy_version(client).await?;
     let head_sha = fetch_repo_head_sha(client, "xoa-proxy").await?;
 
-    if cargo_version == state.upstream_version && head_sha == state.last_built_sha {
+    if !force && cargo_version == state.upstream_version && head_sha == state.last_built_sha {
         return Ok(BumpDecision::NoChange);
     }
 
     // Local state says rebuild — cross-check the latest release (ground truth)
     // so a lost or stale state file cannot trigger a pointless rebuild.
-    if latest_release_matches(client, "xoa-proxy", &head_sha, &cargo_version, state, |tag| {
-        parse_plain_version_tag(tag)
-    })
-    .await
+    if !force
+        && latest_release_matches(client, "xoa-proxy", &head_sha, &cargo_version, state, |tag| {
+            parse_plain_version_tag(tag)
+        })
+        .await
     {
         return Ok(BumpDecision::NoChange);
     }
@@ -113,6 +147,7 @@ async fn decide_xoa_proxy_bump(
 async fn decide_xolite_bump(
     client: &reqwest::Client,
     state: &mut ComponentVersionState,
+    force: bool,
 ) -> Result<BumpDecision, OrchestratorError> {
     // Prefer the UPSTREAM_TAG pin committed in the xolite-ce repo — builds only
     // move when that file is bumped, not on every upstream xo-lite release.
@@ -129,14 +164,15 @@ async fn decide_xolite_bump(
     let upstream_version = fetch_upstream_xolite_version(client, &upstream_tag).await?;
     let head_sha = fetch_repo_head_sha(client, "xolite-ce").await?;
 
-    if upstream_version == state.upstream_version && head_sha == state.last_built_sha {
+    if !force && upstream_version == state.upstream_version && head_sha == state.last_built_sha {
         return Ok(BumpDecision::NoChange);
     }
 
-    if latest_release_matches(client, "xolite-ce", &head_sha, &upstream_version, state, |tag| {
-        parse_ce_tag(tag)
-    })
-    .await
+    if !force
+        && latest_release_matches(client, "xolite-ce", &head_sha, &upstream_version, state, |tag| {
+            parse_ce_tag(tag)
+        })
+        .await
     {
         return Ok(BumpDecision::NoChange);
     }
@@ -196,6 +232,14 @@ async fn main() -> Result<(), OrchestratorError> {
 
     info!("Starting ISO Agent...");
 
+    let force = parse_force_flags()?;
+    if force.xolite || force.xoa_proxy || force.iso {
+        info!(
+            "FORCE MODE: xolite={} xoa-proxy={} iso={} — matching skip rules will be bypassed.",
+            force.xolite, force.xoa_proxy, force.iso
+        );
+    }
+
     let token = load_github_token()?;
     let client = create_github_client(&token)?;
 
@@ -215,12 +259,12 @@ async fn main() -> Result<(), OrchestratorError> {
 
     let xolite_branch = async {
         let head_sha = fetch_repo_head_sha(&client, "xolite-ce").await?;
-        let decision = decide_xolite_bump(&client, &mut xolite_state).await?;
+        let decision = decide_xolite_bump(&client, &mut xolite_state, force.xolite).await?;
         Ok::<(String, BumpDecision), OrchestratorError>((head_sha, decision))
     };
     let xoa_branch = async {
         let head_sha = fetch_repo_head_sha(&client, "xoa-proxy").await?;
-        let decision = decide_xoa_proxy_bump(&client, &mut xoa_state).await?;
+        let decision = decide_xoa_proxy_bump(&client, &mut xoa_state, force.xoa_proxy).await?;
         Ok::<(String, BumpDecision), OrchestratorError>((head_sha, decision))
     };
 
@@ -522,7 +566,8 @@ async fn main() -> Result<(), OrchestratorError> {
         }
     }
 
-    let needs_iso_build = version_state.iso.xcpng_version != XCPNG_TARGET_VERSION
+    let needs_iso_build = force.iso
+        || version_state.iso.xcpng_version != XCPNG_TARGET_VERSION
         || version_state.iso.last_xolite_tag != xolite_version
         || version_state.iso.last_xoa_proxy_tag != xoa_proxy_version;
 

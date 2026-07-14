@@ -88,6 +88,9 @@ pub enum OrchestratorError {
 
     #[error("Header value error: {0}")]
     HeaderValueError(String),
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 // ── GitHub Types ────────────────────────────────────────────────────────────

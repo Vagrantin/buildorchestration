@@ -249,6 +249,17 @@ async fn main() -> Result<()> {
 
     info!("Starting XOA VM Agent...");
 
+    let mut force = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--force" => force = true,
+            other => bail!("Invalid argument: {} (usage: xoa-vm-agent [--force])", other),
+        }
+    }
+    if force {
+        info!("FORCE MODE: image-build skip rules will be bypassed.");
+    }
+
     let mut status = AgentStatus::new("initialization", WorkflowStatus::InProgress);
     status.write_to_file(STATUS_FILE)?;
 
@@ -268,7 +279,8 @@ async fn main() -> Result<()> {
     // A skip requires a *published image* for HEAD, not just unchanged code:
     // the workflow's RPM release and this agent's XVA image release are
     // separate artefacts, and the image is the one this agent exists to ship.
-    if !version_state.last_built_sha.is_empty()
+    if !force
+        && !version_state.last_built_sha.is_empty()
         && repo_head_sha == version_state.last_built_sha
         && version_state.last_tag.starts_with(IMAGE_TAG_PREFIX)
     {
@@ -292,21 +304,28 @@ async fn main() -> Result<()> {
     match fetch_releases(&client, "xoa-hl", 30).await {
         Ok(releases) => {
             if let Some(image) = releases.iter().find(|r| is_image_release_for(r, &short_sha)) {
-                info!(
-                    "Image {} already published for HEAD (SHA: {}), skipping.",
-                    image.tag_name, short_sha
-                );
-                version_state.last_built_sha = repo_head_sha.clone();
-                version_state.last_tag = image.tag_name.clone();
-                version_state.last_built_at = Some(Utc::now());
-                version_state.save()?;
-                status.status = WorkflowStatus::Skipped;
-                status.detail =
-                    format!("Image {} already published (SHA: {})", image.tag_name, short_sha);
-                status.set_component("xoa-hl", WorkflowStatus::Skipped, String::new());
-                status.set_component("xoa-image", WorkflowStatus::Success, image.html_url.clone());
-                status.write_to_file(STATUS_FILE)?;
-                return Ok(());
+                if force {
+                    info!(
+                        "Image {} already published for HEAD (SHA: {}) but --force given, rebuilding.",
+                        image.tag_name, short_sha
+                    );
+                } else {
+                    info!(
+                        "Image {} already published for HEAD (SHA: {}), skipping.",
+                        image.tag_name, short_sha
+                    );
+                    version_state.last_built_sha = repo_head_sha.clone();
+                    version_state.last_tag = image.tag_name.clone();
+                    version_state.last_built_at = Some(Utc::now());
+                    version_state.save()?;
+                    status.status = WorkflowStatus::Skipped;
+                    status.detail =
+                        format!("Image {} already published (SHA: {})", image.tag_name, short_sha);
+                    status.set_component("xoa-hl", WorkflowStatus::Skipped, String::new());
+                    status.set_component("xoa-image", WorkflowStatus::Success, image.html_url.clone());
+                    status.write_to_file(STATUS_FILE)?;
+                    return Ok(());
+                }
             }
 
             // No image for HEAD — does the newest RPM release already cover it?
