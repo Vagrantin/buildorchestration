@@ -478,6 +478,45 @@ pub async fn locate_dispatch_triggered_run(
     )))
 }
 
+/// Dispatch a workflow via the `workflow_dispatch` API.
+///
+/// `git_ref` may be a branch or a tag — dispatching on a tag makes
+/// `github.ref_name` inside the run resolve to that tag, which the ISO
+/// workflow relies on to derive its release version.
+pub async fn dispatch_workflow(
+    client: &Client,
+    repo: &str,
+    workflow_file: &str,
+    git_ref: &str,
+    inputs: serde_json::Value,
+) -> Result<(), OrchestratorError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}/dispatches",
+        OWNER, repo, workflow_file
+    );
+    let payload = serde_json::json!({ "ref": git_ref, "inputs": inputs });
+
+    let res = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| OrchestratorError::GitHubApi(format!("dispatch_workflow for {}", repo), e.to_string()))?;
+
+    // workflow_dispatch returns 204 No Content on success
+    if res.status() != reqwest::StatusCode::NO_CONTENT {
+        let code = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(OrchestratorError::GitHubApi(
+            format!("dispatch_workflow for {}", repo),
+            format!("workflow_dispatch returned {} — {}", code, body),
+        ));
+    }
+
+    tracing::info!("Dispatched {} on {} (ref {})", workflow_file, repo, git_ref);
+    Ok(())
+}
+
 /// Query the conclusion of a workflow run
 pub async fn query_run_conclusion(
     client: &Client,

@@ -16,7 +16,8 @@ use shared::{
     fetch_latest_upstream_xolite_tag, fetch_pinned_xolite_tag, fetch_upstream_xolite_version,
     fetch_xoa_proxy_version,
     parse_ce_tag, parse_plain_version_tag,
-    create_and_push_tag, locate_tag_triggered_run, query_run_conclusion,
+    create_and_push_tag, dispatch_workflow, locate_tag_triggered_run,
+    locate_dispatch_triggered_run, query_run_conclusion,
     append_release_matrix_entry,
     XCPNG_TARGET_VERSION,
 };
@@ -599,10 +600,24 @@ async fn main() -> Result<(), OrchestratorError> {
         let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
         let actual_iso_tag =
             create_and_push_tag(&client, "xcp-ng-ce-iso", &iso_tag, &iso_head_sha).await?;
+        // The tag alone no longer triggers the build. Dispatch the workflow on
+        // the tag ref, pinning the exact component release tags — the workflow
+        // previously fetched `releases/latest`, which raced with the component
+        // release publish and could bake a stale RPM into the ISO.
         let post_iso_trigger = Utc::now();
+        dispatch_workflow(
+            &client,
+            "xcp-ng-ce-iso",
+            "build-iso.yml",
+            &actual_iso_tag,
+            serde_json::json!({
+                "xolite_tag": xolite_version,
+                "xoa_proxy_tag": xoa_proxy_version,
+            }),
+        )
+        .await?;
         let (iso_id, iso_url) =
-            locate_tag_triggered_run(&client, "xcp-ng-ce-iso", &actual_iso_tag, post_iso_trigger)
-                .await?;
+            locate_dispatch_triggered_run(&client, "xcp-ng-ce-iso", post_iso_trigger).await?;
         Ok((iso_id, iso_url, actual_iso_tag))
     }
     .await;

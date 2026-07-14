@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use shared::{
     AgentStatus, WorkflowStatus,
     create_github_client, load_github_token,
-    fetch_repo_head_sha, fetch_releases, fetch_tag_commit_sha, ReleaseInfo,
+    dispatch_workflow, fetch_repo_head_sha, fetch_releases, fetch_tag_commit_sha, ReleaseInfo,
     locate_dispatch_triggered_run, query_run_conclusion,
 };
 use std::path::{Path, PathBuf};
@@ -551,27 +551,11 @@ async fn main() -> Result<()> {
 /// Dispatch the xoa-hl build workflow and wait for the run to appear in the API.
 /// Returns `(run_id, html_url)`.
 async fn trigger_xoa_hl_workflow(client: &reqwest::Client) -> Result<(u64, String)> {
-    let url = format!(
-        "https://api.github.com/repos/{}/actions/workflows/{}/dispatches",
-        XOA_HL_REPO, XOA_HL_WORKFLOW_FILE,
-    );
-
     let trigger_time = Utc::now();
-    let payload = serde_json::json!({ "ref": "main" });
 
-    let res = client
-        .post(&url)
-        .json(&payload)
-        .send()
+    dispatch_workflow(client, "xoa-hl", XOA_HL_WORKFLOW_FILE, "main", serde_json::json!({}))
         .await
-        .context("Failed to POST workflow dispatch")?;
-
-    // workflow_dispatch returns 204 No Content on success
-    if res.status() != reqwest::StatusCode::NO_CONTENT {
-        let code = res.status();
-        let body = res.text().await.unwrap_or_default();
-        bail!("workflow_dispatch returned {} — {}", code, body);
-    }
+        .context("Failed to dispatch workflow")?;
 
     info!("Workflow dispatched, waiting for run to appear...");
 
