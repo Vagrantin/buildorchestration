@@ -1032,8 +1032,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
       "dnf clean all",
       "rm -rf /var/cache/dnf/ /var/log/*.log /var/log/journal/* /var/lib/dnf/history* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/licenses/*",
       "rm -f /boot/*rescue*",
-      "echo -n > /etc/machine-id",
-      "dd if=/dev/zero of=/ZERO bs=1M status=none || true; rm -f /ZERO; dd if=/dev/zero of=/boot/ZERO bs=1M status=none || true; rm -f /boot/ZERO; sync"
+      "echo -n > /etc/machine-id"
     ]}}
   ]
 }}"#,
