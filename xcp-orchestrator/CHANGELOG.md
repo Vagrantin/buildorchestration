@@ -2,13 +2,30 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-07-30
+
+### Changed
+
+- **xoa-vm-agent**: XVA image releases are now published on
+  `Vagrantin/build-xoa-hl`, the repo the image is actually built from,
+  instead of `Vagrantin/xoa-hl`, which only holds the XO source and its RPM
+  releases (fixes `Vagrantin/xcp-hl#22`). The tag format is unchanged
+  (`xoa-image-{date}-{sha7}`, `{sha7}` still the xoa-hl source commit), but the
+  release is no longer anchored with `target_commitish`: that SHA does not
+  exist in `build-xoa-hl`, so the tag is created on its default branch and the
+  source commit is recorded in the release body. The Phase 1 "already built?"
+  check now reads image releases from `build-xoa-hl` and RPM releases from
+  `xoa-hl` in two separate calls. Image releases published before this move
+  stay on `xoa-hl` so already-shipped ISOs keep resolving them, which is why
+  `resolve_xoa_hl_rpm_url` still has to skip `xoa-image-*` tags.
+
 ## 2026-07-13 (fifth batch)
 
 ### Fixed
 
 - **xoa-vm-agent**: infrastructure values (XCP-ng host/user, SR, network, VM
   name/disk/memory, ISO and xe-guest-utilities URLs) were baked into
-  `BuildConfig::default()` — the `build.config` concept from the old shell
+  `BuildConfig::default()`, the `build.config` concept from the old shell
   orchestrator was lost in the Rust rewrite. The agent now overlays
   `/etc/xcp-orchestrator/build.config` (shell-style KEY="VALUE", installed by
   `deploy.sh` from `xoa-vm-agent/build.config.sample` if missing, never
@@ -40,8 +57,8 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 ### Fixed
 
 - **xoa-vm-agent**: "code unchanged" no longer implies "nothing to do". The xoa-hl
-  repo carries two kinds of releases — RPM releases from the `build-xoa.yml`
-  workflow and this agent's own `xoa-image-{date}-{sha7}` XVA releases — and the
+  repo carries two kinds of releases, RPM releases from the `build-xoa.yml`
+  workflow and this agent's own `xoa-image-{date}-{sha7}` XVA releases, and the
   previous skip check ("latest release matches HEAD") only proved the RPM was
   current, skipping before the VM image was ever built. The agent now skips only
   when an `xoa-image-*` release **with an XVA asset** exists for HEAD; if the RPM
@@ -53,7 +70,7 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
   once an image release becomes the latest (no RPM asset). It now scans the
   release list for the newest release carrying an `.rpm` asset.
 - **orchestrator**: the Ollama diagnostic was never actually called since the
-  workspace split — `llm_hint` was a hardcoded string, which is why no analysis
+  workspace split, `llm_hint` was a hardcoded string, which is why no analysis
   appeared despite `ollama serve` running. On failure the orchestrator now pulls
   the failed run's job-log tail from GitHub Actions and feeds it to
   `qwen3-coder:30b` at `localhost:11434` (restoring the `1f87fe4` behaviour),
@@ -76,7 +93,7 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
   XOA-HL and XOA Image rows. Agents now record per-component status and URLs in
   their status files (`AgentStatus.components`, backward compatible).
 - **Rebuilds without changes**: the workspace split renamed the version-state files,
-  orphaning the recorded "last built" state — and state was only saved after a fully
+  orphaning the recorded "last built" state, and state was only saved after a fully
   successful run, so any failure re-triggered every build forever (xoa-proxy releases
   `v0.1.1.1`/`.2`/`.3` all point at the same commit). Agents now cross-check the
   **latest GitHub release** of each repo (xolite-ce, xoa-proxy, xoa-hl, xcp-ng-ce-iso):
@@ -97,7 +114,7 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
   targeted `.github/workflows/build.yml`, while the workflow in `Vagrantin/xoa-hl`
   is `build-xoa.yml`. The constant now matches the real filename.
 - **iso-agent**: pushing a tag that already exists on `xoa-proxy` (e.g. `v0.1.1`)
-  was a hard failure — the collision retry in `create_and_push_tag` only knew how
+  was a hard failure, the collision retry in `create_and_push_tag` only knew how
   to increment `-ceN` suffixes, which xoa-proxy tags no longer carry. Collisions
   on plain version tags now retry with a fourth numeric counter segment
   (`v0.1.1` → `v0.1.1.1`, `v0.1.1.2` → `v0.1.1.3`), matching the existing

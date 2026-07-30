@@ -11,7 +11,7 @@
 //!  6. Generate temporary build files (inst.ks, almalinux-build.json)
 //!  7. Run packer validate + build
 //!  8. Locate generated XVA
-//!  9. Create GitHub Release and upload XVA
+//!  9. Create GitHub Release on build-xoa-hl and upload XVA
 //! 10. Persist version state
 //! 11. Write final status
 
@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const STATUS_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa-vm-agent.status.json";
-/// Infrastructure config (non-secret) — installed by deploy.sh from
+/// Infrastructure config (non-secret), installed by deploy.sh from
 /// xoa-vm-agent/build.config.sample. Missing file = baked-in defaults.
 const BUILD_CONFIG_FILE: &str = "/etc/xcp-orchestrator/build.config";
 const VERSION_STATE_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa_agent_version_state.json";
@@ -45,9 +45,13 @@ const REPO_DIR: &str = "/var/lib/xcp-hl-orchestrator/repos/build-xoa-hl";
 const BUILD_DIR: &str = "/var/lib/xcp-hl-orchestrator/build/xoa-hl";
 const OUTPUT_DIR: &str = "/var/lib/xcp-hl-orchestrator/output/xoa-hl";
 
-/// Full "owner/repo" path — used directly in API URLs that do not go through
+/// Full "owner/repo" path, used directly in API URLs that do not go through
 /// the shared helpers (which prepend OWNER themselves).
-const XOA_HL_REPO: &str = "Vagrantin/xoa-hl";
+///
+/// `xoa-hl` holds the source and its RPM releases; the VM images this agent
+/// builds are published on `build-xoa-hl`, the repo they are built from
+/// (Vagrantin/xcp-hl#22). Image releases published before that move stay on
+/// `xoa-hl` so already-shipped ISOs keep resolving them.
 const BUILD_XOA_HL_REPO: &str = "Vagrantin/build-xoa-hl";
 
 /// Workflow file that builds the RPM and creates a GitHub Release.
@@ -82,7 +86,7 @@ const WORKFLOW_TIMEOUT: Duration = Duration::from_secs(3600);
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct XoaHlVersionState {
     pub last_built_sha: String,
-    pub last_tag: String, // FIX #12: was never written — now updated in Phase 10
+    pub last_tag: String, // FIX #12: was never written, now updated in Phase 10
     pub last_built_at: Option<DateTime<Utc>>,
 }
 
@@ -158,7 +162,7 @@ impl Default for BuildConfig {
 impl BuildConfig {
     /// Defaults overlaid with /etc/xcp-orchestrator/build.config when present.
     /// A missing file is non-fatal (baked-in defaults keep working); a file
-    /// that exists but fails to parse is fatal — a half-applied config
+    /// that exists but fails to parse is fatal, a half-applied config
     /// pointing at the wrong host is worse than stopping.
     fn load() -> Result<Self> {
         let mut config = Self::default();
@@ -181,7 +185,7 @@ impl BuildConfig {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
-                    "No {} found — using baked-in default build config. \
+                    "No {} found, using baked-in default build config. \
                      Run deploy.sh to install one from build.config.sample.",
                     BUILD_CONFIG_FILE
                 );
@@ -295,13 +299,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Local state is empty or untrustworthy — check the published releases
+    // Local state is empty or untrustworthy, check the published releases
     // (ground truth). An xoa-image-* release with an XVA asset for HEAD means
     // everything is done; a current RPM release without one means only the
-    // workflow can be skipped and the image must still be built.
+    // workflow can be skipped and the image must still be built. The two live
+    // in separate repos: images on build-xoa-hl, RPMs on xoa-hl.
     let short_sha = repo_head_sha[..7.min(repo_head_sha.len())].to_string();
-    let mut rpm_is_current = false;
-    match fetch_releases(&client, "xoa-hl", 30).await {
+
+    match fetch_releases(&client, "build-xoa-hl", 30).await {
         Ok(releases) => {
             if let Some(image) = releases.iter().find(|r| is_image_release_for(r, &short_sha)) {
                 if force {
@@ -327,13 +332,24 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
             }
+        }
+        Err(e) => warn!(
+            "Could not list build-xoa-hl releases ({}); proceeding with full build.",
+            e
+        ),
+    }
 
-            // No image for HEAD — does the newest RPM release already cover it?
+    // No image for HEAD, does the newest RPM release already cover it?
+    let mut rpm_is_current = false;
+    match fetch_releases(&client, "xoa-hl", 30).await {
+        Ok(releases) => {
+            // Image releases published before the move to build-xoa-hl are still
+            // listed here and carry no RPM, skip them.
             if let Some(rpm) = releases.iter().find(|r| !r.tag_name.starts_with(IMAGE_TAG_PREFIX)) {
                 match fetch_tag_commit_sha(&client, "xoa-hl", &rpm.tag_name).await {
                     Ok(sha) if sha == repo_head_sha => {
                         info!(
-                            "RPM release {} matches HEAD (SHA: {}) — skipping workflow, building missing image.",
+                            "RPM release {} matches HEAD (SHA: {}), skipping workflow, building missing image.",
                             rpm.tag_name, short_sha
                         );
                         rpm_is_current = true;
@@ -355,7 +371,7 @@ async fn main() -> Result<()> {
 
     // ── PHASE 2: Trigger GA workflow and wait ────────────────────────────────
     if rpm_is_current {
-        info!("PHASE 2: Skipped — RPM release already covers HEAD.");
+        info!("PHASE 2: Skipped, RPM release already covers HEAD.");
     } else {
         info!("PHASE 2: Triggering xoa-hl build workflow...");
         status.phase = "phase_2_trigger_workflow".to_string();
@@ -489,7 +505,7 @@ async fn main() -> Result<()> {
     // ── PHASE 9: Create release and upload XVA ────────────────────────────────
     // FIX #11: was calling upload_to_github_release() which assumed a release
     //          already existed. Now we explicitly create (or reuse) one first.
-    info!("PHASE 9: Creating GitHub Release and uploading XVA...");
+    info!("PHASE 9: Creating GitHub Release on build-xoa-hl and uploading XVA...");
     status.phase = "phase_9_upload_asset".to_string();
     status.write_to_file(STATUS_FILE)?;
 
@@ -574,7 +590,7 @@ async fn trigger_xoa_hl_workflow(client: &reqwest::Client) -> Result<(u64, Strin
 }
 
 /// Poll a run until it completes or `timeout` elapses.
-/// Consecutive status-poll failures tolerated before giving up — GitHub API
+/// Consecutive status-poll failures tolerated before giving up, GitHub API
 /// blips are routine over a long monitor and must not abort the build.
 const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 5;
 
@@ -642,7 +658,7 @@ async fn validate_prerequisites() -> Result<()> {
         .arg("version")
         .output()
         .await
-        .context("Packer binary not found — install from https://developer.hashicorp.com/packer/downloads")?;
+        .context("Packer binary not found, install from https://developer.hashicorp.com/packer/downloads")?;
 
     if !packer_out.status.success() {
         bail!(
@@ -686,7 +702,7 @@ async fn validate_prerequisites() -> Result<()> {
             let avail_bytes = avail_kb * 1024;
             if avail_bytes < REQUIRED_DISK_SPACE_BYTES {
                 bail!(
-                    "Insufficient disk space — required {}GB, have {}GB",
+                    "Insufficient disk space, required {}GB, have {}GB",
                     REQUIRED_DISK_SPACE_BYTES / (1024 * 1024 * 1024),
                     avail_bytes / (1024 * 1024 * 1024),
                 );
@@ -769,10 +785,10 @@ async fn resolve_dynamic_values(
     client: &reqwest::Client,
     config: &mut BuildConfig,
 ) -> Result<()> {
-    // Credentials come exclusively from systemd LoadCredential — never from env vars set manually
+    // Credentials come exclusively from systemd LoadCredential, never from env vars set manually
     let creds_dir = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
         anyhow::anyhow!(
-            "CREDENTIALS_DIRECTORY not set — configure systemd LoadCredential= \
+            "CREDENTIALS_DIRECTORY not set, configure systemd LoadCredential= \
              for XCPNG_PASSWORD and ALMALINUX_ROOT_PASSWORD"
         )
     })?;
@@ -850,8 +866,9 @@ async fn resolve_almalinux_checksum(client: &reqwest::Client) -> Result<String> 
 }
 
 async fn resolve_xoa_hl_rpm_url(client: &reqwest::Client) -> Result<String> {
-    // releases/latest may be one of this agent's xoa-image-* releases, which
-    // carries no RPM — scan the list for the newest release that has one.
+    // releases/latest may be one of the xoa-image-* releases published on this
+    // repo before the move to build-xoa-hl, which carry no RPM, scan the list
+    // for the newest release that has one.
     let releases = fetch_releases(client, "xoa-hl", 30)
         .await
         .context("Failed to fetch xoa-hl releases")?;
@@ -910,7 +927,7 @@ async fn generate_build_files(build_dir: &Path, config: &BuildConfig) -> Result<
 
 fn generate_kickstart(config: &BuildConfig) -> String {
     format!(
-        r#"# AlmaLinux {ver} Minimal Kickstart — XOA HomeLab Edition
+        r#"# AlmaLinux {ver} Minimal Kickstart, XOA HomeLab Edition
 lang en_US.UTF-8
 keyboard us
 network --onboot yes --device eth0 --bootproto dhcp
@@ -979,7 +996,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "iso_checksum": "{iso_chk}",
     "sr_name": "{sr_name}",
     "vm_name": "{vm_name}",
-    "vm_description": "XOA HomeLab Edition — AlmaLinux {ver}",
+    "vm_description": "XOA HomeLab Edition, AlmaLinux {ver}",
     "disk_size": {disk_mb},
     "vm_memory": {mem_mb},
     "http_directory": ".",
@@ -1060,7 +1077,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
 async fn run_packer(build_dir: &Path) -> Result<()> {
     let packer_file = build_dir.join("almalinux-build.json");
 
-    // Validate first — cheap and catches template errors before a long build
+    // Validate first, cheap and catches template errors before a long build
     info!("Running packer validate...");
     let validate = AsyncCommand::new("packer")
         .arg("validate")
@@ -1230,7 +1247,7 @@ fn generate_image_tag(head_sha: &str) -> String {
 
 /// Does this release carry the published VM image for the given commit?
 /// The tag encodes the short SHA (see generate_image_tag) and the XVA asset
-/// must be present — a release whose upload failed doesn't count.
+/// must be present, a release whose upload failed doesn't count.
 fn is_image_release_for(release: &ReleaseInfo, short_sha: &str) -> bool {
     release.tag_name.starts_with(IMAGE_TAG_PREFIX)
         && release.tag_name.ends_with(&format!("-{}", short_sha))
@@ -1240,10 +1257,13 @@ fn is_image_release_for(release: &ReleaseInfo, short_sha: &str) -> bool {
             .any(|a| a.name.ends_with(".xva") || a.name.ends_with(".xva.gz"))
 }
 
-/// Create a GitHub Release, or reuse the existing one (idempotent).
-/// Returns `(upload_url, html_url)`.
+/// Create a GitHub Release on `build-xoa-hl`, or reuse the existing one
+/// (idempotent). Returns `(upload_url, html_url)`.
 ///
-/// The tag is created by the GitHub API using `target_sha` as `target_commitish`.
+/// The tag is created by the GitHub API on that repo's default branch. It
+/// cannot be anchored to `target_sha`: that is an `xoa-hl` commit, which does
+/// not exist here, the source commit is recorded in the tag suffix and the
+/// release body instead.
 async fn create_github_release(
     client: &reqwest::Client,
     tag: &str,
@@ -1259,7 +1279,7 @@ async fn create_github_release(
     // Check whether this exact tag already has a release (retry-safe)
     let check_url = format!(
         "https://api.github.com/repos/{}/releases/tags/{}",
-        XOA_HL_REPO, tag
+        BUILD_XOA_HL_REPO, tag
     );
     if let Ok(res) = client.get(&check_url).send().await {
         if res.status().is_success() {
@@ -1273,16 +1293,15 @@ async fn create_github_release(
         }
     }
 
-    // Create a new release; the API creates the tag at target_sha automatically
+    // Create a new release; the API creates the tag on the default branch
     let create_url = format!(
         "https://api.github.com/repos/{}/releases",
-        XOA_HL_REPO
+        BUILD_XOA_HL_REPO
     );
     let payload = serde_json::json!({
         "tag_name":          tag,
-        "target_commitish":  target_sha,
         "name":              name,
-        "body":              format!("XOA HomeLab Edition VM image\nSource commit: {}", target_sha),
+        "body":              format!("XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}", target_sha),
         "draft":             false,
         "prerelease":        false,
     });
@@ -1362,7 +1381,7 @@ async fn upload_asset(
 
 // FIX #17: `type Result<T> = anyhow::Result<T>` that was at line 1002 has been
 // removed entirely. `use anyhow::Result` at the top of the file already brings
-// anyhow::Result into scope — the alias was redundant and confusing.
+// anyhow::Result into scope, the alias was redundant and confusing.
 
 #[cfg(test)]
 mod tests {
@@ -1372,7 +1391,7 @@ mod tests {
     fn release(tag: &str, asset_names: &[&str]) -> ReleaseInfo {
         ReleaseInfo {
             tag_name: tag.to_string(),
-            html_url: format!("https://github.com/Vagrantin/xoa-hl/releases/tag/{}", tag),
+            html_url: format!("https://github.com/Vagrantin/build-xoa-hl/releases/tag/{}", tag),
             assets: asset_names
                 .iter()
                 .map(|n| ReleaseAsset {

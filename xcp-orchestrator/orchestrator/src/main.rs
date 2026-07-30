@@ -329,7 +329,7 @@ mod tests {
             xoa_hl_status: "Success".to_string(),
             xoa_hl_url: "https://github.com/Vagrantin/xoa-hl/actions/runs/3".to_string(),
             xoa_image_status: "Success".to_string(),
-            xoa_image_url: "https://github.com/Vagrantin/xoa-hl/releases/tag/v1".to_string(),
+            xoa_image_url: "https://github.com/Vagrantin/build-xoa-hl/releases/tag/v1".to_string(),
             llm_hint: Some("check the spec file".to_string()),
             ..Default::default()
         }
@@ -342,7 +342,7 @@ mod tests {
             assert!(html.contains(label), "missing row {}", label);
         }
         assert!(html.contains(r#"href="https://github.com/Vagrantin/xolite-ce/actions/runs/1""#));
-        assert!(html.contains(r#"href="https://github.com/Vagrantin/xoa-hl/releases/tag/v1""#));
+        assert!(html.contains(r#"href="https://github.com/Vagrantin/build-xoa-hl/releases/tag/v1""#));
         assert!(html.contains(r#"class="badge success">Success"#));
         assert!(html.contains(r#"class="badge failure">Failure"#));
         assert!(html.contains(r#"class="badge progress">In Progress"#));
