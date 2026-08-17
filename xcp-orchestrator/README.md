@@ -32,15 +32,12 @@ request. It binds to `127.0.0.1:8787` only and requires a bearer token
 request; the browser is prompted for the token on first use and remembers it
 in `localStorage`.
 
-The web server that serves the static dashboard directory
-(`/var/www/html/orchestrator`) must reverse-proxy `/api/` to
-`127.0.0.1:8787`, e.g. for nginx:
-
-```nginx
-location /api/ {
-    proxy_pass http://127.0.0.1:8787/api/;
-}
-```
+`deploy.sh` installs and configures nginx to serve the static dashboard
+(`/var/www/html/orchestrator`) and reverse-proxy `/api/` to
+`127.0.0.1:8787` (config in `nginx/orchestrator.conf`, installed as the
+`orchestrator` site and replacing the stock `default` site). Nothing further
+to set up: after `deploy.sh` runs, the dashboard and its buttons are
+reachable at `http://<host>/`.
 
 ## Tech Stack
 
