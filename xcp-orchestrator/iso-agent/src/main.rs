@@ -14,7 +14,7 @@ use shared::{
     ComponentVersionState, IsoVersionState,
     fetch_repo_head_sha, fetch_latest_release_ref,
     fetch_latest_upstream_xolite_tag, fetch_pinned_xolite_tag, fetch_upstream_xolite_version,
-    fetch_xoa_proxy_version,
+    fetch_xoa_proxy_version, fetch_release_rpm_name,
     parse_ce_tag, parse_plain_version_tag,
     create_and_push_tag, dispatch_workflow, locate_tag_triggered_run,
     locate_dispatch_triggered_run, query_run_conclusion,
@@ -704,12 +704,21 @@ async fn main() -> Result<(), OrchestratorError> {
                 version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
                 version_state.save()?;
 
+                // The tag says which release went in, the RPM name says what a
+                // host will report from `rpm -q`, the matrix records both.
+                let xolite_rpm =
+                    fetch_release_rpm_name(&client, "xolite-ce", &xolite_version).await?;
+                let xoa_proxy_rpm =
+                    fetch_release_rpm_name(&client, "xoa-proxy", &xoa_proxy_version).await?;
+
                 append_release_matrix_entry(
                     &client,
                     &actual_iso_tag,
                     &xolite_version,
                     &version_state.xolite_ce.upstream_version,
+                    &xolite_rpm,
                     &xoa_proxy_version,
+                    &xoa_proxy_rpm,
                 )
                 .await?;
 

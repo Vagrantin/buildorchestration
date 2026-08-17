@@ -341,7 +341,10 @@ fn next_tag_candidate(tag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag};
+    use super::{
+        next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag,
+        split_leading_comments,
+    };
 
     #[test]
     fn ce_tags_parse() {
@@ -393,6 +396,29 @@ mod tests {
         assert_eq!(parse_pinned_xolite_tag("xo-lite-v"), None);
         assert_eq!(parse_pinned_xolite_tag("v0.21.0"), None);
         assert_eq!(parse_pinned_xolite_tag("xo-server-v5.113.2"), None);
+    }
+
+    #[test]
+    fn leading_comment_block_is_kept_above_new_entries() {
+        let yaml = "# schema\n# docs\n- iso_version: \"v8.3-ce17\"\n";
+        let (header, entries) = split_leading_comments(yaml);
+        assert_eq!(header, "# schema\n# docs\n");
+        assert_eq!(entries, "- iso_version: \"v8.3-ce17\"\n");
+    }
+
+    #[test]
+    fn comments_between_entries_stay_with_the_entries() {
+        let yaml = "# head\n- a: 1\n# mid\n- b: 2\n";
+        let (header, entries) = split_leading_comments(yaml);
+        assert_eq!(header, "# head\n");
+        assert_eq!(entries, "- a: 1\n# mid\n- b: 2\n");
+    }
+
+    #[test]
+    fn file_without_leading_comments_is_unchanged() {
+        let (header, entries) = split_leading_comments("- a: 1\n");
+        assert_eq!(header, "");
+        assert_eq!(entries, "- a: 1\n");
     }
 }
 
@@ -730,13 +756,71 @@ pub async fn fetch_xoa_proxy_version(client: &Client) -> Result<String, Orchestr
         .ok_or_else(|| OrchestratorError::VersionFormat("Could not parse version from Cargo.toml".into()))
 }
 
+/// Split a YAML document into its leading comment block and the rest.
+///
+/// `releases.yml` opens with a comment documenting the entry schema, and new
+/// entries are prepended newest-first, so they have to land *after* that block,
+/// not above it.
+pub fn split_leading_comments(yaml: &str) -> (String, &str) {
+    let offset = yaml
+        .split_inclusive('\n')
+        .take_while(|line| {
+            let t = line.trim_start();
+            t.is_empty() || t.starts_with('#')
+        })
+        .map(|line| line.len())
+        .sum();
+    (yaml[..offset].to_string(), &yaml[offset..])
+}
+
+/// Name of the RPM published on `repo`'s release `tag`, as `rpm -q` prints it
+/// (the asset name without the `.rpm` suffix, e.g.
+/// `xoa-proxy-0.1.1.8-55.gc525575.static.x86_64`).
+///
+/// The release tag alone does not say which package version landed on a host:
+/// the tag maps to a version, but the RPM release field carries the CI run and
+/// source commit. The matrix records both so an installed host can be matched
+/// back to a row.
+pub async fn fetch_release_rpm_name(
+    client: &Client,
+    repo: &str,
+    tag: &str,
+) -> Result<String, OrchestratorError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/releases/tags/{}",
+        OWNER, repo, tag
+    );
+    let release: ReleaseInfo = parse_github_response(
+        client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| {
+                OrchestratorError::GitHubApi(format!("release {} of {}", tag, repo), e.to_string())
+            })?,
+        &format!("fetch_release_rpm_name for {}@{}", repo, tag),
+    )
+    .await?;
+
+    release
+        .assets
+        .iter()
+        .find_map(|a| a.name.strip_suffix(".rpm"))
+        .map(|n| n.to_string())
+        .ok_or_else(|| {
+            OrchestratorError::VersionFormat(format!("no .rpm asset on {} release {}", repo, tag))
+        })
+}
+
 /// Append an entry to the release matrix
 pub async fn append_release_matrix_entry(
     client: &Client,
     iso_tag: &str,
     xolite_version: &str,
     xolite_upstream: &str,
+    xolite_rpm: &str,
     xoa_proxy_version: &str,
+    xoa_proxy_rpm: &str,
 ) -> Result<(), OrchestratorError> {
     use base64::{engine::general_purpose, Engine as _};
 
@@ -762,14 +846,19 @@ pub async fn append_release_matrix_entry(
         .map_err(|e| OrchestratorError::FromUtf8(e))?;
 
     let new_entry = format!(
-        "- iso_version: \"{iso}\"\n  build_date: \"{date}\"\n  components:\n    xolite_ce:\n      version: \"{xv}\"\n      upstream: \"{xu}\"\n      upstream_url: \"https://github.com/vatesfr/xen-orchestra/releases/tag/xo-lite-v{xu}\"\n    xoa_proxy:\n      version: \"{pv}\"\n",
+        "- iso_version: \"{iso}\"\n  build_date: \"{date}\"\n  components:\n    xolite_ce:\n      version: \"{xv}\"\n      rpm: \"{xr}\"\n      upstream: \"{xu}\"\n      upstream_url: \"https://github.com/vatesfr/xen-orchestra/releases/tag/xo-lite-v{xu}\"\n    xoa_proxy:\n      version: \"{pv}\"\n      rpm: \"{pr}\"\n",
         iso = iso_tag,
         date = Utc::now().format("%Y-%m-%d"),
         xv = xolite_version,
+        xr = xolite_rpm,
         xu = xolite_upstream,
         pv = xoa_proxy_version,
+        pr = xoa_proxy_rpm,
     );
-    let updated_yaml = format!("{}\n{}", new_entry.trim_end(), current_yaml);
+    // The file opens with a comment block documenting the schema; entries go
+    // below it, newest first.
+    let (header, entries) = split_leading_comments(&current_yaml);
+    let updated_yaml = format!("{}{}\n{}", header, new_entry.trim_end(), entries);
 
     let payload = serde_json::json!({
         "message": format!("docs: record release {} in matrix", iso_tag),
