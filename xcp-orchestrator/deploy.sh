@@ -18,9 +18,10 @@ CREDS_DIR="/etc/xcp-hl-credentials"
 echo "---> Compiling optimized Rust binaries (workspace)..."
 cargo build --release
 
-# 2. Stop all timers before swapping binaries
-echo "---> Stopping active timers..."
-for unit in xcp-orchestrator.timer iso-agent.timer xoa-vm-agent.timer; do
+# 2. Stop all timers, plus the long-running orchestrator-api service, before
+#    swapping binaries — a running binary's file can't be overwritten in place.
+echo "---> Stopping active timers and services..."
+for unit in xcp-orchestrator.timer iso-agent.timer xoa-vm-agent.timer orchestrator-api.service; do
     sudo systemctl stop "$unit" 2>/dev/null || true
 done
 
