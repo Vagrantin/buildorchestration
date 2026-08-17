@@ -1,14 +1,15 @@
-//! orchestrator-api - small local HTTP endpoint that lets the dashboard's
-//! "Run now" buttons start an agent's systemd unit on demand.
+//! orchestrator-api - small HTTP endpoint that lets the dashboard's "Run now"
+//! buttons start an agent's systemd unit on demand.
 //!
-//! Binds to 127.0.0.1 only; a reverse proxy (e.g. nginx, alongside the static
-//! dashboard in TARGET_REPORT_DIR) is expected to expose /api/ externally.
-//! Every request must carry `Authorization: Bearer <token>` matching the
+//! Binds to 0.0.0.0:8787 and is CORS-enabled so the dashboard's JS (served by
+//! whatever already serves TARGET_REPORT_DIR, e.g. simplehttpsrv on :80) can
+//! call it directly from the browser without a reverse proxy in front. Every
+//! request must carry `Authorization: Bearer <token>` matching the
 //! TRIGGER_TOKEN credential, since a match starts a root systemd unit.
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     routing::post,
     Json, Router,
 };
@@ -16,9 +17,10 @@ use serde::Serialize;
 use shared::load_credential;
 use std::sync::Arc;
 use tokio::process::Command;
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
-const BIND_ADDR: &str = "127.0.0.1:8787";
+const BIND_ADDR: &str = "0.0.0.0:8787";
 
 /// Agent name (as used by the dashboard buttons) to its systemd unit.
 /// Kept as an explicit table rather than interpolating the path segment
@@ -140,9 +142,17 @@ async fn main() {
         .expect("TRIGGER_TOKEN credential required (LoadCredential=TRIGGER_TOKEN=...)");
     let state = Arc::new(AppState { token });
 
+    // Origin is unpredictable (dashboard may be reached by hostname or IP),
+    // and the bearer token is the real access control, so allow any origin.
+    let cors = CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
+        .allow_methods([Method::POST])
+        .allow_headers([axum::http::header::AUTHORIZATION, axum::http::header::CONTENT_TYPE]);
+
     let app = Router::new()
         .route("/api/trigger/:agent", post(trigger_agent))
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     info!("orchestrator-api listening on {}", BIND_ADDR);
     let listener = tokio::net::TcpListener::bind(BIND_ADDR)

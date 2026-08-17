@@ -272,6 +272,9 @@ fn render_dashboard_html(history: &[RunHistoryItem]) -> String {
       <span id="trigger-status" class="trigger-status"></span>
     </div>
     <script>
+    // orchestrator-api listens on its own port, separate from whatever
+    // serves this static page, so it's called directly (CORS-enabled).
+    const TRIGGER_API_PORT = 8787;
     async function triggerAgent(btn) {
       const agent = btn.dataset.agent;
       const statusEl = document.getElementById('trigger-status');
@@ -284,7 +287,9 @@ fn render_dashboard_html(history: &[RunHistoryItem]) -> String {
       btn.disabled = true;
       statusEl.textContent = 'Starting ' + agent + '...';
       try {
-        const res = await fetch('/api/trigger/' + encodeURIComponent(agent), {
+        const apiUrl = location.protocol + '//' + location.hostname + ':' + TRIGGER_API_PORT
+          + '/api/trigger/' + encodeURIComponent(agent);
+        const res = await fetch(apiUrl, {
           method: 'POST',
           headers: { 'Authorization': 'Bearer ' + token },
         });

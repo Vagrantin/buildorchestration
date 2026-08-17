@@ -24,20 +24,19 @@ The orchestrator manages the builds for:
 ## Manual Agent Triggers
 
 The dashboard (`build_report.html`) has "Run now" buttons for each agent.
-They call a small local API (`orchestrator-api`, systemd unit
+They call a small API (`orchestrator-api`, systemd unit
 `orchestrator-api.service`) that starts the matching systemd unit
 (`xcp-orchestrator.service`, `iso-agent.service`, `xoa-vm-agent.service`) on
-request. It binds to `127.0.0.1:8787` only and requires a bearer token
+request. It binds to `0.0.0.0:8787` and requires a bearer token
 (`/etc/xcp-hl-credentials/trigger_token`, set by `deploy.sh`) on every
 request; the browser is prompted for the token on first use and remembers it
 in `localStorage`.
 
-`deploy.sh` installs and configures nginx to serve the static dashboard
-(`/var/www/html/orchestrator`) and reverse-proxy `/api/` to
-`127.0.0.1:8787` (config in `nginx/orchestrator.conf`, installed as the
-`orchestrator` site and replacing the stock `default` site). Nothing further
-to set up: after `deploy.sh` runs, the dashboard and its buttons are
-reachable at `http://<host>/`.
+The dashboard's JS calls this API directly on port 8787 (CORS-enabled), so
+whatever already serves the static dashboard directory
+(`/var/www/html/orchestrator`, e.g. a plain HTTP server on port 80) needs no
+changes. If a firewall is active on the host, allow inbound TCP 8787 from
+wherever the dashboard is viewed from.
 
 ## Tech Stack
 
