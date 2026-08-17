@@ -79,6 +79,24 @@ done
 sudo systemctl enable orchestrator-api.service
 sudo systemctl restart orchestrator-api.service
 
+# 9. Install and configure nginx: serves the static dashboard and proxies
+#    /api/ to orchestrator-api (127.0.0.1:8787) for the "Run now" buttons.
+echo "---> Installing and configuring nginx..."
+if ! command -v nginx >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y nginx
+fi
+
+sudo mkdir -p /var/www/html/orchestrator
+sudo cp nginx/orchestrator.conf /etc/nginx/sites-available/orchestrator
+sudo ln -sf /etc/nginx/sites-available/orchestrator /etc/nginx/sites-enabled/orchestrator
+# The stock "default" site also listens on :80 and would conflict with ours.
+sudo rm -f /etc/nginx/sites-enabled/default
+
+sudo nginx -t
+sudo systemctl enable nginx
+sudo systemctl reload nginx 2>/dev/null || sudo systemctl restart nginx
+
 echo "=========================================================="
 echo "  Redeployment Complete!"
 echo "  Timer status checks:"
@@ -86,14 +104,13 @@ echo "    systemctl status xcp-orchestrator.timer"
 echo "    systemctl status iso-agent.timer"
 echo "    systemctl status xoa-vm-agent.timer"
 echo "    systemctl status orchestrator-api.service"
+echo "    systemctl status nginx"
 echo ""
 echo "  Force immediate manual runs:"
 echo "    sudo systemctl start xcp-orchestrator.service"
 echo "    sudo systemctl start iso-agent.service"
 echo "    sudo systemctl start xoa-vm-agent.service"
 echo ""
-echo "  NOTICE: orchestrator-api listens on 127.0.0.1:8787 only."
-echo "  Add an nginx (or equivalent) reverse proxy for /api/ alongside"
-echo "  the static dashboard at /var/www/html/orchestrator for the"
-echo "  dashboard buttons to reach it. See README.md."
+echo "  Dashboard: http://<this host>/  (nginx serves /var/www/html/orchestrator"
+echo "  and proxies /api/ to orchestrator-api on 127.0.0.1:8787)"
 echo "=========================================================="
