@@ -5,11 +5,12 @@ echo "=========================================================="
 echo "  Deploying/Updating XCP-orchestrator Rust Workspace       "
 echo "=========================================================="
 
-BINARIES=(orchestrator iso-agent xoa-vm-agent)
+BINARIES=(orchestrator orchestrator-api iso-agent xoa-vm-agent)
 UNITS=(
     xcp-orchestrator.service xcp-orchestrator.timer
     iso-agent.service        iso-agent.timer
     xoa-vm-agent.service     xoa-vm-agent.timer
+    orchestrator-api.service
 )
 CREDS_DIR="/etc/xcp-hl-credentials"
 
@@ -50,6 +51,7 @@ prompt_secret_if_missing() {
 prompt_secret_if_missing "github_token"            "Enter your GitHub Personal Access Token (PAT)"
 prompt_secret_if_missing "xcpng_password"           "Enter the XCP-ng host root password"
 prompt_secret_if_missing "almalinux_root_password"  "Enter the AlmaLinux VM root password to bake into images"
+prompt_secret_if_missing "trigger_token"            "Enter a bearer token for the dashboard's manual trigger buttons"
 
 # 5. Install the non-secret build config if not already present (never overwritten)
 CONFIG_DIR="/etc/xcp-orchestrator"
@@ -73,15 +75,25 @@ for timer in xcp-orchestrator.timer iso-agent.timer xoa-vm-agent.timer; do
     sudo systemctl start "$timer"
 done
 
+# 8. (Re)start the manual-trigger API used by the dashboard's "Run now" buttons
+sudo systemctl enable orchestrator-api.service
+sudo systemctl restart orchestrator-api.service
+
 echo "=========================================================="
 echo "  Redeployment Complete!"
 echo "  Timer status checks:"
 echo "    systemctl status xcp-orchestrator.timer"
 echo "    systemctl status iso-agent.timer"
 echo "    systemctl status xoa-vm-agent.timer"
+echo "    systemctl status orchestrator-api.service"
 echo ""
 echo "  Force immediate manual runs:"
 echo "    sudo systemctl start xcp-orchestrator.service"
 echo "    sudo systemctl start iso-agent.service"
 echo "    sudo systemctl start xoa-vm-agent.service"
+echo ""
+echo "  NOTICE: orchestrator-api listens on 127.0.0.1:8787 only."
+echo "  Add an nginx (or equivalent) reverse proxy for /api/ alongside"
+echo "  the static dashboard at /var/www/html/orchestrator for the"
+echo "  dashboard buttons to reach it. See README.md."
 echo "=========================================================="

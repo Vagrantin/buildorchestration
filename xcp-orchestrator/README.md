@@ -21,6 +21,27 @@ The orchestrator manages the builds for:
 * Asynchronous Execution: High-performance, non-blocking operations powered by the Tokio runtime.
 * Robust Status Monitoring: Real-time tracking of build progress and system health.
 
+## Manual Agent Triggers
+
+The dashboard (`build_report.html`) has "Run now" buttons for each agent.
+They call a small local API (`orchestrator-api`, systemd unit
+`orchestrator-api.service`) that starts the matching systemd unit
+(`xcp-orchestrator.service`, `iso-agent.service`, `xoa-vm-agent.service`) on
+request. It binds to `127.0.0.1:8787` only and requires a bearer token
+(`/etc/xcp-hl-credentials/trigger_token`, set by `deploy.sh`) on every
+request; the browser is prompted for the token on first use and remembers it
+in `localStorage`.
+
+The web server that serves the static dashboard directory
+(`/var/www/html/orchestrator`) must reverse-proxy `/api/` to
+`127.0.0.1:8787`, e.g. for nginx:
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:8787/api/;
+}
+```
+
 ## Tech Stack
 
 * Language: Rust (Edition 2021)

@@ -258,8 +258,52 @@ fn render_dashboard_html(history: &[RunHistoryItem]) -> String {
     .card{background:#1c1c1f;padding:20px;border-radius:8px;margin-bottom:20px;border:1px solid #2d2d34;}
     .badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;}
     .success{background:#166534;color:#bbf7d0;} .failure{background:#991b1b;color:#fca5a5;} .progress{background:#854d0e;color:#fef08a;}
-    a{color:#6366f1;text-decoration:none;} a:hover{text-decoration:underline;} pre{background:#09090b;padding:15px;border-radius:6px;overflow-x:auto;color:#fda4af;border-left:4px solid #f43f5e;}</style></head><body>
-    <h1>XCP-ng Agentic Build Dashboard</h1>"#,
+    a{color:#6366f1;text-decoration:none;} a:hover{text-decoration:underline;} pre{background:#09090b;padding:15px;border-radius:6px;overflow-x:auto;color:#fda4af;border-left:4px solid #f43f5e;}
+    button.trigger{background:#4f46e5;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:13px;cursor:pointer;margin-right:10px;}
+    button.trigger:hover{background:#4338ca;} button.trigger:disabled{background:#3f3f46;cursor:wait;}
+    .trigger-status{font-size:12px;color:#a1a1aa;margin-left:6px;}</style></head><body>
+    <h1>XCP-ng Agentic Build Dashboard</h1>
+    <div class="card">
+      <h3>Manual Controls</h3>
+      <p>Runs the agent immediately via its systemd unit, bypassing the daily timer.</p>
+      <button class="trigger" data-agent="orchestrator" onclick="triggerAgent(this)">Run Orchestrator</button>
+      <button class="trigger" data-agent="iso-agent" onclick="triggerAgent(this)">Run ISO Agent</button>
+      <button class="trigger" data-agent="xoa-vm-agent" onclick="triggerAgent(this)">Run XOA VM Agent</button>
+      <span id="trigger-status" class="trigger-status"></span>
+    </div>
+    <script>
+    async function triggerAgent(btn) {
+      const agent = btn.dataset.agent;
+      const statusEl = document.getElementById('trigger-status');
+      let token = window.localStorage.getItem('xcpTriggerToken');
+      if (!token) {
+        token = window.prompt('Trigger token:');
+        if (!token) return;
+        window.localStorage.setItem('xcpTriggerToken', token);
+      }
+      btn.disabled = true;
+      statusEl.textContent = 'Starting ' + agent + '...';
+      try {
+        const res = await fetch('/api/trigger/' + encodeURIComponent(agent), {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + token },
+        });
+        const body = await res.json();
+        if (res.ok) {
+          statusEl.textContent = body.detail;
+        } else {
+          statusEl.textContent = 'Error: ' + body.detail;
+          if (res.status === 401) {
+            window.localStorage.removeItem('xcpTriggerToken');
+          }
+        }
+      } catch (e) {
+        statusEl.textContent = 'Request failed: ' + e;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    </script>"#,
     );
 
     for (idx, item) in history.iter().enumerate() {
@@ -347,6 +391,19 @@ mod tests {
         assert!(html.contains(r#"class="badge failure">Failure"#));
         assert!(html.contains(r#"class="badge progress">In Progress"#));
         assert!(html.contains("check the spec file"));
+    }
+
+    #[test]
+    fn dashboard_has_trigger_buttons_for_each_agent() {
+        let html = render_dashboard_html(&[sample_item()]);
+        for agent in ["orchestrator", "iso-agent", "xoa-vm-agent"] {
+            assert!(
+                html.contains(&format!(r#"data-agent="{}""#, agent)),
+                "missing trigger button for {}",
+                agent
+            );
+        }
+        assert!(html.contains("/api/trigger/"));
     }
 
     #[test]

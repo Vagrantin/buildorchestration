@@ -1,0 +1,15 @@
+[Unit]
+Description=XCP-ng Orchestrator Manual Trigger API
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+# Bearer token compared against Authorization headers from the dashboard's
+# "Run now" buttons; only a match may start an agent's systemd unit.
+LoadCredential=TRIGGER_TOKEN:/etc/xcp-hl-credentials/trigger_token
+ExecStart=/usr/local/bin/orchestrator-api
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

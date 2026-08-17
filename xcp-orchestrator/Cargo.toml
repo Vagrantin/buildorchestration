@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "orchestrator",
+    "orchestrator-api",
     "shared",
     "iso-agent",
     "xoa-vm-agent",
