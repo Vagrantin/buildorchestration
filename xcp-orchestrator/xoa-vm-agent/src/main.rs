@@ -4,7 +4,7 @@
 //!
 //! Workflow:
 //!  1. Check if rebuild needed (HEAD SHA vs last_built_sha)
-//!  2. Trigger GitHub Actions workflow and wait for RPM build to complete
+//!  2. Push the xoa-hl `v{version}-ce{N}` tag and wait for its RPM release
 //!  3. Validate prerequisites (Packer, plugin, disk, ports)
 //!  4. Sync repository
 //!  5. Resolve dynamic values (ISO checksum, RPM URL, credentials)
@@ -19,10 +19,11 @@ use anyhow::{Context, Result, bail};
 
 use chrono::{DateTime, Utc};
 use shared::{
-    AgentStatus, WorkflowStatus,
+    AgentStatus, ComponentVersionState, WorkflowStatus,
     create_github_client, load_github_token,
-    dispatch_workflow, fetch_repo_head_sha, fetch_releases, fetch_tag_commit_sha, ReleaseInfo,
-    locate_dispatch_triggered_run, query_run_conclusion,
+    create_and_push_tag, fetch_release_by_tag, fetch_repo_head_sha, fetch_releases,
+    fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, ReleaseInfo,
+    locate_tag_triggered_run, parse_ce_tag, query_run_conclusion,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -54,11 +55,11 @@ const OUTPUT_DIR: &str = "/var/lib/xcp-hl-orchestrator/output/xoa-hl";
 /// `xoa-hl` so already-shipped ISOs keep resolving them.
 const BUILD_XOA_HL_REPO: &str = "Vagrantin/build-xoa-hl";
 
-/// Workflow file that builds the RPM and creates a GitHub Release.
-const XOA_HL_WORKFLOW_FILE: &str = "build-xoa.yml";
+/// Full "owner/repo" path of the source repo publishing the RPM releases.
+const XOA_HL_REPO: &str = "Vagrantin/xoa-hl";
 
 /// Tag prefix distinguishing this agent's VM-image releases (xoa-image-{date}-{sha7})
-/// from the RPM releases created by the workflow (v{version}_{sha}).
+/// from the RPM releases created by the workflow (v{version}-ce{N}).
 const IMAGE_TAG_PREFIX: &str = "xoa-image-";
 
 const ALMALINUX_VERSION: &str = "9";
@@ -81,6 +82,18 @@ const PACKER_SIGTERM_GRACE: Duration = Duration::from_secs(30);
 /// Hard timeout waiting for the xoa-hl GA workflow to complete.
 const WORKFLOW_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// Hard timeout waiting for the release carrying the pushed tag to appear with
+/// its RPM asset. The workflow is already reported successful at that point,
+/// so this only covers the lag between the release call and the API listing it.
+const RPM_RELEASE_TIMEOUT: Duration = Duration::from_secs(900); // 15 minutes
+
+/// Gap between two release-availability polls.
+const RPM_RELEASE_POLL_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Releases read from xoa-hl when backfilling the ce counter. The list is
+/// polluted with legacy tags, so it has to be long enough to reach a ce one.
+const XOA_HL_RELEASE_SCAN: u8 = 30;
+
 // ── Version State ─────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
@@ -88,6 +101,10 @@ struct XoaHlVersionState {
     pub last_built_sha: String,
     pub last_tag: String, // FIX #12: was never written, now updated in Phase 10
     pub last_built_at: Option<DateTime<Utc>>,
+    /// RPM release state: upstream version, ce counter, last `v{version}-ce{N}`
+    /// tag and the xoa-hl SHA it was cut from. Absent in pre-ce state files.
+    #[serde(default)]
+    pub rpm: ComponentVersionState,
 }
 
 impl XoaHlVersionState {
@@ -243,6 +260,124 @@ fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
     Ok(())
 }
 
+// ── xoa-hl RPM release model ──────────────────────────────────────────────────
+
+/// What xoa-hl needs before the image can be built, decided before any push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RpmBump {
+    /// A published release already covers HEAD; build the image against `tag`.
+    NoChange { tag: String },
+    /// Push `v{version}-ce{counter}` and let CI build and publish the RPM.
+    Bump { version: String, counter: u32 },
+}
+
+/// Web page of an xoa-hl release, for the dashboard status entries.
+fn release_url_for(tag: &str) -> String {
+    format!("https://github.com/{}/releases/tag/{}", XOA_HL_REPO, tag)
+}
+
+/// The RPM download URL carried by a release, if any. A ce release carries
+/// exactly one asset, the RPM.
+fn rpm_asset_url(release: &ReleaseInfo) -> Option<String> {
+    release
+        .assets
+        .iter()
+        .find(|a| a.name.ends_with(".rpm"))
+        .map(|a| a.browser_download_url.clone())
+}
+
+/// Highest-numbered xoa-hl ce release of `expected_version`, as
+/// `(release, counter)`.
+///
+/// xoa-hl's release list also carries legacy `xoa-image-*` tags and the bare
+/// `v{version}` tag from before the ce model, so the filter is strict: the tag
+/// must parse as `v{version}-ce{N}` *and* its version half must match.
+fn newest_ce_release<'a>(
+    releases: &'a [ReleaseInfo],
+    expected_version: &str,
+) -> Option<(&'a ReleaseInfo, u32)> {
+    releases
+        .iter()
+        .filter_map(|r| match parse_ce_tag(&r.tag_name) {
+            Some((version, counter)) if version == expected_version => Some((r, counter)),
+            _ => None,
+        })
+        .max_by_key(|(_, counter)| *counter)
+}
+
+/// Counter of the next ce tag: 1 for a version never released before,
+/// otherwise one past the highest counter known. `released_counter` comes from
+/// the published releases and covers lost or stale local state.
+fn next_ce_counter(
+    state: &ComponentVersionState,
+    version: &str,
+    released_counter: Option<u32>,
+) -> u32 {
+    let local = if state.upstream_version == version {
+        state.ce_counter
+    } else {
+        0
+    };
+    local.max(released_counter.unwrap_or(0)) + 1
+}
+
+/// Decide whether xoa-hl needs a new RPM release for `head_sha`.
+///
+/// The version comes from the `UPSTREAM_XO` pin, not from the tags: nothing
+/// moves until that file or the repo HEAD does. When the local state is empty
+/// or stale, the published releases are the ground truth and `state` is
+/// backfilled from them.
+async fn decide_rpm_bump(
+    client: &reqwest::Client,
+    state: &mut ComponentVersionState,
+    head_sha: &str,
+) -> Result<RpmBump> {
+    let pin = fetch_xoa_hl_upstream_pin(client)
+        .await
+        .context("Failed to read the xoa-hl UPSTREAM_XO pin")?;
+    let version = pin.version_string();
+    info!("xoa-hl: upstream pin {} resolves to version {}", pin.xo_version, version);
+
+    if version == state.upstream_version
+        && head_sha == state.last_built_sha
+        && !state.last_tag.is_empty()
+    {
+        return Ok(RpmBump::NoChange { tag: state.last_tag.clone() });
+    }
+
+    let releases = match fetch_releases(client, "xoa-hl", XOA_HL_RELEASE_SCAN).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Could not list xoa-hl releases ({}); trusting local state.", e);
+            Vec::new()
+        }
+    };
+    let newest = newest_ce_release(&releases, &version);
+
+    if let Some((release, counter)) = newest {
+        let tag = release.tag_name.clone();
+        if rpm_asset_url(release).is_none() {
+            warn!("xoa-hl release {} carries no RPM asset, a new release is needed.", tag);
+        } else {
+            match fetch_tag_commit_sha(client, "xoa-hl", &tag).await {
+                Ok(sha) if sha == head_sha => {
+                    info!("xoa-hl: release {} already matches HEAD, backfilling state.", tag);
+                    state.upstream_version = version;
+                    state.ce_counter = counter;
+                    state.last_tag = tag.clone();
+                    state.last_built_sha = head_sha.to_string();
+                    return Ok(RpmBump::NoChange { tag });
+                }
+                Ok(_) => {}
+                Err(e) => warn!("Could not resolve xoa-hl tag {} ({}); rebuilding.", tag, e),
+            }
+        }
+    }
+
+    let counter = next_ce_counter(state, &version, newest.map(|(_, c)| c));
+    Ok(RpmBump::Bump { version, counter })
+}
+
 // ── Main Workflow ─────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -299,11 +434,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Local state is empty or untrustworthy, check the published releases
+    // Local state is empty or untrustworthy, check the published images
     // (ground truth). An xoa-image-* release with an XVA asset for HEAD means
-    // everything is done; a current RPM release without one means only the
-    // workflow can be skipped and the image must still be built. The two live
-    // in separate repos: images on build-xoa-hl, RPMs on xoa-hl.
+    // everything is done. Images live on build-xoa-hl, RPM releases on xoa-hl,
+    // which Phase 2 handles on its own.
     let short_sha = repo_head_sha[..7.min(repo_head_sha.len())].to_string();
 
     match fetch_releases(&client, "build-xoa-hl", 30).await {
@@ -339,68 +473,81 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // No image for HEAD, does the newest RPM release already cover it?
-    let mut rpm_is_current = false;
-    match fetch_releases(&client, "xoa-hl", 30).await {
-        Ok(releases) => {
-            // Image releases published before the move to build-xoa-hl are still
-            // listed here and carry no RPM, skip them.
-            if let Some(rpm) = releases.iter().find(|r| !r.tag_name.starts_with(IMAGE_TAG_PREFIX)) {
-                match fetch_tag_commit_sha(&client, "xoa-hl", &rpm.tag_name).await {
-                    Ok(sha) if sha == repo_head_sha => {
-                        info!(
-                            "RPM release {} matches HEAD (SHA: {}), skipping workflow, building missing image.",
-                            rpm.tag_name, short_sha
-                        );
-                        rpm_is_current = true;
-                        status.set_component("xoa-hl", WorkflowStatus::Skipped, rpm.html_url.clone());
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!(
-                        "Could not resolve RPM release tag {} ({}); proceeding with full build.",
-                        rpm.tag_name, e
-                    ),
-                }
-            }
+    // ── PHASE 2: Ensure an RPM release exists for HEAD ────────────────────────
+    info!("PHASE 2: Resolving the xoa-hl RPM release...");
+    status.phase = "phase_2_rpm_release".to_string();
+    status.write_to_file(STATUS_FILE)?;
+
+    // decide_rpm_bump may backfill the ce counter from the published releases,
+    // so it works on a clone that is merged back whatever it decides.
+    let mut rpm_state = version_state.rpm.clone();
+    let decision = decide_rpm_bump(&client, &mut rpm_state, &repo_head_sha).await;
+    version_state.rpm = rpm_state;
+
+    let decision = match decision {
+        Ok(d) => d,
+        Err(e) => {
+            error!("xoa-hl RPM bump detection failed: {}", e);
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("RPM bump detection failed: {}", e);
+            status.set_component("xoa-hl", WorkflowStatus::Failure, String::new());
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
         }
-        Err(e) => warn!(
-            "Could not list xoa-hl releases ({}); proceeding with full build.",
-            e
-        ),
-    }
+    };
 
-    // ── PHASE 2: Trigger GA workflow and wait ────────────────────────────────
-    if rpm_is_current {
-        info!("PHASE 2: Skipped, RPM release already covers HEAD.");
-    } else {
-        info!("PHASE 2: Triggering xoa-hl build workflow...");
-        status.phase = "phase_2_trigger_workflow".to_string();
-        status.detail = "Dispatching xoa-hl GitHub Actions workflow".to_string();
-        status.write_to_file(STATUS_FILE)?;
+    let rpm_tag = match decision {
+        RpmBump::NoChange { tag } => {
+            info!(
+                "xoa-hl: release {} already covers HEAD (SHA: {}), skipping the RPM build.",
+                tag, short_sha
+            );
+            status.set_component("xoa-hl", WorkflowStatus::Skipped, release_url_for(&tag));
+            tag
+        }
+        RpmBump::Bump { version, counter } => {
+            let base_tag = format!("v{}-ce{}", version, counter);
+            info!("xoa-hl: pushing tag {} on HEAD to trigger the RPM build.", base_tag);
+            status.detail = format!("Pushing xoa-hl tag {}", base_tag);
+            status.write_to_file(STATUS_FILE)?;
 
-        let (run_id, run_url) = match trigger_xoa_hl_workflow(&client).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Workflow dispatch failed: {}", e);
-                status.status = WorkflowStatus::Failure;
-                status.detail = format!("Workflow dispatch failed: {}", e);
-                status.set_component("xoa-hl", WorkflowStatus::Failure, String::new());
-                status.write_to_file(STATUS_FILE)?;
-                return Err(e);
-            }
-        };
+            let trigger_time = Utc::now();
+            let actual_tag =
+                match create_and_push_tag(&client, "xoa-hl", &base_tag, &repo_head_sha).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("xoa-hl tag push failed: {}", e);
+                        status.status = WorkflowStatus::Failure;
+                        status.detail = format!("Tag push failed: {}", e);
+                        status.set_component("xoa-hl", WorkflowStatus::Failure, String::new());
+                        status.write_to_file(STATUS_FILE)?;
+                        return Err(e.into());
+                    }
+                };
 
-        status.url = run_url.clone();
-        status.detail = format!("Waiting for workflow: {}", run_url);
-        status.set_component("xoa-hl", WorkflowStatus::InProgress, run_url.clone());
-        status.write_to_file(STATUS_FILE)?;
+            let (run_id, run_url) =
+                match locate_tag_triggered_run(&client, "xoa-hl", &actual_tag, trigger_time).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Could not locate the run triggered by {}: {}", actual_tag, e);
+                        status.status = WorkflowStatus::Failure;
+                        status.detail = format!("Workflow run not found: {}", e);
+                        status.set_component(
+                            "xoa-hl",
+                            WorkflowStatus::Failure,
+                            release_url_for(&actual_tag),
+                        );
+                        status.write_to_file(STATUS_FILE)?;
+                        return Err(e.into());
+                    }
+                };
 
-        match wait_for_workflow(&client, run_id, &run_url, WORKFLOW_TIMEOUT).await {
-            Ok(()) => {
-                info!("xoa-hl workflow completed successfully");
-                status.set_component("xoa-hl", WorkflowStatus::Success, run_url.clone());
-            }
-            Err(e) => {
+            status.url = run_url.clone();
+            status.detail = format!("Waiting for workflow: {}", run_url);
+            status.set_component("xoa-hl", WorkflowStatus::InProgress, run_url.clone());
+            status.write_to_file(STATUS_FILE)?;
+
+            if let Err(e) = wait_for_workflow(&client, run_id, &run_url, WORKFLOW_TIMEOUT).await {
                 error!("xoa-hl workflow failed: {}", e);
                 status.status = WorkflowStatus::Failure;
                 status.detail = format!("Workflow failed: {}", e);
@@ -408,8 +555,32 @@ async fn main() -> Result<()> {
                 status.write_to_file(STATUS_FILE)?;
                 return Err(e);
             }
+            info!("xoa-hl workflow completed successfully");
+
+            // The workflow publishes the release as its last step; the API can
+            // still lag behind it, so wait for the asset itself.
+            if let Err(e) = wait_for_rpm_release(&client, &actual_tag, RPM_RELEASE_TIMEOUT).await {
+                error!("xoa-hl release {} never carried an RPM: {}", actual_tag, e);
+                status.status = WorkflowStatus::Failure;
+                status.detail = format!("RPM release unavailable: {}", e);
+                status.set_component("xoa-hl", WorkflowStatus::Failure, run_url.clone());
+                status.write_to_file(STATUS_FILE)?;
+                return Err(e);
+            }
+            status.set_component("xoa-hl", WorkflowStatus::Success, run_url.clone());
+
+            // Persist as soon as the RPM exists: a later Packer failure must not
+            // make the next run push yet another tag for the same commit.
+            version_state.rpm.upstream_version = version;
+            version_state.rpm.ce_counter =
+                parse_ce_tag(&actual_tag).map(|(_, c)| c).unwrap_or(counter);
+            version_state.rpm.last_tag = actual_tag.clone();
+            version_state.rpm.last_built_sha = repo_head_sha.clone();
+            version_state.save().context("Failed to persist xoa-hl RPM state")?;
+
+            actual_tag
         }
-    }
+    };
 
     // ── PHASE 3: Validate prerequisites ──────────────────────────────────────
     info!("PHASE 3: Validating prerequisites...");
@@ -449,7 +620,7 @@ async fn main() -> Result<()> {
             return Err(e);
         }
     };
-    if let Err(e) = resolve_dynamic_values(&client, &mut config).await {
+    if let Err(e) = resolve_dynamic_values(&client, &mut config, &rpm_tag).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Value resolution failed: {}", e);
         status.write_to_file(STATUS_FILE)?;
@@ -564,29 +735,43 @@ async fn main() -> Result<()> {
 
 // ── PHASE 2 helpers ───────────────────────────────────────────────────────────
 
-/// Dispatch the xoa-hl build workflow and wait for the run to appear in the API.
-/// Returns `(run_id, html_url)`.
-async fn trigger_xoa_hl_workflow(client: &reqwest::Client) -> Result<(u64, String)> {
-    let trigger_time = Utc::now();
+/// Poll `releases/tags/{tag}` until the RPM asset shows up or `timeout`
+/// elapses. Pushing the tag only starts the build, the release lands minutes
+/// later, so the URL cannot be resolved before this returns.
+async fn wait_for_rpm_release(
+    client: &reqwest::Client,
+    tag: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let deadline = Instant::now() + timeout;
+    let mut attempt: u32 = 0;
 
-    dispatch_workflow(client, "xoa-hl", XOA_HL_WORKFLOW_FILE, "main", serde_json::json!({}))
-        .await
-        .context("Failed to dispatch workflow")?;
+    loop {
+        attempt += 1;
+        match fetch_release_by_tag(client, "xoa-hl", tag).await {
+            Ok(Some(release)) => match rpm_asset_url(&release) {
+                Some(url) => {
+                    info!("Attempt {}: release {} carries its RPM", attempt, tag);
+                    return Ok(url);
+                }
+                None => info!(
+                    "Attempt {}: release {} published, no RPM asset yet",
+                    attempt, tag
+                ),
+            },
+            Ok(None) => info!("Attempt {}: no release on tag {} yet", attempt, tag),
+            Err(e) => warn!("Attempt {}: could not read release {}: {}", attempt, tag, e),
+        }
 
-    info!("Workflow dispatched, waiting for run to appear...");
-
-    // FIX (P0-1): workflow_dispatch runs are filed under event=workflow_dispatch,
-    // not event=push, and carry no head_branch/tag to match against. Using
-    // locate_tag_triggered_run here (event=push filter) meant this call always
-    // timed out after 180s. locate_dispatch_triggered_run polls the correct
-    // event type and matches purely on created_at >= trigger_time.
-    let (run_id, run_url) =
-        locate_dispatch_triggered_run(client, "xoa-hl", trigger_time)
-            .await
-            .context("Failed to locate triggered workflow run")?;
-
-    info!("Workflow run started: {}", run_url);
-    Ok((run_id, run_url))
+        if Instant::now() + RPM_RELEASE_POLL_INTERVAL >= deadline {
+            bail!(
+                "Timed out after {:?} waiting for the RPM asset on xoa-hl release {}",
+                timeout,
+                tag
+            );
+        }
+        sleep(RPM_RELEASE_POLL_INTERVAL).await;
+    }
 }
 
 /// Poll a run until it completes or `timeout` elapses.
@@ -784,6 +969,7 @@ async fn sync_repository() -> Result<()> {
 async fn resolve_dynamic_values(
     client: &reqwest::Client,
     config: &mut BuildConfig,
+    rpm_tag: &str,
 ) -> Result<()> {
     // Credentials come exclusively from systemd LoadCredential, never from env vars set manually
     let creds_dir = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
@@ -811,8 +997,8 @@ async fn resolve_dynamic_values(
         .context("Failed to resolve AlmaLinux checksum")?;
     info!("Checksum: {}", config.almalinux_iso_checksum);
 
-    info!("Resolving xoa-hl RPM URL...");
-    config.xoa_hl_rpm_url = resolve_xoa_hl_rpm_url(client)
+    info!("Resolving xoa-hl RPM URL for release {}...", rpm_tag);
+    config.xoa_hl_rpm_url = resolve_xoa_hl_rpm_url(client, rpm_tag)
         .await
         .context("Failed to resolve xoa-hl RPM URL")?;
     info!("RPM URL: {}", config.xoa_hl_rpm_url);
@@ -865,20 +1051,19 @@ async fn resolve_almalinux_checksum(client: &reqwest::Client) -> Result<String> 
     bail!("Could not resolve AlmaLinux ISO checksum from official sources");
 }
 
-async fn resolve_xoa_hl_rpm_url(client: &reqwest::Client) -> Result<String> {
-    // releases/latest may be one of the xoa-image-* releases published on this
-    // repo before the move to build-xoa-hl, which carry no RPM, scan the list
-    // for the newest release that has one.
-    let releases = fetch_releases(client, "xoa-hl", 30)
+/// Resolve the RPM published on the exact release this run builds against.
+///
+/// Scanning the release list for the first `.rpm` asset is wrong: GitHub
+/// returns assets oldest-first, so that selected a months-old RPM. The tag is
+/// authoritative, and the filename is read from the asset, never predicted.
+async fn resolve_xoa_hl_rpm_url(client: &reqwest::Client, tag: &str) -> Result<String> {
+    let release = fetch_release_by_tag(client, "xoa-hl", tag)
         .await
-        .context("Failed to fetch xoa-hl releases")?;
+        .with_context(|| format!("Failed to fetch xoa-hl release {}", tag))?
+        .ok_or_else(|| anyhow::anyhow!("xoa-hl has no release on tag {}", tag))?;
 
-    releases
-        .into_iter()
-        .flat_map(|r| r.assets)
-        .find(|a| a.name.ends_with(".rpm"))
-        .map(|a| a.browser_download_url)
-        .ok_or_else(|| anyhow::anyhow!("No RPM asset found in recent xoa-hl releases"))
+    rpm_asset_url(&release)
+        .ok_or_else(|| anyhow::anyhow!("xoa-hl release {} carries no .rpm asset", tag))
 }
 
 // ── PHASE 6: Generate build files ─────────────────────────────────────────────
@@ -1425,6 +1610,65 @@ mod tests {
         let sha = "cb65556aabbccdd";
         let tag = generate_image_tag(sha);
         assert!(is_image_release_for(&release(&tag, &["xoa.xva.gz"]), &sha[..7]));
+    }
+
+    #[test]
+    fn newest_ce_release_ignores_legacy_tags() {
+        let version = "5.113.2_e281c536";
+        let releases = vec![
+            release("xoa-image-20260713-cb65556", &["xoa.xva.gz"]),
+            release("v5.113.2_e281c536", &["xoa-hl-5.113.2.el9.noarch.rpm"]),
+            release("v5.113.2_e281c536-ce7", &["xoa-hl-5.113.2_e281c536-7.noarch.rpm"]),
+            release("v5.113.2_e281c536-ce3", &["xoa-hl-5.113.2_e281c536-3.noarch.rpm"]),
+            // A ce release of a different upstream pin must not match either.
+            release("v5.114.0_aabbccdd-ce9", &["xoa-hl-5.114.0_aabbccdd-9.noarch.rpm"]),
+        ];
+        let (found, counter) = newest_ce_release(&releases, version).expect("ce release found");
+        assert_eq!(found.tag_name, "v5.113.2_e281c536-ce7");
+        assert_eq!(counter, 7);
+    }
+
+    #[test]
+    fn newest_ce_release_returns_none_when_only_legacy_tags_exist() {
+        let releases = vec![
+            release("xoa-image-20260713-cb65556", &["xoa.xva.gz"]),
+            release("v5.113.2_e281c536", &["xoa-hl-5.113.2.el9.noarch.rpm"]),
+        ];
+        assert!(newest_ce_release(&releases, "5.113.2_e281c536").is_none());
+    }
+
+    #[test]
+    fn counter_resets_on_version_change_and_increments_otherwise() {
+        let state = ComponentVersionState {
+            upstream_version: "5.113.2_e281c536".to_string(),
+            ce_counter: 6,
+            last_tag: "v5.113.2_e281c536-ce6".to_string(),
+            last_built_sha: "cb65556".to_string(),
+        };
+        // Same version: one past the local counter.
+        assert_eq!(next_ce_counter(&state, "5.113.2_e281c536", None), 7);
+        // New upstream pin: the counter restarts.
+        assert_eq!(next_ce_counter(&state, "5.114.0_aabbccdd", None), 1);
+        // Lost state: the published releases decide.
+        assert_eq!(
+            next_ce_counter(&ComponentVersionState::default(), "5.113.2_e281c536", Some(7)),
+            8
+        );
+        // Stale state behind the releases: the releases win.
+        assert_eq!(next_ce_counter(&state, "5.113.2_e281c536", Some(9)), 10);
+    }
+
+    #[test]
+    fn rpm_asset_url_picks_the_rpm() {
+        assert_eq!(
+            rpm_asset_url(&release("v5.113.2_e281c536-ce7", &["notes.txt", "xoa-hl.noarch.rpm"])),
+            Some("https://example.com/xoa-hl.noarch.rpm".to_string())
+        );
+        assert_eq!(rpm_asset_url(&release("v5.113.2_e281c536-ce7", &[])), None);
+        assert_eq!(
+            rpm_asset_url(&release("xoa-image-20260713-cb65556", &["xoa.xva.gz"])),
+            None
+        );
     }
 
     #[test]

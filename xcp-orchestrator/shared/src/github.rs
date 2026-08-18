@@ -343,7 +343,7 @@ fn next_tag_candidate(tag: &str) -> Option<String> {
 mod tests {
     use super::{
         next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag,
-        split_leading_comments,
+        parse_upstream_xo, split_leading_comments, UpstreamXoPin,
     };
 
     #[test]
@@ -353,6 +353,50 @@ mod tests {
         assert_eq!(parse_ce_tag("v0.1.1"), None);
         assert_eq!(parse_ce_tag("v-ce3"), None);
         assert_eq!(parse_ce_tag("v1-cebad"), None);
+    }
+
+    #[test]
+    fn xoa_hl_ce_tags_parse_and_legacy_tags_do_not() {
+        assert_eq!(
+            parse_ce_tag("v5.113.2_e281c536-ce7"),
+            Some(("5.113.2_e281c536".to_string(), 7))
+        );
+        // Legacy tags still listed on xoa-hl must never be read as ce releases.
+        assert_eq!(parse_ce_tag("v5.113.2_e281c536"), None);
+        assert_eq!(parse_ce_tag("xoa-image-20260713-cb65556"), None);
+    }
+
+    #[test]
+    fn upstream_xo_pin_parses() {
+        let content = "# Upstream xen-orchestra pin. Shell-sourceable.\n\
+                       # 5.113.2, last XO 5.x release (2025-12-09).\n\
+                       XO_COMMIT=e281c536d3b1e97ccfb3b0826f91b7dbb6c4478c\n\
+                       XO_VERSION=5.113.2\n";
+        let pin = parse_upstream_xo(content).expect("pin parses");
+        assert_eq!(pin.xo_version, "5.113.2");
+        assert_eq!(pin.xo_commit, "e281c536d3b1e97ccfb3b0826f91b7dbb6c4478c");
+        assert_eq!(pin.version_string(), "5.113.2_e281c536");
+    }
+
+    #[test]
+    fn upstream_xo_pin_accepts_quotes_and_ignores_unknown_keys() {
+        let content = "XO_VERSION=\"5.114.0\"\nOTHER=x\nXO_COMMIT='abcdef0123456789'\n";
+        assert_eq!(
+            parse_upstream_xo(content),
+            Some(UpstreamXoPin {
+                xo_version: "5.114.0".to_string(),
+                xo_commit: "abcdef0123456789".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn upstream_xo_pin_rejects_incomplete_files() {
+        assert_eq!(parse_upstream_xo(""), None);
+        assert_eq!(parse_upstream_xo("XO_VERSION=5.113.2\n"), None);
+        assert_eq!(parse_upstream_xo("XO_COMMIT=e281c536d3b1e97c\n"), None);
+        // A commit too short to slice an 8-character prefix from.
+        assert_eq!(parse_upstream_xo("XO_VERSION=5.113.2\nXO_COMMIT=e281\n"), None);
     }
 
     #[test]
@@ -687,31 +731,47 @@ pub fn parse_pinned_xolite_tag(content: &str) -> Option<String> {
     }
 }
 
-/// Fetch the pinned upstream XO Lite tag from the UPSTREAM_TAG file at the root
-/// of the xolite-ce repo. Returns Ok(None) when the pin file does not exist so
-/// callers can fall back to the latest upstream release.
-pub async fn fetch_pinned_xolite_tag(client: &Client) -> Result<Option<String>, OrchestratorError> {
+/// Fetch a UTF-8 text file from the default branch of `repo` over the contents
+/// API. Returns `Ok(None)` when the file does not exist, so callers can treat a
+/// missing pin file as "not pinned" rather than as an error.
+pub async fn fetch_repo_text_file(
+    client: &Client,
+    repo: &str,
+    path: &str,
+) -> Result<Option<String>, OrchestratorError> {
     let url = format!(
-        "https://api.github.com/repos/{}/xolite-ce/contents/UPSTREAM_TAG?ref={}",
-        OWNER, DEFAULT_BRANCH
+        "https://api.github.com/repos/{}/{}/contents/{}?ref={}",
+        OWNER, repo, path, DEFAULT_BRANCH
     );
     let res = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| OrchestratorError::GitHubApi("fetch UPSTREAM_TAG".to_string(), e.to_string()))?;
+        .map_err(|e| OrchestratorError::GitHubApi(format!("fetch {} from {}", path, repo), e.to_string()))?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let file: GHFileContent = parse_github_response(res, "fetch_pinned_xolite_tag").await?;
+    let file: GHFileContent =
+        parse_github_response(res, &format!("fetch_repo_text_file {}@{}", repo, path)).await?;
 
     use base64::{engine::general_purpose, Engine as _};
     let cleaned: String = file.content.chars().filter(|c| !c.is_whitespace()).collect();
     let decoded = general_purpose::STANDARD
         .decode(cleaned)
         .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
-    let content = String::from_utf8(decoded)
-        .map_err(|e| OrchestratorError::VersionFormat(format!("UPSTREAM_TAG is not UTF-8: {}", e)))?;
+    String::from_utf8(decoded).map(Some).map_err(|e| {
+        OrchestratorError::VersionFormat(format!("{} in {} is not UTF-8: {}", path, repo, e))
+    })
+}
+
+/// Fetch the pinned upstream XO Lite tag from the UPSTREAM_TAG file at the root
+/// of the xolite-ce repo. Returns Ok(None) when the pin file does not exist so
+/// callers can fall back to the latest upstream release.
+pub async fn fetch_pinned_xolite_tag(client: &Client) -> Result<Option<String>, OrchestratorError> {
+    let content = match fetch_repo_text_file(client, "xolite-ce", "UPSTREAM_TAG").await? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
 
     parse_pinned_xolite_tag(&content).map(Some).ok_or_else(|| {
         OrchestratorError::VersionFormat(format!(
@@ -719,6 +779,100 @@ pub async fn fetch_pinned_xolite_tag(client: &Client) -> Result<Option<String>, 
             content.trim()
         ))
     })
+}
+
+/// Length of the upstream commit prefix xoa-hl stamps into its version string.
+pub const XO_SHORT_SHA_LEN: usize = 8;
+
+/// The upstream xen-orchestra pin committed in xoa-hl's `UPSTREAM_XO` file.
+/// It is the version oracle for xoa-hl: builds only move when it is bumped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamXoPin {
+    /// Upstream release version, e.g. "5.113.2".
+    pub xo_version: String,
+    /// Full upstream commit the release is built from.
+    pub xo_commit: String,
+}
+
+impl UpstreamXoPin {
+    /// Version string xoa-hl builds stamp: `{XO_VERSION}_{XO_COMMIT:0:8}`,
+    /// e.g. "5.113.2_e281c536". It is the version half of the `-ceN` tags.
+    pub fn version_string(&self) -> String {
+        let short: String = self.xo_commit.chars().take(XO_SHORT_SHA_LEN).collect();
+        format!("{}_{}", self.xo_version, short)
+    }
+}
+
+/// Parse xoa-hl's shell-sourceable `UPSTREAM_XO` pin file. Comments and blank
+/// lines are skipped; unknown keys are ignored. Returns `None` unless both
+/// `XO_VERSION` and a commit of at least 8 characters are present.
+pub fn parse_upstream_xo(content: &str) -> Option<UpstreamXoPin> {
+    let mut xo_version: Option<String> = None;
+    let mut xo_commit: Option<String> = None;
+
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Shell-sourceable file: an unquoted value ends at the first space.
+        let value = value.split_whitespace().next().unwrap_or("");
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        match key.trim() {
+            "XO_VERSION" => xo_version = Some(value.to_string()),
+            "XO_COMMIT" => xo_commit = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    let xo_version = xo_version.filter(|v| !v.is_empty())?;
+    let xo_commit = xo_commit.filter(|c| c.len() >= XO_SHORT_SHA_LEN)?;
+    Some(UpstreamXoPin { xo_version, xo_commit })
+}
+
+/// Read xoa-hl's `UPSTREAM_XO` pin, the version oracle for its RPM releases.
+pub async fn fetch_xoa_hl_upstream_pin(client: &Client) -> Result<UpstreamXoPin, OrchestratorError> {
+    let content = fetch_repo_text_file(client, "xoa-hl", "UPSTREAM_XO")
+        .await?
+        .ok_or_else(|| {
+            OrchestratorError::VersionFormat("xoa-hl has no UPSTREAM_XO pin file".to_string())
+        })?;
+
+    parse_upstream_xo(&content).ok_or_else(|| {
+        OrchestratorError::VersionFormat(format!(
+            "UPSTREAM_XO does not define XO_VERSION and XO_COMMIT: {:?}",
+            content.trim()
+        ))
+    })
+}
+
+/// Fetch the release published on `tag`. Returns `Ok(None)` when no release
+/// carries that tag yet, which is the normal state while CI is still building.
+pub async fn fetch_release_by_tag(
+    client: &Client,
+    repo: &str,
+    tag: &str,
+) -> Result<Option<ReleaseInfo>, OrchestratorError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/releases/tags/{}",
+        OWNER, repo, tag
+    );
+    let res = client.get(&url).send().await.map_err(|e| {
+        OrchestratorError::GitHubApi(format!("release {} of {}", tag, repo), e.to_string())
+    })?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    parse_github_response(res, &format!("fetch_release_by_tag for {}@{}", repo, tag))
+        .await
+        .map(Some)
 }
 
 /// Fetch xoa-proxy version from Cargo.toml
