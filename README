@@ -117,6 +117,8 @@ The script will compile the native binary payload with release optimizations, mi
 
 Ensure that the token used has accurate access bounds. The application requires Read and Write access to **Actions** and Read-only access to **Metadata** across your targeted infrastructure projects (`xcp-ng-ce-iso`, `xoa-proxy`, `xolite-ce`).
 
+Builds are started by pushing release tags, so the token also needs Read and Write access to **Contents** on every repository the agents tag: `xolite-ce`, `xoa-proxy`, `xcp-ng-ce-iso`, `xoa-hl` (the `v{version}-ce{N}` tag that triggers its RPM build) and `build-xoa-hl` (the VM image releases).
+
 ---
 
 ## Operational Management

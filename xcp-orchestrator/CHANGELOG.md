@@ -2,6 +2,45 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-08-18
+
+### Changed
+
+- **xoa-vm-agent**: xoa-hl adopted the ce release model (fat RPM, one release
+  per build, `v{version}-ce{N}` tags, no tarball asset), so the agent now drives
+  it the way iso-agent drives xolite-ce. The version oracle is the committed
+  `UPSTREAM_XO` pin, read over the contents API: the version string is
+  `{XO_VERSION}_{XO_COMMIT:0:8}`, e.g. `5.113.2_e281c536`. Nothing is rebuilt
+  when both that version and the repo HEAD match the persisted state; a version
+  change restarts the ce counter at 1, anything else takes the next counter.
+  The agent then pushes `v{version}-ce{N}` (`create_and_push_tag`, whose 422
+  retry means the returned tag is the authoritative one), which is what starts
+  the RPM workflow, and waits for its run. Counter, tag and source SHA are
+  persisted under a new `rpm` object in the agent's version-state file (absent
+  in older files, defaulted), and backfilled from the published releases when
+  local state is lost. xoa-hl's release list still carries legacy `xoa-image-*`
+  tags and the bare `v5.113.2_e281c536` tag, so the release scan only accepts
+  tags that parse as `v{version}-ce{N}` whose version half matches the pin.
+  The `workflow_dispatch` trigger is gone: the workflow builds on tag push.
+
+### Fixed
+
+- **xoa-vm-agent**: `resolve_xoa_hl_rpm_url` took the first `.rpm` asset found
+  while walking the release list. GitHub returns assets oldest-first, so this
+  baked a July 2026 RPM (no systemd units) into every image built since. The
+  URL is now resolved against `releases/tags/{tag}` for the exact tag the run
+  is building, and the filename is read from the asset, never predicted.
+
+### Added
+
+- **xoa-vm-agent**: after the tag push the agent waits for the release carrying
+  that tag to appear *with* its RPM asset (`RPM_RELEASE_TIMEOUT`, 15 minutes,
+  polled every 20 s) before resolving the URL. The workflow completing is not
+  enough: the release is published in its last step and the API lags it.
+- `shared::fetch_repo_text_file` (generalised out of `fetch_pinned_xolite_tag`),
+  `shared::fetch_xoa_hl_upstream_pin` / `parse_upstream_xo` / `UpstreamXoPin`,
+  and `shared::fetch_release_by_tag`, all with unit tests.
+
 ## 2026-07-30
 
 ### Changed
