@@ -3,7 +3,7 @@
 //! Builds XOA-HL (Xen Orchestra Appliance - Home Lab Edition) XVA images.
 //!
 //! Workflow:
-//!  1. Check if rebuild needed (HEAD SHA vs last_built_sha)
+//!  1. Check if rebuild needed (xoa-hl/build-xoa-hl HEAD SHAs vs image_xoa_hl_sha/image_build_xoa_hl_sha)
 //!  2. Push the xoa-hl `v{version}-ce{N}` tag and wait for its RPM release
 //!  3. Validate prerequisites (Packer, plugin, disk, ports)
 //!  4. Sync repository
@@ -98,9 +98,14 @@ const XOA_HL_RELEASE_SCAN: u8 = 30;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct XoaHlVersionState {
-    pub last_built_sha: String,
-    pub last_tag: String, 
-    pub last_built_at: Option<DateTime<Utc>>,
+    /// xoa-hl HEAD SHA the last successfully built XVA image came from.
+    pub image_xoa_hl_sha: String,
+    /// build-xoa-hl HEAD SHA the last successfully built XVA image came from.
+    #[serde(default)]
+    pub image_build_xoa_hl_sha: String,
+    /// Tag of the last published XVA image release.
+    pub image_tag: String,
+    pub image_built_at: Option<DateTime<Utc>>,
     /// RPM release state: upstream version, ce counter, last `v{version}-ce{N}`
     /// tag and the xoa-hl SHA it was cut from. Absent in pre-ce state files.
     #[serde(default)]
@@ -414,19 +419,27 @@ async fn main() -> Result<()> {
     let repo_head_sha = fetch_repo_head_sha(&client, "xoa-hl")
         .await
         .context("Failed to fetch xoa-hl HEAD SHA")?;
+    // build-xoa-hl carries the Packer/kickstart/first-boot scripts this agent
+    // builds with, a change there must trigger a rebuild too (Vagrantin/xcp-hl#47).
+    let build_xoa_hl_head_sha = fetch_repo_head_sha(&client, "build-xoa-hl")
+        .await
+        .context("Failed to fetch build-xoa-hl HEAD SHA")?;
 
-    // A skip requires a *published image* for HEAD, not just unchanged code:
-    // the workflow's RPM release and this agent's XVA image release are
-    // separate artefacts, and the image is the one this agent exists to ship.
+    // A skip requires a *published image* for HEAD of both repos, not just
+    // unchanged xoa-hl code: the workflow's RPM release and this agent's XVA
+    // image release are separate artefacts, and the image is the one this
+    // agent exists to ship.
     if !force
-        && !version_state.last_built_sha.is_empty()
-        && repo_head_sha == version_state.last_built_sha
-        && version_state.last_tag.starts_with(IMAGE_TAG_PREFIX)
+        && !version_state.image_xoa_hl_sha.is_empty()
+        && repo_head_sha == version_state.image_xoa_hl_sha
+        && build_xoa_hl_head_sha == version_state.image_build_xoa_hl_sha
+        && version_state.image_tag.starts_with(IMAGE_TAG_PREFIX)
     {
         info!(
-            "No changes since image {} was built (SHA: {}), skipping.",
-            version_state.last_tag,
-            &repo_head_sha[..7]
+            "No changes since image {} was built (xoa-hl: {}, build-xoa-hl: {}), skipping.",
+            version_state.image_tag,
+            &repo_head_sha[..7],
+            &build_xoa_hl_head_sha[..7]
         );
         status.status = WorkflowStatus::Skipped;
         status.detail = format!("No changes (SHA: {})", &repo_head_sha[..7]);
@@ -442,7 +455,10 @@ async fn main() -> Result<()> {
 
     match fetch_releases(&client, "build-xoa-hl", 30).await {
         Ok(releases) => {
-            if let Some(image) = releases.iter().find(|r| is_image_release_for(r, &short_sha)) {
+            if let Some(image) = releases
+                .iter()
+                .find(|r| is_image_release_for(r, &short_sha, &build_xoa_hl_head_sha))
+            {
                 if force {
                     info!(
                         "Image {} already published for HEAD (SHA: {}) but --force given, rebuilding.",
@@ -453,9 +469,10 @@ async fn main() -> Result<()> {
                         "Image {} already published for HEAD (SHA: {}), skipping.",
                         image.tag_name, short_sha
                     );
-                    version_state.last_built_sha = repo_head_sha.clone();
-                    version_state.last_tag = image.tag_name.clone();
-                    version_state.last_built_at = Some(Utc::now());
+                    version_state.image_xoa_hl_sha = repo_head_sha.clone();
+                    version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
+                    version_state.image_tag = image.tag_name.clone();
+                    version_state.image_built_at = Some(Utc::now());
                     version_state.save()?;
                     status.status = WorkflowStatus::Skipped;
                     status.detail =
@@ -683,8 +700,15 @@ async fn main() -> Result<()> {
     let image_tag = generate_image_tag(&repo_head_sha);
     let image_name = format!("XOA HomeLab Edition - {}", image_tag);
 
-    let (upload_url, release_url) =
-        match create_github_release(&client, &image_tag, &image_name, &repo_head_sha).await {
+    let (upload_url, release_url) = match create_github_release(
+        &client,
+        &image_tag,
+        &image_name,
+        &repo_head_sha,
+        &build_xoa_hl_head_sha,
+    )
+    .await
+    {
             Ok(u) => u,
             Err(e) => {
                 status.status = WorkflowStatus::Failure;
@@ -712,9 +736,10 @@ async fn main() -> Result<()> {
     info!("PHASE 10: Persisting version state...");
     status.phase = "phase_10_persist_state".to_string();
 
-    version_state.last_built_sha = repo_head_sha.clone();
-    version_state.last_tag = image_tag.clone(); // FIX #12: was never set
-    version_state.last_built_at = Some(Utc::now());
+    version_state.image_xoa_hl_sha = repo_head_sha.clone();
+    version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
+    version_state.image_tag = image_tag.clone(); // FIX #12: was never set
+    version_state.image_built_at = Some(Utc::now());
     version_state.save().context("Failed to persist version state")?;
 
     // ── PHASE 11: Write final status ──────────────────────────────────────────
@@ -1430,12 +1455,14 @@ fn generate_image_tag(head_sha: &str) -> String {
     format!("{}{}-{}", IMAGE_TAG_PREFIX, date, short)
 }
 
-/// Does this release carry the published VM image for the given commit?
-/// The tag encodes the short SHA (see generate_image_tag) and the XVA asset
-/// must be present, a release whose upload failed doesn't count.
-fn is_image_release_for(release: &ReleaseInfo, short_sha: &str) -> bool {
+/// Does this release carry the published VM image for the given commits?
+/// The tag encodes the xoa-hl short SHA (see generate_image_tag), the body
+/// records the build-xoa-hl SHA it was built from (Vagrantin/xcp-hl#47), and
+/// the XVA asset must be present, a release whose upload failed doesn't count.
+fn is_image_release_for(release: &ReleaseInfo, short_sha: &str, build_xoa_hl_sha: &str) -> bool {
     release.tag_name.starts_with(IMAGE_TAG_PREFIX)
         && release.tag_name.ends_with(&format!("-{}", short_sha))
+        && release.body.contains(&format!("(build-xoa-hl): {}", build_xoa_hl_sha))
         && release
             .assets
             .iter()
@@ -1448,12 +1475,14 @@ fn is_image_release_for(release: &ReleaseInfo, short_sha: &str) -> bool {
 /// The tag is created by the GitHub API on that repo's default branch. It
 /// cannot be anchored to `target_sha`: that is an `xoa-hl` commit, which does
 /// not exist here, the source commit is recorded in the tag suffix and the
-/// release body instead.
+/// release body instead. `build_xoa_hl_sha` (this repo's own HEAD) is
+/// recorded in the body only, `is_image_release_for` matches on it.
 async fn create_github_release(
     client: &reqwest::Client,
     tag: &str,
     name: &str,
     target_sha: &str,
+    build_xoa_hl_sha: &str,
 ) -> Result<(String, String)> {
     #[derive(serde::Deserialize)]
     struct ReleaseResp {
@@ -1486,7 +1515,10 @@ async fn create_github_release(
     let payload = serde_json::json!({
         "tag_name":          tag,
         "name":              name,
-        "body":              format!("XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}", target_sha),
+        "body":              format!(
+            "XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}\nSource commit (build-xoa-hl): {}",
+            target_sha, build_xoa_hl_sha
+        ),
         "draft":             false,
         "prerelease":        false,
     });
@@ -1574,6 +1606,10 @@ mod tests {
     use shared::ReleaseAsset;
 
     fn release(tag: &str, asset_names: &[&str]) -> ReleaseInfo {
+        release_with_body(tag, asset_names, "")
+    }
+
+    fn release_with_body(tag: &str, asset_names: &[&str], body: &str) -> ReleaseInfo {
         ReleaseInfo {
             tag_name: tag.to_string(),
             html_url: format!("https://github.com/Vagrantin/build-xoa-hl/releases/tag/{}", tag),
@@ -1584,32 +1620,68 @@ mod tests {
                     browser_download_url: format!("https://example.com/{}", n),
                 })
                 .collect(),
+            body: body.to_string(),
         }
     }
 
     #[test]
-    fn image_release_requires_prefix_sha_and_xva_asset() {
+    fn image_release_requires_prefix_sha_build_sha_and_xva_asset() {
         let sha = "cb65556";
-        // The real thing: image tag for this SHA with an XVA asset
-        assert!(is_image_release_for(&release("xoa-image-20260713-cb65556", &["xoa.xva.gz"]), sha));
-        assert!(is_image_release_for(&release("xoa-image-20260713-cb65556", &["xoa.xva"]), sha));
+        let build_sha = "deadbeef";
+        let body = format!("Source commit (build-xoa-hl): {}", build_sha);
+        // The real thing: image tag for this SHA with an XVA asset and matching body
+        assert!(is_image_release_for(
+            &release_with_body("xoa-image-20260713-cb65556", &["xoa.xva.gz"], &body),
+            sha,
+            build_sha
+        ));
+        assert!(is_image_release_for(
+            &release_with_body("xoa-image-20260713-cb65556", &["xoa.xva"], &body),
+            sha,
+            build_sha
+        ));
         // RPM release at the same SHA is NOT an image
         assert!(!is_image_release_for(
             &release("v5.113.2_e281c536", &["xoa-hl-5.113.2.el9.noarch.rpm"]),
-            sha
+            sha,
+            build_sha
         ));
         // Image release for a different commit
-        assert!(!is_image_release_for(&release("xoa-image-20260701-090ce7e", &["xoa.xva.gz"]), sha));
+        assert!(!is_image_release_for(
+            &release_with_body("xoa-image-20260701-090ce7e", &["xoa.xva.gz"], &body),
+            sha,
+            build_sha
+        ));
         // Image release whose XVA upload failed (no asset) doesn't count
-        assert!(!is_image_release_for(&release("xoa-image-20260713-cb65556", &[]), sha));
-        assert!(!is_image_release_for(&release("xoa-image-20260713-cb65556", &["notes.txt"]), sha));
+        assert!(!is_image_release_for(
+            &release_with_body("xoa-image-20260713-cb65556", &[], &body),
+            sha,
+            build_sha
+        ));
+        assert!(!is_image_release_for(
+            &release_with_body("xoa-image-20260713-cb65556", &["notes.txt"], &body),
+            sha,
+            build_sha
+        ));
+        // build-xoa-hl advanced since this release was built, no longer a match
+        assert!(!is_image_release_for(
+            &release_with_body("xoa-image-20260713-cb65556", &["xoa.xva.gz"], &body),
+            sha,
+            "newsha"
+        ));
     }
 
     #[test]
     fn generated_image_tag_matches_its_own_release_check() {
         let sha = "cb65556aabbccdd";
+        let build_sha = "deadbeef";
         let tag = generate_image_tag(sha);
-        assert!(is_image_release_for(&release(&tag, &["xoa.xva.gz"]), &sha[..7]));
+        let body = format!("Source commit (build-xoa-hl): {}", build_sha);
+        assert!(is_image_release_for(
+            &release_with_body(&tag, &["xoa.xva.gz"], &body),
+            &sha[..7],
+            build_sha
+        ));
     }
 
     #[test]
