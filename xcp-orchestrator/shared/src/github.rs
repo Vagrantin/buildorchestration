@@ -245,6 +245,8 @@ pub struct ReleaseInfo {
     pub html_url: String,
     #[serde(default)]
     pub assets: Vec<ReleaseAsset>,
+    #[serde(default)]
+    pub body: String,
 }
 
 /// List a repo's releases, newest first.
