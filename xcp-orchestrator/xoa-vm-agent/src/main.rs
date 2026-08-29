@@ -30,7 +30,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::fs as async_fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpListener; // FIX #14: real port check via bind attempt
+use tokio::net::TcpListener;
 use tokio::process::Command as AsyncCommand;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -99,7 +99,7 @@ const XOA_HL_RELEASE_SCAN: u8 = 30;
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct XoaHlVersionState {
     pub last_built_sha: String,
-    pub last_tag: String, // FIX #12: was never written, now updated in Phase 10
+    pub last_tag: String, 
     pub last_built_at: Option<DateTime<Utc>>,
     /// RPM release state: upstream version, ce counter, last `v{version}-ce{N}`
     /// tag and the xoa-hl SHA it was cut from. Absent in pre-ce state files.
