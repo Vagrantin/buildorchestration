@@ -1,25 +1,25 @@
-```markdown
 # XCP-orchestrator
 
 ## Overview
 
-XCP-orchestrator is a Rust-based orchestration engine designed to automate and manage the build processes for several key components within the Xen ecosystem. It provides a centralized logic layer to handle complex workflows, ensuring consistency across different appliance types.
+XCP-orchestrator automate and manage the build processes for XCP-HL components. Each binary is its own systemd service on its own daily timer:
 
-The orchestrator manages the builds for:
-* XOA VM
-* XOA-hl
-* XO-lite-hl
-* XCP-ng-ISO
-* xoa-proxy
+* **`iso-agent`** (04:00) — checks `xolite-ce` and `xoa-proxy` for upstream changes, dispatches/monitors their GitHub Actions builds, then builds and tags `xcp-ng-ce-iso`.
+* **`xoa-vm-agent`** (04:00) — checks `xoa-hl` and `build-xoa-hl` for changes, pushes the `v{version}-ce{N}` tag that starts xoa-hl's RPM release, waits for it, then runs Packer locally against the target XCP-ng host to build and publish the XOA VM (XVA) image.
+* **`orchestrator`** (09:00, after the two agents above) — aggregates their status/history, runs AI diagnostics on any failed build via Ollama, and renders the dashboard.
+* **`orchestrator-api`** — API behind the dashboard's to trigger manual build and status update.
+* **`shared`** — GitHub API client, version-state types, and status/report types used by all of the above.
+
+The builds are managed across these agents:
+* XOA VM / xoa-hl(via `xoa-vm-agent`)
+* XO Lite CE / xoa-proxy / xcp-ng-ce-iso (via `iso-agent`)
 
 ## Key Features
 
-* Build Orchestration: Automated lifecycle management for multiple appliance targets.
-* Version and State Management: Precise tracking of build versions and system states to ensure reproducible builds.
-* GitHub Integration: Support for interacting with GitHub workflows and repositories.
-* AI-Assisted Capabilities: Integration with Ollama to leverage LLMs within the orchestration workflow.
-* Asynchronous Execution: High-performance, non-blocking operations powered by the Tokio runtime.
-* Robust Status Monitoring: Real-time tracking of build progress and system health.
+* Version and State Management: Each agent persists its own version-state JSON under `/var/lib/xcp-hl-orchestrator/`, so a rebuild only fires when what it actually depends on has moved.
+* Automated build: Build are triggered automatically daily at 4 AM.
+* GitHub Integration: Trigger github workflow for build and releases.
+* Monitoring: Dashboard to visualize where is the status of each build.
 
 ## Manual Agent Triggers
 
@@ -33,10 +33,16 @@ request; the browser is prompted for the token on first use and remembers it
 in `localStorage`.
 
 The dashboard's JS calls this API directly on port 8787 (CORS-enabled), so
-whatever already serves the static dashboard directory
-(`/var/www/html/orchestrator`, e.g. a plain HTTP server on port 80) needs no
-changes. If a firewall is active on the host, allow inbound TCP 8787 from
+if a firewall is active on the host, allow inbound TCP 8787 from
 wherever the dashboard is viewed from.
+
+From the command line, `force-run.sh` runs the same agents outside the
+dashboard, with the credentials each systemd unit declares:
+
+```bash
+sudo ./force-run.sh                 # run all agents in force mode
+sudo ./force-run.sh xoa-vm-agent    # run only one agent
+```
 
 ## Tech Stack
 
@@ -46,4 +52,3 @@ wherever the dashboard is viewed from.
 * Networking: Reqwest (HTTP communication)
 * Logging: Tracing (Structured logging and telemetry)
 * Error Handling: Anyhow and Thiserror
-
