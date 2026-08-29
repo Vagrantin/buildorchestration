@@ -3,7 +3,7 @@
 //! Builds XOA-HL (Xen Orchestra Appliance - Home Lab Edition) XVA images.
 //!
 //! Workflow:
-//!  1. Check if rebuild needed (HEAD SHA vs last_built_sha)
+//!  1. Check if rebuild needed (xoa-hl/build-xoa-hl HEAD SHAs vs image_xoa_hl_sha/image_build_xoa_hl_sha)
 //!  2. Push the xoa-hl `v{version}-ce{N}` tag and wait for its RPM release
 //!  3. Validate prerequisites (Packer, plugin, disk, ports)
 //!  4. Sync repository
@@ -98,13 +98,14 @@ const XOA_HL_RELEASE_SCAN: u8 = 30;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct XoaHlVersionState {
-    /// HEAD SHA of xoa-hl (source repo) at the last successful build.
-    pub last_built_sha: String,
-    /// HEAD SHA of build-xoa-hl (Packer/build-script repo) at the last build.
+    /// xoa-hl HEAD SHA the last successfully built XVA image came from.
+    pub image_xoa_hl_sha: String,
+    /// build-xoa-hl HEAD SHA the last successfully built XVA image came from.
     #[serde(default)]
-    pub last_built_sha_build_xoa_hl: String,
-    pub last_tag: String, // FIX #12: was never written, now updated in Phase 10
-    pub last_built_at: Option<DateTime<Utc>>,
+    pub image_build_xoa_hl_sha: String,
+    /// Tag of the last published XVA image release.
+    pub image_tag: String, // FIX #12: was never written, now updated in Phase 10
+    pub image_built_at: Option<DateTime<Utc>>,
     /// RPM release state: upstream version, ce counter, last `v{version}-ce{N}`
     /// tag and the xoa-hl SHA it was cut from. Absent in pre-ce state files.
     #[serde(default)]
@@ -429,14 +430,14 @@ async fn main() -> Result<()> {
     // image release are separate artefacts, and the image is the one this
     // agent exists to ship.
     if !force
-        && !version_state.last_built_sha.is_empty()
-        && repo_head_sha == version_state.last_built_sha
-        && build_xoa_hl_head_sha == version_state.last_built_sha_build_xoa_hl
-        && version_state.last_tag.starts_with(IMAGE_TAG_PREFIX)
+        && !version_state.image_xoa_hl_sha.is_empty()
+        && repo_head_sha == version_state.image_xoa_hl_sha
+        && build_xoa_hl_head_sha == version_state.image_build_xoa_hl_sha
+        && version_state.image_tag.starts_with(IMAGE_TAG_PREFIX)
     {
         info!(
             "No changes since image {} was built (xoa-hl: {}, build-xoa-hl: {}), skipping.",
-            version_state.last_tag,
+            version_state.image_tag,
             &repo_head_sha[..7],
             &build_xoa_hl_head_sha[..7]
         );
@@ -468,10 +469,10 @@ async fn main() -> Result<()> {
                         "Image {} already published for HEAD (SHA: {}), skipping.",
                         image.tag_name, short_sha
                     );
-                    version_state.last_built_sha = repo_head_sha.clone();
-                    version_state.last_built_sha_build_xoa_hl = build_xoa_hl_head_sha.clone();
-                    version_state.last_tag = image.tag_name.clone();
-                    version_state.last_built_at = Some(Utc::now());
+                    version_state.image_xoa_hl_sha = repo_head_sha.clone();
+                    version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
+                    version_state.image_tag = image.tag_name.clone();
+                    version_state.image_built_at = Some(Utc::now());
                     version_state.save()?;
                     status.status = WorkflowStatus::Skipped;
                     status.detail =
@@ -735,10 +736,10 @@ async fn main() -> Result<()> {
     info!("PHASE 10: Persisting version state...");
     status.phase = "phase_10_persist_state".to_string();
 
-    version_state.last_built_sha = repo_head_sha.clone();
-    version_state.last_built_sha_build_xoa_hl = build_xoa_hl_head_sha.clone();
-    version_state.last_tag = image_tag.clone(); // FIX #12: was never set
-    version_state.last_built_at = Some(Utc::now());
+    version_state.image_xoa_hl_sha = repo_head_sha.clone();
+    version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
+    version_state.image_tag = image_tag.clone(); // FIX #12: was never set
+    version_state.image_built_at = Some(Utc::now());
     version_state.save().context("Failed to persist version state")?;
 
     // ── PHASE 11: Write final status ──────────────────────────────────────────
