@@ -99,12 +99,16 @@ const XOA_HL_RELEASE_SCAN: u8 = 30;
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 struct XoaHlVersionState {
     /// xoa-hl HEAD SHA the last successfully built XVA image came from.
+    /// The alias reads state files written before the fields were renamed.
+    #[serde(default, alias = "last_built_sha")]
     pub image_xoa_hl_sha: String,
     /// build-xoa-hl HEAD SHA the last successfully built XVA image came from.
-    #[serde(default)]
+    #[serde(default, alias = "last_built_sha_build_xoa_hl")]
     pub image_build_xoa_hl_sha: String,
     /// Tag of the last published XVA image release.
+    #[serde(default, alias = "last_tag")]
     pub image_tag: String,
+    #[serde(default, alias = "last_built_at")]
     pub image_built_at: Option<DateTime<Utc>>,
     /// RPM release state: upstream version, ce counter, last `v{version}-ce{N}`
     /// tag and the xoa-hl SHA it was cut from. Absent in pre-ce state files.
@@ -1741,6 +1745,33 @@ mod tests {
             rpm_asset_url(&release("xoa-image-20260713-cb65556", &["xoa.xva.gz"])),
             None
         );
+    }
+
+    /// A state file written before the image_* rename must still load: load()
+    /// falls back to Default on a parse error, silently dropping the rpm state
+    /// and re-cutting a ce release that already exists.
+    #[test]
+    fn pre_rename_state_file_still_loads() {
+        let old = r#"{
+            "last_built_sha": "cb65556aabb",
+            "last_tag": "xoa-image-20260713-cb65556",
+            "last_built_at": "2026-07-13T00:00:00Z",
+            "rpm": {
+                "upstream_version": "5.113.2_e281c536",
+                "ce_counter": 6,
+                "last_tag": "v5.113.2_e281c536-ce6",
+                "last_built_sha": "cb65556aabb"
+            }
+        }"#;
+        let state: XoaHlVersionState = serde_json::from_str(old).expect("old state must parse");
+        assert_eq!(state.image_xoa_hl_sha, "cb65556aabb");
+        assert_eq!(state.image_tag, "xoa-image-20260713-cb65556");
+        // build-xoa-hl was not tracked back then, so it stays empty and forces
+        // one rebuild rather than wrongly skipping.
+        assert_eq!(state.image_build_xoa_hl_sha, "");
+        // The rpm sub-state is what a silent reset would have thrown away.
+        assert_eq!(state.rpm.ce_counter, 6);
+        assert_eq!(state.rpm.last_tag, "v5.113.2_e281c536-ce6");
     }
 
     #[test]

@@ -245,8 +245,19 @@ pub struct ReleaseInfo {
     pub html_url: String,
     #[serde(default)]
     pub assets: Vec<ReleaseAsset>,
-    #[serde(default)]
+    /// Release notes. GitHub sends `null` for a release created without a
+    /// body, which `serde(default)` alone does not cover: it only fills in a
+    /// missing key, so an explicit null still fails the String deserialize.
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     pub body: String,
+}
+
+/// Deserialize a nullable JSON string as `String`, mapping null to empty.
+fn null_as_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// List a repo's releases, newest first.
@@ -345,8 +356,25 @@ fn next_tag_candidate(tag: &str) -> Option<String> {
 mod tests {
     use super::{
         next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag,
-        parse_upstream_xo, split_leading_comments, UpstreamXoPin,
+        parse_upstream_xo, split_leading_comments, ReleaseInfo, UpstreamXoPin,
     };
+
+    /// GitHub sends `"body": null` for a release created without notes (every
+    /// xoa-hl ce release is one), which used to abort the whole release list.
+    #[test]
+    fn release_body_accepts_null_missing_and_string() {
+        let null_body = r#"{"tag_name":"v1-ce1","html_url":"u","assets":[],"body":null}"#;
+        let r: ReleaseInfo = serde_json::from_str(null_body).expect("null body must parse");
+        assert_eq!(r.body, "");
+
+        let no_body = r#"{"tag_name":"v1-ce1","html_url":"u","assets":[]}"#;
+        let r: ReleaseInfo = serde_json::from_str(no_body).expect("missing body must parse");
+        assert_eq!(r.body, "");
+
+        let with_body = r#"{"tag_name":"v1-ce1","html_url":"u","assets":[],"body":"notes"}"#;
+        let r: ReleaseInfo = serde_json::from_str(with_body).expect("string body must parse");
+        assert_eq!(r.body, "notes");
+    }
 
     #[test]
     fn ce_tags_parse() {
