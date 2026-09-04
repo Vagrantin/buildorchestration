@@ -32,6 +32,10 @@ pub struct IsoVersionState {
     /// when neither component has advanced since.
     pub last_xolite_tag: String,
     pub last_xoa_proxy_tag: String,
+    /// HEAD SHA of xcp-ng-ce-iso at the time of last_tag, so a commit to the
+    /// ISO repo itself (no component bump) still triggers a rebuild.
+    #[serde(default)]
+    pub last_built_sha: String,
 }
 
 /// Version state for XOA-HL builds

@@ -81,6 +81,23 @@ enum BumpDecision {
     PatchBump { upstream_version: String, next_counter: u32 },
 }
 
+/// Whether xcp-ng-ce-iso needs a new build: either component advanced, the
+/// target base version changed, or the ISO repo's own HEAD moved since the
+/// last build (a commit with no accompanying component release).
+fn needs_iso_build(
+    force: bool,
+    state: &IsoVersionState,
+    current_iso_sha: &str,
+    xolite_tag: &str,
+    xoa_proxy_tag: &str,
+) -> bool {
+    force
+        || state.xcpng_version != XCPNG_TARGET_VERSION
+        || state.last_xolite_tag != xolite_tag
+        || state.last_xoa_proxy_tag != xoa_proxy_tag
+        || state.last_built_sha != current_iso_sha
+}
+
 /// Dev override: force a rebuild even when the version/SHA rules say nothing
 /// changed. Forcing a component pushes a fresh -ceN tag (a real release).
 #[derive(Default, Clone, Copy)]
@@ -548,7 +565,7 @@ async fn main() -> Result<(), OrchestratorError> {
         && xoa_status == WorkflowStatus::Skipped
     {
         match fetch_latest_release_ref(&client, "xcp-ng-ce-iso").await {
-            Ok(Some((tag, _sha))) => {
+            Ok(Some((tag, release_sha))) => {
                 if let Some((xcpng_version, ce_counter)) = parse_ce_tag(&tag) {
                     info!("Seeding ISO state from latest release {}.", tag);
                     version_state.iso.xcpng_version = xcpng_version;
@@ -556,6 +573,7 @@ async fn main() -> Result<(), OrchestratorError> {
                     version_state.iso.last_tag = tag;
                     version_state.iso.last_xolite_tag = xolite_version.clone();
                     version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
+                    version_state.iso.last_built_sha = release_sha;
                     version_state.save()?;
                 }
             }
@@ -567,12 +585,15 @@ async fn main() -> Result<(), OrchestratorError> {
         }
     }
 
-    let needs_iso_build = force.iso
-        || version_state.iso.xcpng_version != XCPNG_TARGET_VERSION
-        || version_state.iso.last_xolite_tag != xolite_version
-        || version_state.iso.last_xoa_proxy_tag != xoa_proxy_version;
+    let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
 
-    if !needs_iso_build {
+    if !needs_iso_build(
+        force.iso,
+        &version_state.iso,
+        &iso_head_sha,
+        &xolite_version,
+        &xoa_proxy_version,
+    ) {
         info!("No component changes since last ISO build, skipping.");
         status.phase = "completed".to_string();
         status.status = WorkflowStatus::Skipped;
@@ -597,7 +618,6 @@ async fn main() -> Result<(), OrchestratorError> {
     status.write_to_file(STATUS_FILE)?;
 
     let iso_build_result: Result<(u64, String, String), OrchestratorError> = async {
-        let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
         let actual_iso_tag =
             create_and_push_tag(&client, "xcp-ng-ce-iso", &iso_tag, &iso_head_sha).await?;
         // The tag alone no longer triggers the build. Dispatch the workflow on
@@ -702,6 +722,7 @@ async fn main() -> Result<(), OrchestratorError> {
                 version_state.iso.last_tag = actual_iso_tag.clone();
                 version_state.iso.last_xolite_tag = xolite_version.clone();
                 version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
+                version_state.iso.last_built_sha = iso_head_sha.clone();
                 version_state.save()?;
 
                 // The tag says which release went in, the RPM name says what a
@@ -733,4 +754,93 @@ async fn main() -> Result<(), OrchestratorError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn built_state() -> IsoVersionState {
+        IsoVersionState {
+            xcpng_version: XCPNG_TARGET_VERSION.to_string(),
+            ce_counter: 4,
+            last_tag: format!("v{}-ce4", XCPNG_TARGET_VERSION),
+            last_xolite_tag: "v1.2.3-ce1".to_string(),
+            last_xoa_proxy_tag: "v0.9.0-ce2".to_string(),
+            last_built_sha: "abc123".to_string(),
+        }
+    }
+
+    #[test]
+    fn no_change_skips_build() {
+        let state = built_state();
+        assert!(!needs_iso_build(
+            false,
+            &state,
+            "abc123",
+            "v1.2.3-ce1",
+            "v0.9.0-ce2",
+        ));
+    }
+
+    #[test]
+    fn iso_repo_sha_change_triggers_build() {
+        let state = built_state();
+        assert!(needs_iso_build(
+            false,
+            &state,
+            "def456",
+            "v1.2.3-ce1",
+            "v0.9.0-ce2",
+        ));
+    }
+
+    #[test]
+    fn xolite_tag_change_triggers_build() {
+        let state = built_state();
+        assert!(needs_iso_build(
+            false,
+            &state,
+            "abc123",
+            "v1.2.4-ce1",
+            "v0.9.0-ce2",
+        ));
+    }
+
+    #[test]
+    fn xoa_proxy_tag_change_triggers_build() {
+        let state = built_state();
+        assert!(needs_iso_build(
+            false,
+            &state,
+            "abc123",
+            "v1.2.3-ce1",
+            "v0.9.1-ce1",
+        ));
+    }
+
+    #[test]
+    fn target_version_mismatch_triggers_build() {
+        let mut state = built_state();
+        state.xcpng_version = "8.2".to_string();
+        assert!(needs_iso_build(
+            false,
+            &state,
+            "abc123",
+            "v1.2.3-ce1",
+            "v0.9.0-ce2",
+        ));
+    }
+
+    #[test]
+    fn force_triggers_build_even_with_no_changes() {
+        let state = built_state();
+        assert!(needs_iso_build(
+            true,
+            &state,
+            "abc123",
+            "v1.2.3-ce1",
+            "v0.9.0-ce2",
+        ));
+    }
 }
