@@ -594,7 +594,7 @@ async fn main() -> Result<(), OrchestratorError> {
         &xolite_version,
         &xoa_proxy_version,
     ) {
-        info!("No component changes since last ISO build, skipping.");
+        info!("xcp-ng-ce-iso: no change detected, skipping.");
         status.phase = "completed".to_string();
         status.status = WorkflowStatus::Skipped;
         status.detail = "No component changes".to_string();
@@ -603,6 +603,7 @@ async fn main() -> Result<(), OrchestratorError> {
         return Ok(());
     }
 
+    info!("xcp-ng-ce-iso: change detected, triggering build.");
     info!("PHASE 3: Triggering custom ISO build...");
 
     let next_counter = if version_state.iso.xcpng_version == XCPNG_TARGET_VERSION {
