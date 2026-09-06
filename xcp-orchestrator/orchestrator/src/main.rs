@@ -266,9 +266,9 @@ fn render_dashboard_html(history: &[RunHistoryItem]) -> String {
     <div class="card">
       <h3>Manual Controls</h3>
       <p>Runs the agent immediately via its systemd unit, bypassing the daily timer.</p>
-      <button class="trigger" data-agent="orchestrator" onclick="triggerAgent(this)">Run Orchestrator</button>
-      <button class="trigger" data-agent="iso-agent" onclick="triggerAgent(this)">Run ISO Agent</button>
-      <button class="trigger" data-agent="xoa-vm-agent" onclick="triggerAgent(this)">Run XOA VM Agent</button>
+      <button class="trigger" data-agent="orchestrator" onclick="triggerAgent(this)">Refresh Status</button>
+      <button class="trigger" data-agent="iso-agent" onclick="triggerAgent(this)">Build XO Lite CE, XOA Proxy & XCP-ng ISO</button>
+      <button class="trigger" data-agent="xoa-vm-agent" onclick="triggerAgent(this)">Build XOA HL & XOA VM Image</button>
       <span id="trigger-status" class="trigger-status"></span>
     </div>
     <script>
@@ -296,6 +296,8 @@ fn render_dashboard_html(history: &[RunHistoryItem]) -> String {
         const body = await res.json();
         if (res.ok) {
           statusEl.textContent = body.detail;
+          // Auto-refresh the page after a short delay to show updated status
+          setTimeout(function() { location.reload(); }, 500);
         } else {
           statusEl.textContent = 'Error: ' + body.detail;
           if (res.status === 401) {
@@ -324,7 +326,7 @@ fn render_dashboard_html(history: &[RunHistoryItem]) -> String {
         let rows: [(&str, &str, &str); 5] = [
             ("Xolite-ce", &item.xolite_status, &item.xolite_url),
             ("XOA-Proxy", &item.xoa_proxy_status, &item.xoa_proxy_url),
-            ("ISO Matrix", &item.iso_status, &item.iso_url),
+            ("XCP-ng ISO", &item.iso_status, &item.iso_url),
             ("XOA-HL", &item.xoa_hl_status, &item.xoa_hl_url),
             ("XOA Image", &item.xoa_image_status, &item.xoa_image_url),
         ];
@@ -387,7 +389,7 @@ mod tests {
     #[test]
     fn dashboard_renders_all_component_rows_with_links() {
         let html = render_dashboard_html(&[sample_item()]);
-        for label in ["Xolite-ce", "XOA-Proxy", "ISO Matrix", "XOA-HL", "XOA Image"] {
+        for label in ["Xolite-ce", "XOA-Proxy", "XCP-ng ISO", "XOA-HL", "XOA Image"] {
             assert!(html.contains(label), "missing row {}", label);
         }
         assert!(html.contains(r#"href="https://github.com/Vagrantin/xolite-ce/actions/runs/1""#));
