@@ -51,20 +51,40 @@ impl Default for RunHistoryItem {
     }
 }
 
-/// Read a component's (status, url) from an agent status, falling back to the
-/// agent-level fields so older status files (without `components`) still render.
+/// Read a component's (status, url) from an agent status.
+///
+/// An agent that records components at all records each one as it reaches it,
+/// so a name missing from a *non-empty* list means the run has not got there
+/// yet — not that the component shares the agent's current state. Reporting
+/// the agent-level status in that case made the ISO row echo "this agent is
+/// busy" as "In Progress" while xolite-ce was still building, and echo the
+/// agent's `Failure` (with another repo's run URL) after a component failure
+/// aborted the run before the ISO was ever dispatched.
+///
+/// The agent-level fallback is kept only for status files written before
+/// per-component tracking existed, which have no `components` array at all.
 fn component_or_agent(status: &AgentStatus, name: &str) -> (String, String) {
-    match status.component(name) {
-        Some(c) => (
+    if let Some(c) = status.component(name) {
+        return (
             c.status.to_string(),
             if c.url.is_empty() { "#".to_string() } else { c.url.clone() },
-        ),
-        None => (
+        );
+    }
+
+    if status.components.is_empty() {
+        return (
             status.status.to_string(),
             if status.url.is_empty() { "#".to_string() } else { status.url.clone() },
-        ),
+        );
     }
+
+    (PENDING_STATUS.to_string(), "#".to_string())
 }
+
+/// Display status for a component the run has not reached yet. Deliberately
+/// distinct from "In Progress": the difference between "the ISO is building"
+/// and "the ISO has not started" is the whole point of the dependency order.
+const PENDING_STATUS: &str = "Pending";
 
 fn is_failed(status: &WorkflowStatus) -> bool {
     matches!(
@@ -247,6 +267,7 @@ fn badge_class(status: &str) -> &'static str {
     match status {
         "Success" => "success",
         "Failure" | "Timeout" | "Aborted" => "failure",
+        PENDING_STATUS => "pending",
         _ => "progress",
     }
 }
@@ -258,6 +279,7 @@ fn render_dashboard_html(history: &[RunHistoryItem]) -> String {
     .card{background:#1c1c1f;padding:20px;border-radius:8px;margin-bottom:20px;border:1px solid #2d2d34;}
     .badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;}
     .success{background:#166534;color:#bbf7d0;} .failure{background:#991b1b;color:#fca5a5;} .progress{background:#854d0e;color:#fef08a;}
+    .pending{background:#27272a;color:#a1a1aa;}
     a{color:#6366f1;text-decoration:none;} a:hover{text-decoration:underline;} pre{background:#09090b;padding:15px;border-radius:6px;overflow-x:auto;color:#fda4af;border-left:4px solid #f43f5e;}
     button.trigger{background:#4f46e5;color:#fff;border:none;padding:8px 14px;border-radius:6px;font-size:13px;cursor:pointer;margin-right:10px;}
     button.trigger:hover{background:#4338ca;} button.trigger:disabled{background:#3f3f46;cursor:wait;}
@@ -443,6 +465,107 @@ mod tests {
                 "https://github.com/Vagrantin/xolite-ce/actions/runs/2".to_string(),
             ]
         );
+    }
+
+    /// Reproduces the dashboard state reported in the bug: iso-agent is in
+    /// PHASE 2, xolite-ce still building, and the "iso" component has not been
+    /// reached yet so it is absent from `components`.
+    fn phase2_status() -> AgentStatus {
+        let mut status = AgentStatus::new("monitoring", WorkflowStatus::InProgress);
+        status.url = "https://github.com/Vagrantin/xolite-ce/actions/runs/1".to_string();
+        status.set_component(
+            "xolite-ce",
+            WorkflowStatus::InProgress,
+            "https://github.com/Vagrantin/xolite-ce/actions/runs/1",
+        );
+        status.set_component("xoa-proxy", WorkflowStatus::Skipped, "");
+        status
+    }
+
+    #[test]
+    fn unreached_component_does_not_inherit_agent_status() {
+        let status = phase2_status();
+        let (iso_status, iso_url) = component_or_agent(&status, "iso");
+        assert_eq!(
+            iso_status, "Pending",
+            "the ISO has not been dispatched yet; it must not report the \
+             agent-level status"
+        );
+        assert_eq!(iso_url, "#", "an unreached component has no logs to link");
+    }
+
+    #[test]
+    fn recorded_components_still_win_over_agent_status() {
+        let status = phase2_status();
+        assert_eq!(component_or_agent(&status, "xolite-ce").0, "In Progress");
+        assert_eq!(component_or_agent(&status, "xoa-proxy").0, "Skipped");
+    }
+
+    /// The abort path: a component build failed, iso-agent returned before
+    /// PHASE 3, and `status.url` was repointed at the failing component's run.
+    /// The ISO must not be reported as failed — it was never dispatched — and
+    /// its row must not link to another repository's logs.
+    #[test]
+    fn aborted_run_does_not_report_the_iso_as_failed() {
+        let mut status = AgentStatus::new("failed", WorkflowStatus::Failure);
+        status.detail = "Component build failed or timed out; ISO build aborted".to_string();
+        status.url = "https://github.com/Vagrantin/xolite-ce/actions/runs/7".to_string();
+        status.set_component(
+            "xolite-ce",
+            WorkflowStatus::Failure,
+            "https://github.com/Vagrantin/xolite-ce/actions/runs/7",
+        );
+        status.set_component("xoa-proxy", WorkflowStatus::Skipped, "");
+
+        let (iso_status, iso_url) = component_or_agent(&status, "iso");
+        assert_eq!(iso_status, "Pending");
+        assert_ne!(
+            iso_url, "https://github.com/Vagrantin/xolite-ce/actions/runs/7",
+            "the ISO row must not link to xolite-ce's run"
+        );
+        assert_eq!(iso_url, "#");
+    }
+
+    /// End-to-end over the rendering path the orchestrator actually uses, on
+    /// the exact state from the bug report: the ISO row must not claim to be
+    /// building while xolite-ce still is.
+    #[test]
+    fn dashboard_does_not_show_the_iso_building_alongside_xolite() {
+        let status = phase2_status();
+        let mut item = RunHistoryItem::default();
+        (item.xolite_status, item.xolite_url) = component_or_agent(&status, "xolite-ce");
+        (item.xoa_proxy_status, item.xoa_proxy_url) = component_or_agent(&status, "xoa-proxy");
+        (item.iso_status, item.iso_url) = component_or_agent(&status, "iso");
+
+        assert_eq!(item.xolite_status, "In Progress");
+        assert_eq!(item.iso_status, "Pending");
+
+        let html = render_dashboard_html(&[item]);
+        assert!(html.contains("XCP-ng ISO"), "ISO row missing");
+        assert!(
+            html.contains(r#"class="badge pending">Pending"#),
+            "the ISO row should render as Pending"
+        );
+        assert_eq!(
+            html.matches(r#"class="badge progress">In Progress"#).count(),
+            1,
+            "exactly one row (xolite-ce) should read In Progress"
+        );
+    }
+
+    #[test]
+    fn pending_badge_is_distinct_from_in_progress() {
+        assert_eq!(badge_class("Pending"), "pending");
+        assert_ne!(badge_class("Pending"), badge_class("In Progress"));
+    }
+
+    #[test]
+    fn legacy_status_without_components_still_falls_back() {
+        let mut status = AgentStatus::new("iso_build", WorkflowStatus::InProgress);
+        status.url = "https://github.com/Vagrantin/xcp-ng-ce-iso/actions/runs/9".to_string();
+        let (s, url) = component_or_agent(&status, "iso");
+        assert_eq!(s, "In Progress");
+        assert_eq!(url, "https://github.com/Vagrantin/xcp-ng-ce-iso/actions/runs/9");
     }
 
     #[test]

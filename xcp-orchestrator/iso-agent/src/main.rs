@@ -98,6 +98,19 @@ fn needs_iso_build(
         || state.last_built_sha != current_iso_sha
 }
 
+/// Whether the ISO must wait. The ISO build resolves the *published*
+/// xo-lite-ce and xoa-proxy releases and bakes their RPMs into its local repo,
+/// so dispatching while either is still building would silently pick up the
+/// previous release and produce an ISO that looks clean but ships stale
+/// components.
+///
+/// `Skipped` is deliberately not a blocker: a component that did not change
+/// this run already has a published release, which is exactly the case where a
+/// commit to xcp-ng-ce-iso alone should still rebuild the ISO.
+fn components_still_building(xolite: &WorkflowStatus, xoa_proxy: &WorkflowStatus) -> bool {
+    *xolite == WorkflowStatus::InProgress || *xoa_proxy == WorkflowStatus::InProgress
+}
+
 /// Dev override: force a rebuild even when the version/SHA rules say nothing
 /// changed. Forcing a component pushes a fresh -ceN tag (a real release).
 #[derive(Default, Clone, Copy)]
@@ -529,11 +542,36 @@ async fn main() -> Result<(), OrchestratorError> {
         status.phase = "failed".to_string();
         status.status = WorkflowStatus::Failure;
         status.detail = "Component build failed or timed out; ISO build aborted".to_string();
+        // Record the ISO explicitly. Without this the dashboard finds no "iso"
+        // entry and reports the agent's own Failure as the ISO's, linking the
+        // row to the failing component's run — an ISO build that never started,
+        // shown as failed.
+        status.set_component("iso", WorkflowStatus::Skipped, String::new());
         if xolite_status == WorkflowStatus::Failure && xolite_id.is_some() {
             status.url = xolite_url;
         } else if xoa_status == WorkflowStatus::Failure && xoa_id.is_some() {
             status.url = xoa_url;
         }
+        status.write_to_file(STATUS_FILE)?;
+        return Ok(());
+    }
+
+    // PHASE 2's monitor loop only exits once both components have left
+    // InProgress, and the check above returns on Failure/Timeout, so this is
+    // already guaranteed. Enforce it anyway: the cost of a refactor quietly
+    // reintroducing the race is an ISO released against stale component RPMs,
+    // which nothing downstream would flag.
+    if components_still_building(&xolite_status, &xoa_status) {
+        warn!(
+            "Refusing to build the ISO: components still in progress \
+             (xolite-ce: {}, xoa-proxy: {}).",
+            xolite_status, xoa_status
+        );
+        status.phase = "failed".to_string();
+        status.status = WorkflowStatus::Failure;
+        status.detail =
+            "Component build still in progress; ISO build aborted".to_string();
+        status.set_component("iso", WorkflowStatus::Skipped, String::new());
         status.write_to_file(STATUS_FILE)?;
         return Ok(());
     }
@@ -830,6 +868,57 @@ mod tests {
             "v1.2.3-ce1",
             "v0.9.0-ce2",
         ));
+    }
+
+    #[test]
+    fn in_progress_component_blocks_the_iso() {
+        assert!(components_still_building(
+            &WorkflowStatus::InProgress,
+            &WorkflowStatus::Skipped
+        ));
+        assert!(components_still_building(
+            &WorkflowStatus::Skipped,
+            &WorkflowStatus::InProgress
+        ));
+        assert!(components_still_building(
+            &WorkflowStatus::InProgress,
+            &WorkflowStatus::InProgress
+        ));
+    }
+
+    /// The case from the bug report: nothing changed in either component, but a
+    /// commit landed in xcp-ng-ce-iso. Both are Skipped, which must not block,
+    /// and the SHA clause must still ask for a build.
+    #[test]
+    fn skipped_components_do_not_block_an_own_repo_rebuild() {
+        assert!(!components_still_building(
+            &WorkflowStatus::Skipped,
+            &WorkflowStatus::Skipped
+        ));
+        let state = built_state();
+        assert!(
+            needs_iso_build(false, &state, "def456", "v1.2.3-ce1", "v0.9.0-ce2"),
+            "a commit to xcp-ng-ce-iso must rebuild even with both components skipped"
+        );
+    }
+
+    /// A finished component, successful or not, is not a reason to wait — the
+    /// failure case is handled separately and returns before the guard.
+    #[test]
+    fn terminal_component_states_do_not_block() {
+        for state in [
+            WorkflowStatus::Success,
+            WorkflowStatus::Skipped,
+            WorkflowStatus::Failure,
+            WorkflowStatus::Timeout,
+            WorkflowStatus::Aborted,
+        ] {
+            assert!(
+                !components_still_building(&state, &WorkflowStatus::Success),
+                "{} should not block the ISO",
+                state
+            );
+        }
     }
 
     #[test]
