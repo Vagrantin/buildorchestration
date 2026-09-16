@@ -168,9 +168,6 @@ impl Default for BuildConfig {
             xcpng_password: String::new(),
             sr_name: "Local storage".to_string(),
             vm_network_name: "Pool-wide network associated with eth0".to_string(),
-            // Baked into the XVA as the VM's name-label, so this is the name
-            // XO Lite shows once the appliance is deployed, and it names the
-            // release asset (<vm_name>.xva). See xcp-hl#97.
             vm_name: "XOA-hl".to_string(),
             vm_disk_size_mb: 10000,
             vm_memory_mb: 2048,
