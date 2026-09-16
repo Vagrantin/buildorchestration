@@ -17,7 +17,10 @@ SR_NAME="Local storage"
 VM_NETWORK_NAME="Pool-wide network associated with eth0"
 
 # Target XOA VM Specifications
-VM_NAME="xoa-almalinux"
+# VM_NAME is baked into the XVA as the VM's name-label, so it is the name XO
+# Lite shows for the appliance once deployed; it also names the release asset
+# (<VM_NAME>.xva). Keep it aligned with the product name. See xcp-hl#97.
+VM_NAME="XOA-hl"
 VM_DISK_SIZE_MB=10000
 VM_MEMORY_MB=2048
 
