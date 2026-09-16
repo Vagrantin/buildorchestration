@@ -1,0 +1,40 @@
+// Promoted from Dev (xcp-hl-jenkins-infra's iso-agent-poll job) per
+// jenkins-infra/docs/promotion.md. Read-only mirror of iso-agent: polls
+// xolite-ce/xoa-proxy/xcp-ng-ce-iso releases, reports what it sees,
+// dispatches and publishes nothing.
+//
+// Not yet run by a Test pipeline (xcp-hl#75) and not merged to main:
+// per xcp-hl#57 section 4.3, only Test re-proving this on prod-shaped
+// hardware clears it for that. Tracked in xcp-hl#72.
+pipeline {
+  agent { label 'test' }
+  options { timeout(time: 5, unit: 'MINUTES') }
+  stages {
+    stage('poll') {
+      steps {
+        sh '''
+          export GITHUB_TOKEN=pass://xcp-hl-test/github_token/password
+          with-secrets sh -c '
+            set -e
+            latest() {
+              curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+                "https://api.github.com/repos/Vagrantin/$1/releases/latest" -o "/tmp/$1.json"
+            }
+            latest xcp-ng-ce-iso; latest xolite-ce; latest xoa-proxy
+            iso_tag=$(jq -r .tag_name /tmp/xcp-ng-ce-iso.json); iso_at=$(jq -r .published_at /tmp/xcp-ng-ce-iso.json)
+            xolite_tag=$(jq -r .tag_name /tmp/xolite-ce.json); xolite_at=$(jq -r .published_at /tmp/xolite-ce.json)
+            proxy_tag=$(jq -r .tag_name /tmp/xoa-proxy.json); proxy_at=$(jq -r .published_at /tmp/xoa-proxy.json)
+            echo "xcp-ng-ce-iso latest: $iso_tag ($iso_at)"
+            echo "xolite-ce latest:     $xolite_tag ($xolite_at)"
+            echo "xoa-proxy latest:     $proxy_tag ($proxy_at)"
+            iso_epoch=$(date -d "$iso_at" +%s); xolite_epoch=$(date -d "$xolite_at" +%s); proxy_epoch=$(date -d "$proxy_at" +%s)
+            need=false
+            if [ "$xolite_epoch" -gt "$iso_epoch" ]; then need=true; fi
+            if [ "$proxy_epoch" -gt "$iso_epoch" ]; then need=true; fi
+            echo "build needed (a dependency released after the current iso tag): $need"
+          '
+        '''
+      }
+    }
+  }
+}
