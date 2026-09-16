@@ -168,7 +168,7 @@ impl Default for BuildConfig {
             xcpng_password: String::new(),
             sr_name: "Local storage".to_string(),
             vm_network_name: "Pool-wide network associated with eth0".to_string(),
-            vm_name: "xoa-almalinux".to_string(),
+            vm_name: "XOA-hl".to_string(),
             vm_disk_size_mb: 10000,
             vm_memory_mb: 2048,
             almalinux_root_password: String::new(),
@@ -1798,7 +1798,7 @@ VM_MEMORY_MB="4096"
         assert_eq!(config.vm_disk_size_mb, 20000);
         assert_eq!(config.vm_memory_mb, 4096);
         // Untouched keys keep their defaults
-        assert_eq!(config.vm_name, "xoa-almalinux");
+        assert_eq!(config.vm_name, "XOA-hl");
     }
 
     #[test]

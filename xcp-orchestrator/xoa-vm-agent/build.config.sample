@@ -17,7 +17,7 @@ SR_NAME="Local storage"
 VM_NETWORK_NAME="Pool-wide network associated with eth0"
 
 # Target XOA VM Specifications
-VM_NAME="xoa-almalinux"
+VM_NAME="XOA-hl"
 VM_DISK_SIZE_MB=10000
 VM_MEMORY_MB=2048
 
