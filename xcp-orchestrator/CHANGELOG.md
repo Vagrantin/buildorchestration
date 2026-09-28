@@ -4,6 +4,14 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 
 ## Unreleased
 
+### Fixed
+
+- **xoa-vm-agent**: a `--force` rebuild on a day that already had an image
+  reused that day's release and then failed its upload, because GitHub
+  refuses a second asset named `XOA-hl.xva`. The new XVA now goes up as
+  `XOA-hl.xva.new`, the previous asset is deleted, and the new one is renamed,
+  so the release keeps one `XOA-hl.xva` and its download URL throughout.
+
 ### Removed
 
 - **orchestrator, orchestrator-api, orchestratorhost** (xcp-hl#77): both

@@ -737,7 +737,7 @@ async fn main() -> Result<()> {
     let image_tag = generate_image_tag(&repo_head_sha);
     let image_name = format!("XOA HomeLab Edition - {}", image_tag);
 
-    let (upload_url, release_url) = match create_github_release(
+    let (upload_url, release_url, assets_url) = match create_github_release(
         &client,
         &image_tag,
         &image_name,
@@ -759,7 +759,7 @@ async fn main() -> Result<()> {
     status.set_component("xoa-image", WorkflowStatus::InProgress, release_url.clone());
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = upload_asset(&client, &upload_url, &xva_path).await {
+    if let Err(e) = upload_asset(&client, &upload_url, &assets_url, &xva_path).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Asset upload failed: {}", e);
         status.set_component("xoa-image", WorkflowStatus::Failure, release_url.clone());
@@ -1640,11 +1640,12 @@ async fn create_github_release(
     name: &str,
     target_sha: &str,
     build_xoa_hl_sha: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     #[derive(serde::Deserialize)]
     struct ReleaseResp {
         upload_url: String,
         html_url: String,
+        assets_url: String,
     }
 
     // Check whether this exact tag already has a release (retry-safe)
@@ -1659,6 +1660,7 @@ async fn create_github_release(
                 return Ok((
                     r.upload_url.trim_end_matches("{?name,label}").to_string(),
                     r.html_url,
+                    r.assets_url,
                 ));
             }
         }
@@ -1702,13 +1704,17 @@ async fn create_github_release(
     Ok((
         release.upload_url.trim_end_matches("{?name,label}").to_string(),
         release.html_url,
+        release.assets_url,
     ))
 }
 
 /// Stream-upload `xva_path` to an existing GitHub Release upload URL.
+/// Uploads the XVA. If the release already holds one (a forced rebuild), the new file goes
+/// up under a temporary name, then replaces the old asset, so the download URL never breaks.
 async fn upload_asset(
     client: &reqwest::Client,
     upload_url: &str,
+    assets_url: &str,
     xva_path: &Path,
 ) -> Result<()> {
     let file_size = async_fs::metadata(xva_path)
@@ -1734,8 +1740,34 @@ async fn upload_asset(
 
     let stream = tokio_util::io::ReaderStream::new(file);
 
+    #[derive(serde::Deserialize)]
+    struct Asset {
+        id: u64,
+        name: String,
+        url: String,
+    }
+    let existing: Vec<Asset> = client
+        .get(assets_url)
+        .query(&[("per_page", "100")])
+        .send()
+        .await
+        .context("Failed to list release assets")?
+        .error_for_status()
+        .context("Failed to list release assets")?
+        .json()
+        .await
+        .context("Failed to parse release assets")?;
+    let temp_name = format!("{}.new", file_name);
+    let old = existing.iter().find(|a| a.name == file_name);
+    // A leftover from an interrupted replacement would block the temporary name.
+    if let Some(stale) = existing.iter().find(|a| a.name == temp_name) {
+        client.delete(&stale.url).send().await?.error_for_status()
+            .with_context(|| format!("Failed to delete stale asset {} ({})", stale.name, stale.id))?;
+    }
+    let upload_name = if old.is_some() { temp_name.as_str() } else { file_name.as_str() };
+
     let res = client
-        .post(&format!("{}?name={}", upload_url, file_name))
+        .post(&format!("{}?name={}", upload_url, upload_name))
         .header("Content-Type", "application/octet-stream")
         .header("Content-Length", file_size)
         .body(reqwest::Body::wrap_stream(stream))
@@ -1747,6 +1779,20 @@ async fn upload_asset(
         let code = res.status();
         let body = res.text().await.unwrap_or_default();
         bail!("GitHub asset upload failed ({}): {}", code, body);
+    }
+
+    if let Some(old) = old {
+        let new: Asset = res.json().await.context("Failed to parse the uploaded asset")?;
+        client.delete(&old.url).send().await?.error_for_status()
+            .with_context(|| format!("Failed to delete the previous {} ({})", old.name, old.id))?;
+        client
+            .patch(&new.url)
+            .json(&serde_json::json!({ "name": file_name }))
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("Failed to rename {} to {}", new.name, file_name))?;
+        info!("Replaced the previous {} (asset {}) with asset {}", file_name, old.id, new.id);
     }
 
     info!("XVA uploaded successfully");
