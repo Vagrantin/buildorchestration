@@ -659,49 +659,6 @@ pub async fn query_run_conclusion(
     }
 }
 
-/// Extract log context from a failed job
-pub async fn extract_failed_log_context(
-    client: &Client,
-    repo: &str,
-    run_id: u64,
-) -> Result<String, OrchestratorError> {
-    let jobs_url = format!(
-        "https://api.github.com/repos/{}/{}/actions/runs/{}/jobs",
-        OWNER, repo, run_id
-    );
-    let res: GHJobsResponse = parse_github_response(
-        client
-            .get(&jobs_url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(run_id.to_string(), e.to_string()))?,
-        "extract_failed_log_context jobs list",
-    )
-    .await?;
-
-    if let Some(failed_job) = res.jobs.iter().find(|j| j.conclusion.as_deref() == Some("failure")) {
-        let log_url = format!(
-            "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
-            OWNER, repo, failed_job.id
-        );
-        let log_text = client
-            .get(&log_url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(run_id.to_string(), e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(run_id.to_string(), e.to_string()))?;
-
-        let lines: Vec<&str> = log_text.lines().collect();
-        let tail_count = lines.len().min(250);
-        let truncated = lines[lines.len() - tail_count..].join("\n");
-        return Ok(truncated);
-    }
-
-    Ok("Could not resolve failed job log metrics.".to_string())
-}
-
 /// Fetch the latest upstream XO Lite tag
 pub async fn fetch_latest_upstream_xolite_tag(client: &Client) -> Result<String, OrchestratorError> {
     let url = "https://api.github.com/repos/vatesfr/xen-orchestra/releases?per_page=10";
