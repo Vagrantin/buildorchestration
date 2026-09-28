@@ -1472,7 +1472,13 @@ async fn xapi_call(
     Ok(reply.get("result").cloned().unwrap_or(serde_json::Value::Null))
 }
 
-/// Destroys the Packer VM `uuid` and every disk it had attached, including the uploaded ISO.
+/// Name Packer gives the uploaded ISO disk: the last path segment of the ISO URL.
+fn iso_vdi_name(iso_url: &str) -> &str {
+    let path = iso_url.split(['?', '#']).next().unwrap_or(iso_url);
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Destroys the Packer VM `uuid`, its disks, and detached ISO uploads left by successful builds.
 async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
     // XCP-ng hosts use a self-signed certificate, as Packer's own XAPI client accepts.
     let client = reqwest::Client::builder()
@@ -1506,6 +1512,22 @@ async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
             xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
         }
         info!("Removed build VM {} and {} disk(s) from {}", uuid, vdis.len(), config.xcpng_ip);
+
+        // Packer detaches its uploaded ISO before export, so it is not among the VM's disks.
+        let iso = iso_vdi_name(&config.almalinux_iso_url);
+        let named = xapi_call(&client, &url, "VDI.get_by_name_label", serde_json::json!([s, iso])).await?;
+        let mut removed = 0;
+        for vdi in named.as_array().into_iter().flatten() {
+            let other = xapi_call(&client, &url, "VDI.get_other_config", serde_json::json!([s, vdi])).await?;
+            let vbds = xapi_call(&client, &url, "VDI.get_VBDs", serde_json::json!([s, vdi])).await?;
+            // Plugin uploads carry other_config temp=temp; attached ones belong to kept failed builds.
+            let attached = vbds.as_array().is_some_and(|v| !v.is_empty());
+            if other.get("temp").and_then(|t| t.as_str()) == Some("temp") && !attached {
+                xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
+                removed += 1;
+            }
+        }
+        info!("Removed {} detached ISO upload(s) named {:?} from {}", removed, iso, config.xcpng_ip);
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -1981,6 +2003,12 @@ VM_MEMORY_MB="4096"
         assert!(line.starts_with("rootpw --iscrypted --allow-ssh $6$"));
         assert!(!ks.contains(&config.almalinux_root_password));
         assert!(sha_crypt::sha512_check(&config.almalinux_root_password, hash).is_ok());
+    }
+
+    #[test]
+    fn iso_vdi_name_is_the_url_file_name() {
+        assert_eq!(iso_vdi_name(ALMALINUX_ISO_URL), "AlmaLinux-9-latest-x86_64-minimal.iso");
+        assert_eq!(iso_vdi_name("https://h/x/a.iso?checksum=sha256:1"), "a.iso");
     }
 
     #[test]

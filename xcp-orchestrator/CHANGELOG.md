@@ -2,6 +2,19 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- **xoa-vm-agent**: Packer detaches its uploaded AlmaLinux ISO disk before
+  the export, so the success cleanup never saw it, and `keep_vm: always`
+  stops the plugin deleting it: each successful build left about 2 GB on the
+  build host. The plugin also reuses a disk of that name without
+  re-uploading, so a newer "latest" ISO would have been ignored. After a
+  successful build the agent now deletes detached ISO uploads of that name
+  (plugin marker `other_config temp=temp`, no VBD). A kept failed build's ISO
+  is still attached, so it stays.
+
 ## 2026-09-28 (xcp-orchestrator-v0.3.0)
 
 ### Fixed
