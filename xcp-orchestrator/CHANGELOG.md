@@ -4,6 +4,15 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 
 ## 2026-09-28 (xcp-orchestrator-v0.3.0)
 
+### Fixed
+
+- **xoa-vm-agent**: the kickstart set the root password with an unquoted
+  `rootpw --plaintext`, and the Packer template embedded passwords without
+  JSON escaping. Kickstart splits lines like a shell, so a password holding
+  `#`, quotes, backslashes or spaces was silently changed and Packer never got
+  in over SSH. The kickstart now carries a SHA-512 crypt hash
+  (`rootpw --iscrypted --allow-ssh`), and template values are JSON-encoded.
+
 ### Changed
 
 - **xoa-vm-agent**: can run under Jenkins (Vagrantin/xcp-hl#76).

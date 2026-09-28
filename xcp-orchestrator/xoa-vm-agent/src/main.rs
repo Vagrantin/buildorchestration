@@ -1123,7 +1123,7 @@ async fn generate_build_files(build_dir: &Path, config: &BuildConfig) -> Result<
     async_fs::create_dir_all(build_dir.join("systemd")).await?;
 
     info!("Generating inst.ks...");
-    async_fs::write(build_dir.join("inst.ks"), generate_kickstart(config)).await?;
+    async_fs::write(build_dir.join("inst.ks"), generate_kickstart(config)?).await?;
 
     info!("Generating almalinux-build.json...");
     async_fs::write(
@@ -1158,13 +1158,20 @@ async fn generate_build_files(build_dir: &Path, config: &BuildConfig) -> Result<
     Ok(())
 }
 
-fn generate_kickstart(config: &BuildConfig) -> String {
-    format!(
+/// Kickstart splits lines like a shell, so a plaintext password with #, quotes or spaces breaks.
+fn kickstart_root_hash(password: &str) -> Result<String> {
+    sha_crypt::sha512_simple(password, &sha_crypt::Sha512Params::default())
+        .map_err(|e| anyhow::anyhow!("Failed to hash the AlmaLinux root password: {:?}", e))
+}
+
+fn generate_kickstart(config: &BuildConfig) -> Result<String> {
+    let rootpw = kickstart_root_hash(&config.almalinux_root_password)?;
+    Ok(format!(
         r#"# AlmaLinux {ver} Minimal Kickstart, XOA HomeLab Edition
 lang en_US.UTF-8
 keyboard us
 network --onboot yes --device eth0 --bootproto dhcp
-rootpw --plaintext {rootpw}
+rootpw --iscrypted --allow-ssh {rootpw}
 timezone Asia/Tokyo --utc
 selinux --disabled
 firewall --disabled
@@ -1213,8 +1220,8 @@ usermod -aG wheel xo
 %end
 "#,
         ver = ALMALINUX_VERSION,
-        rootpw = config.almalinux_root_password,
-    )
+        rootpw = rootpw,
+    ))
 }
 
 /// keep_vm "always": the plugin ignores -on-error, so the agent destroys the VM itself on success.
@@ -1225,7 +1232,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "type": "xenserver-iso",
     "remote_host": "{xcpng_ip}",
     "remote_username": "{xcpng_user}",
-    "remote_password": "{xcpng_pass}",
+    "remote_password": {xcpng_pass},
     "iso_url": "{iso_url}",
     "iso_checksum": "{iso_chk}",
     "sr_name": "{sr_name}",
@@ -1234,14 +1241,14 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "disk_size": {disk_mb},
     "vm_memory": {mem_mb},
     "http_directory": ".",
-    "network_names": ["{net}"],
+    "network_names": [{net}],
     "boot_command": [
       "<wait5><esc><wait>",
       "linux inst.ks=http://{{{{ .HTTPIP }}}}:{{{{ .HTTPPort }}}}/inst.ks inst.text<enter>"
     ],
     "boot_wait": "5s",
     "ssh_username": "root",
-    "ssh_password": "{rootpw}",
+    "ssh_password": {rootpw},
     "ssh_timeout": "30m",
     "format": "xva_compressed",
     "keep_vm": "always",
@@ -1289,7 +1296,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
 }}"#,
         xcpng_ip = config.xcpng_ip,
         xcpng_user = config.xcpng_user,
-        xcpng_pass = config.xcpng_password,
+        // Values that may hold quotes or backslashes go in JSON-encoded, quotes included.
+        xcpng_pass = serde_json::Value::from(config.xcpng_password.as_str()),
         iso_url = config.almalinux_iso_url,
         iso_chk = config.almalinux_iso_checksum,
         sr_name = config.sr_name,
@@ -1297,8 +1305,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         disk_mb = config.vm_disk_size_mb,
         mem_mb = config.vm_memory_mb,
         ver = ALMALINUX_VERSION,
-        net = config.vm_network_name,
-        rootpw = config.almalinux_root_password,
+        net = serde_json::Value::from(config.vm_network_name.as_str()),
+        rootpw = serde_json::Value::from(config.almalinux_root_password.as_str()),
         xe_xenstore_url = config.xe_guest_utilities_xenstore_url,
         xe_url = config.xe_guest_utilities_url,
         rpm_url = config.xoa_hl_rpm_url,
@@ -1955,6 +1963,24 @@ VM_MEMORY_MB="4096"
         let json: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
         assert_eq!(json["builders"][0]["keep_vm"], "always");
+    }
+
+    #[test]
+    fn awkward_passwords_survive_template_and_kickstart() {
+        let mut config = BuildConfig::default();
+        config.almalinux_root_password = r#"a#b'c"d\e f"#.to_string();
+        config.xcpng_password = r#"x"y\z"#.to_string();
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&config)).unwrap();
+        assert_eq!(json["builders"][0]["ssh_password"], config.almalinux_root_password.as_str());
+        assert_eq!(json["builders"][0]["remote_password"], config.xcpng_password.as_str());
+
+        let ks = generate_kickstart(&config).unwrap();
+        let line = ks.lines().find(|l| l.starts_with("rootpw ")).unwrap();
+        let hash = line.rsplit(' ').next().unwrap();
+        assert!(line.starts_with("rootpw --iscrypted --allow-ssh $6$"));
+        assert!(!ks.contains(&config.almalinux_root_password));
+        assert!(sha_crypt::sha512_check(&config.almalinux_root_password, hash).is_ok());
     }
 
     #[test]
