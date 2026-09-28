@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use shared::{
     AgentStatus, ComponentVersionState, WorkflowStatus,
-    create_github_client, load_github_token,
+    create_github_client, load_credential, load_github_token,
     create_and_push_tag, fetch_release_by_tag, fetch_repo_head_sha, fetch_releases,
     fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, ReleaseInfo,
     locate_tag_triggered_run, parse_ce_tag, query_run_conclusion,
@@ -41,6 +41,8 @@ const STATUS_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa-vm-agent.status.json
 /// Infrastructure config (non-secret), installed by deploy.sh from
 /// xoa-vm-agent/build.config.sample. Missing file = baked-in defaults.
 const BUILD_CONFIG_FILE: &str = "/etc/xcp-orchestrator/build.config";
+/// Overrides BUILD_CONFIG_FILE; Jenkins renders its own config per run.
+const BUILD_CONFIG_ENV: &str = "XOA_BUILD_CONFIG";
 const VERSION_STATE_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa_agent_version_state.json";
 const REPO_DIR: &str = "/var/lib/xcp-hl-orchestrator/repos/build-xoa-hl";
 const BUILD_DIR: &str = "/var/lib/xcp-hl-orchestrator/build/xoa-hl";
@@ -66,8 +68,8 @@ const ALMALINUX_VERSION: &str = "9";
 const ALMALINUX_ISO_URL: &str =
     "https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso";
 
-/// 100 GB minimum free space for build + output artefacts.
-const REQUIRED_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+/// Default minimum free space (GB) for build + output artefacts; MIN_FREE_DISK_GB overrides.
+const DEFAULT_MIN_FREE_DISK_GB: u64 = 100;
 
 /// Ports Packer's embedded HTTP server may bind to (kickstart delivery).
 /// All must be free at build time.
@@ -158,6 +160,7 @@ struct BuildConfig {
     xoa_hl_rpm_url: String,
     xe_guest_utilities_url: String,
     xe_guest_utilities_xenstore_url: String,
+    min_free_disk_gb: u64,
 }
 
 impl Default for BuildConfig {
@@ -181,6 +184,7 @@ impl Default for BuildConfig {
             xe_guest_utilities_xenstore_url:
                 "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-xenstore-10.0.0-1.x86_64.rpm"
                     .to_string(),
+            min_free_disk_gb: DEFAULT_MIN_FREE_DISK_GB,
         }
     }
 }
@@ -191,15 +195,23 @@ impl BuildConfig {
     /// that exists but fails to parse is fatal, a half-applied config
     /// pointing at the wrong host is worse than stopping.
     fn load() -> Result<Self> {
+        let path = std::env::var(BUILD_CONFIG_ENV)
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| BUILD_CONFIG_FILE.to_string());
+        Self::load_from(&path)
+    }
+
+    fn load_from(path: &str) -> Result<Self> {
         let mut config = Self::default();
-        match std::fs::read_to_string(BUILD_CONFIG_FILE) {
+        match std::fs::read_to_string(path) {
             Ok(content) => {
                 apply_build_config(&mut config, &content)
-                    .with_context(|| format!("Failed to parse {}", BUILD_CONFIG_FILE))?;
+                    .with_context(|| format!("Failed to parse {}", path))?;
                 info!(
                     "Build config loaded from {}: xcpng_ip={}, xcpng_user={}, sr_name={:?}, \
-                     network={:?}, vm_name={}, disk={}MB, memory={}MB",
-                    BUILD_CONFIG_FILE,
+                     network={:?}, vm_name={}, disk={}MB, memory={}MB, min_free={}GB",
+                    path,
                     config.xcpng_ip,
                     config.xcpng_user,
                     config.sr_name,
@@ -207,17 +219,18 @@ impl BuildConfig {
                     config.vm_name,
                     config.vm_disk_size_mb,
                     config.vm_memory_mb,
+                    config.min_free_disk_gb,
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
                     "No {} found, using baked-in default build config. \
                      Run deploy.sh to install one from build.config.sample.",
-                    BUILD_CONFIG_FILE
+                    path
                 );
             }
             Err(e) => {
-                return Err(e).with_context(|| format!("Failed to read {}", BUILD_CONFIG_FILE));
+                return Err(e).with_context(|| format!("Failed to read {}", path));
             }
         }
         Ok(config)
@@ -249,6 +262,10 @@ fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
             v.parse::<u32>()
                 .with_context(|| format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v))
         };
+        let parse_gb = |v: &str| {
+            v.parse::<u64>()
+                .with_context(|| format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v))
+        };
 
         match key {
             "XCPNG_IP" => config.xcpng_ip = value.to_string(),
@@ -258,6 +275,7 @@ fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
             "VM_NAME" => config.vm_name = value.to_string(),
             "VM_DISK_SIZE_MB" => config.vm_disk_size_mb = parse_mb(value)?,
             "VM_MEMORY_MB" => config.vm_memory_mb = parse_mb(value)?,
+            "MIN_FREE_DISK_GB" => config.min_free_disk_gb = parse_gb(value)?,
             "ALMALINUX_ISO_URL" => config.almalinux_iso_url = value.to_string(),
             "XE_GUEST_UTILITIES_URL" => config.xe_guest_utilities_url = value.to_string(),
             "XE_GUEST_UTILITIES_XENSTORE_URL" => {
@@ -410,6 +428,17 @@ async fn main() -> Result<()> {
 
     let mut status = AgentStatus::new("initialization", WorkflowStatus::InProgress);
     status.write_to_file(STATUS_FILE)?;
+
+    // Load the build config first: a bad config must fail before any tag is pushed.
+    let mut config = match BuildConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("Build config invalid: {}", e);
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
+        }
+    };
 
     let mut version_state = XoaHlVersionState::load()?;
     let token = load_github_token().context("Failed to load GitHub token")?;
@@ -608,7 +637,7 @@ async fn main() -> Result<()> {
     status.phase = "phase_3_validate_prerequisites".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = validate_prerequisites().await {
+    if let Err(e) = validate_prerequisites(config.min_free_disk_gb).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Prerequisite check failed: {}", e);
         status.write_to_file(STATUS_FILE)?;
@@ -632,15 +661,6 @@ async fn main() -> Result<()> {
     status.phase = "phase_5_resolve_values".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    let mut config = match BuildConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            status.status = WorkflowStatus::Failure;
-            status.detail = format!("Build config invalid: {}", e);
-            status.write_to_file(STATUS_FILE)?;
-            return Err(e);
-        }
-    };
     if let Err(e) = resolve_dynamic_values(&client, &mut config, &rpm_tag).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Value resolution failed: {}", e);
@@ -862,7 +882,7 @@ async fn wait_for_workflow(
 
 // ── PHASE 3: Validate Prerequisites ──────────────────────────────────────────
 
-async fn validate_prerequisites() -> Result<()> {
+async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
     // FIX #16: was using blocking std::process::Command throughout.
     //          All checks now use AsyncCommand so the executor is not blocked.
 
@@ -914,10 +934,10 @@ async fn validate_prerequisites() -> Result<()> {
         if parts.len() >= 4 {
             let avail_kb: u64 = parts[3].parse().unwrap_or(0);
             let avail_bytes = avail_kb * 1024;
-            if avail_bytes < REQUIRED_DISK_SPACE_BYTES {
+            if avail_bytes < min_free_disk_gb * 1024 * 1024 * 1024 {
                 bail!(
                     "Insufficient disk space, required {}GB, have {}GB",
-                    REQUIRED_DISK_SPACE_BYTES / (1024 * 1024 * 1024),
+                    min_free_disk_gb,
                     avail_bytes / (1024 * 1024 * 1024),
                 );
             }
@@ -1000,25 +1020,11 @@ async fn resolve_dynamic_values(
     config: &mut BuildConfig,
     rpm_tag: &str,
 ) -> Result<()> {
-    // Credentials come exclusively from systemd LoadCredential, never from env vars set manually
-    let creds_dir = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
-        anyhow::anyhow!(
-            "CREDENTIALS_DIRECTORY not set, configure systemd LoadCredential= \
-             for XCPNG_PASSWORD and ALMALINUX_ROOT_PASSWORD"
-        )
-    })?;
-    let creds = std::path::PathBuf::from(creds_dir);
-
-    config.xcpng_password = std::fs::read_to_string(creds.join("XCPNG_PASSWORD"))
-        .context("XCPNG_PASSWORD credential missing")?
-        .trim()
-        .to_string();
-
-    config.almalinux_root_password =
-        std::fs::read_to_string(creds.join("ALMALINUX_ROOT_PASSWORD"))
-            .context("ALMALINUX_ROOT_PASSWORD credential missing")?
-            .trim()
-            .to_string();
+    // systemd LoadCredential= files, or resolved environment variables under Jenkins.
+    config.xcpng_password =
+        load_credential("XCPNG_PASSWORD").context("XCPNG_PASSWORD credential missing")?;
+    config.almalinux_root_password = load_credential("ALMALINUX_ROOT_PASSWORD")
+        .context("ALMALINUX_ROOT_PASSWORD credential missing")?;
 
     info!("Resolving AlmaLinux ISO checksum...");
     config.almalinux_iso_checksum = resolve_almalinux_checksum(client)
@@ -1198,6 +1204,7 @@ usermod -aG wheel xo
     )
 }
 
+/// keep_vm "never" destroys the VM on success; -on-error=abort skips that cleanup on failure.
 fn generate_packer_template(config: &BuildConfig) -> String {
     format!(
         r#"{{
@@ -1224,7 +1231,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "ssh_password": "{rootpw}",
     "ssh_timeout": "30m",
     "format": "xva_compressed",
-    "keep_vm": "always",
+    "keep_vm": "never",
     "skip_set_template": "true",
     "output_directory": "{output_dir}"
   }}],
@@ -1318,7 +1325,7 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
     let mut child = AsyncCommand::new("packer")
         .arg("build")
         // FIX #10: was "-on-error=ask" which blocks on stdin forever in automation.
-        //          "-on-error=abort" tears down and exits immediately on failure.
+        //          "-on-error=abort" exits on failure without cleanup, so the VM stays for debugging.
         .arg("-on-error=abort")
         .arg(&packer_file)
         .current_dir(build_dir)
@@ -1828,9 +1835,32 @@ VM_MEMORY_MB="4096"
         assert_eq!(config.vm_name, d.vm_name);
         assert_eq!(config.vm_disk_size_mb, d.vm_disk_size_mb);
         assert_eq!(config.vm_memory_mb, d.vm_memory_mb);
+        assert_eq!(config.min_free_disk_gb, d.min_free_disk_gb);
         assert_eq!(config.almalinux_iso_url, d.almalinux_iso_url);
         assert_eq!(config.xe_guest_utilities_url, d.xe_guest_utilities_url);
         assert_eq!(config.xe_guest_utilities_xenstore_url, d.xe_guest_utilities_xenstore_url);
+    }
+
+    #[test]
+    fn build_config_min_free_disk_overrides_default() {
+        let mut config = BuildConfig::default();
+        assert_eq!(config.min_free_disk_gb, DEFAULT_MIN_FREE_DISK_GB);
+        apply_build_config(&mut config, "MIN_FREE_DISK_GB=20\n").unwrap();
+        assert_eq!(config.min_free_disk_gb, 20);
+        assert!(apply_build_config(&mut config, "MIN_FREE_DISK_GB=-1\n").is_err());
+    }
+
+    #[test]
+    fn build_config_load_from_missing_path_uses_defaults() {
+        let config = BuildConfig::load_from("/nonexistent/xoa-build.config").unwrap();
+        assert_eq!(config.xcpng_ip, BuildConfig::default().xcpng_ip);
+    }
+
+    #[test]
+    fn packer_template_destroys_vm_only_on_success() {
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
+        assert_eq!(json["builders"][0]["keep_vm"], "never");
     }
 
     #[test]

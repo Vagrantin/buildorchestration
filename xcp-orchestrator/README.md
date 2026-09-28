@@ -46,10 +46,13 @@ sudo ./force-run.sh xoa-vm-agent    # run only one agent
 
 ## Running under Jenkins
 
-`iso-agent` is moving to Jenkins (xcp-hl#77): the `iso-agent` job in
-`jenkins-infra` runs the released binary on the Jenkins host, with
-`GITHUB_TOKEN` resolved from the vault into the environment and
-`/var/lib/xcp-hl-orchestrator` bind-mounted so its version state persists.
+`iso-agent` (xcp-hl#77) and `xoa-vm-agent` (xcp-hl#76) run as the
+`iso-agent` and `xoa-vm-agent` jobs in `jenkins-infra`, which run the
+released binaries on the Jenkins host, with secrets resolved from the vault
+into the environment and `/var/lib/xcp-hl-orchestrator` bind-mounted so the
+version state persists. `xoa-vm-agent` also reads `XCPNG_PASSWORD` and
+`ALMALINUX_ROOT_PASSWORD` from the environment, and its build config from
+the path in `XOA_BUILD_CONFIG`.
 Binaries come from `xcp-orchestrator-v*` releases built by
 `.github/workflows/xcp-orchestrator.yml`, not from `deploy.sh`.
 

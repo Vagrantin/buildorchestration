@@ -2,6 +2,21 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-09-28 (xcp-orchestrator-v0.3.0)
+
+### Changed
+
+- **xoa-vm-agent**: can run under Jenkins (Vagrantin/xcp-hl#76).
+  `XCPNG_PASSWORD` and `ALMALINUX_ROOT_PASSWORD` go through `load_credential`
+  like the GitHub token, so they come from systemd credentials or from a
+  resolved environment variable. `XOA_BUILD_CONFIG` points at another
+  build.config, and the new `MIN_FREE_DISK_GB` key replaces the hardcoded
+  100 GB free-space check (default unchanged). The build config is now read
+  before any tag is pushed.
+- **xoa-vm-agent**: Packer `keep_vm` is `never` instead of `always`. A
+  successful build now destroys its VM and disks on the XCP-ng host; a failed
+  one still leaves them, because `-on-error=abort` skips all cleanup.
+
 ## 2026-09-28
 
 ### Fixed
