@@ -6,6 +6,12 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 
 ### Fixed
 
+- **iso-agent**: after a tag collision, `create_and_push_tag` moves on to
+  the next free tag, but the agent still recorded the counter it *asked*
+  for. The ISO state ended up at `ce_counter: 21` with `last_tag:
+  v8.3-ce38`, so every later build first walked through about 17 existing
+  tags (and would stop at the 99-attempt cap). The counter is now read back
+  from the tag actually pushed, for the ISO, xolite-ce and xoa-proxy alike.
 - **shared / iso-agent / xoa-vm-agent**: `locate_tag_triggered_run` listed the
   latest push runs of *every* workflow in the repo and took the first one whose
   branch matched the tag. Since `secret-scan` also runs on every tag push and
