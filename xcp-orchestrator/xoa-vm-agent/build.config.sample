@@ -6,9 +6,10 @@
 # Edit the deployed copy to match your infrastructure; the agent
 # falls back to these baked-in defaults when the file is absent.
 #
-# NO SECRETS HERE. Passwords are loaded exclusively via systemd
-# LoadCredential= from /etc/xcp-hl-credentials/ (github_token,
-# xcpng_password, almalinux_root_password).
+# NO SECRETS HERE. Passwords come from systemd LoadCredential= under
+# /etc/xcp-hl-credentials/ (github_token, xcpng_password,
+# almalinux_root_password), or from resolved environment variables
+# of the same upper-case names under Jenkins.
 
 # XCP-ng Hypervisor Connection
 XCPNG_IP="192.168.1.10"
@@ -20,6 +21,9 @@ VM_NETWORK_NAME="Pool-wide network associated with eth0"
 VM_NAME="XOA-hl"
 VM_DISK_SIZE_MB=10000
 VM_MEMORY_MB=2048
+
+# Free space required under /var/lib/xcp-hl-orchestrator before a build
+MIN_FREE_DISK_GB=100
 
 # Installation Media (AlmaLinux 9 minimal)
 ALMALINUX_ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"

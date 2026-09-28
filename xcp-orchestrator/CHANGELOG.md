@@ -2,6 +2,33 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-09-28 (xcp-orchestrator-v0.3.0)
+
+### Fixed
+
+- **xoa-vm-agent**: the kickstart set the root password with an unquoted
+  `rootpw --plaintext`, and the Packer template embedded passwords without
+  JSON escaping. Kickstart splits lines like a shell, so a password holding
+  `#`, quotes, backslashes or spaces was silently changed and Packer never got
+  in over SSH. The kickstart now carries a SHA-512 crypt hash
+  (`rootpw --iscrypted --allow-ssh`), and template values are JSON-encoded.
+
+### Changed
+
+- **xoa-vm-agent**: can run under Jenkins (Vagrantin/xcp-hl#76).
+  `XCPNG_PASSWORD` and `ALMALINUX_ROOT_PASSWORD` go through `load_credential`
+  like the GitHub token, so they come from systemd credentials or from a
+  resolved environment variable. `XOA_BUILD_CONFIG` points at another
+  build.config, and the new `MIN_FREE_DISK_GB` key replaces the hardcoded
+  100 GB free-space check (default unchanged). The build config is now read
+  before any tag is pushed.
+- **xoa-vm-agent**: a successful build now removes its VM and disks (the
+  uploaded AlmaLinux ISO included) from the XCP-ng host through XAPI; a failed
+  build still leaves them for inspection. Packer keeps `keep_vm: always`,
+  because the xenserver plugin ignores `-on-error` and would otherwise clean
+  up failures too. The VM is identified by the uuid Packer reports, so VMs
+  left by earlier failed runs are never touched.
+
 ## 2026-09-28
 
 ### Fixed

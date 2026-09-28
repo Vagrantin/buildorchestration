@@ -20,4 +20,5 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 base64      = { workspace = true }
+sha-crypt   = "0.5"   # kickstart root password as a SHA-512 crypt hash, never plaintext
 libc        = "0.2"   # FIX #10: SIGTERM before SIGKILL on packer timeout (Unix only)
