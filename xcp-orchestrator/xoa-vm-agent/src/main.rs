@@ -157,6 +157,8 @@ struct BuildConfig {
     almalinux_root_password: String,
     almalinux_iso_url: String,
     almalinux_iso_checksum: String,
+    /// The checksum-named ISO disk is already on the build host: Packer attaches it, no upload.
+    reuse_iso_vdi: bool,
     xoa_hl_rpm_url: String,
     xe_guest_utilities_url: String,
     xe_guest_utilities_xenstore_url: String,
@@ -177,6 +179,7 @@ impl Default for BuildConfig {
             almalinux_root_password: String::new(),
             almalinux_iso_url: ALMALINUX_ISO_URL.to_string(),
             almalinux_iso_checksum: String::new(),
+            reuse_iso_vdi: false,
             xoa_hl_rpm_url: String::new(),
             xe_guest_utilities_url:
                 "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-10.0.0-1.x86_64.rpm"
@@ -666,6 +669,11 @@ async fn main() -> Result<()> {
         status.detail = format!("Value resolution failed: {}", e);
         status.write_to_file(STATUS_FILE)?;
         return Err(e);
+    }
+    // Not fatal: without it, Packer simply uploads the ISO again.
+    if let Err(e) = prepare_iso_vdi(&mut config).await {
+        config.reuse_iso_vdi = false;
+        warn!("Could not check the ISO disk on {}: {:#}", config.xcpng_ip, e);
     }
 
     // ── PHASE 6: Generate build files ────────────────────────────────────────
@@ -1234,8 +1242,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "remote_username": "{xcpng_user}",
     "remote_password": {xcpng_pass},
     "iso_url": "{iso_url}",
-    "iso_checksum": "{iso_chk}",
-    "iso_name": {iso_name},
+    "iso_checksum": "{iso_chk}",{iso_name}
     "sr_name": "{sr_name}",
     "vm_name": "{vm_name}",
     "vm_description": "XOA HomeLab Edition, AlmaLinux {ver}",
@@ -1301,10 +1308,15 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         xcpng_pass = serde_json::Value::from(config.xcpng_password.as_str()),
         iso_url = config.almalinux_iso_url,
         iso_chk = config.almalinux_iso_checksum,
-        iso_name = serde_json::Value::from(iso_vdi_name(
-            &config.almalinux_iso_url,
-            &config.almalinux_iso_checksum,
-        )),
+        // iso_name makes the plugin skip download and upload and attach that disk instead.
+        iso_name = if config.reuse_iso_vdi {
+            format!(
+                "\n    \"iso_name\": {},",
+                serde_json::Value::from(iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum))
+            )
+        } else {
+            String::new()
+        },
         sr_name = config.sr_name,
         vm_name = config.vm_name,
         disk_mb = config.vm_disk_size_mb,
@@ -1500,8 +1512,8 @@ fn is_stale_iso_upload(record: &serde_json::Value, stem: &str, current: &str) ->
     family && temp && detached && name != current
 }
 
-/// Destroys the Packer VM `uuid` and its disks, keeping the current ISO upload for the next build.
-async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
+/// Logs in to the build host's XAPI; returns the client, the JSON-RPC URL and the session.
+async fn xapi_login(config: &BuildConfig) -> Result<(reqwest::Client, String, String)> {
     // XCP-ng hosts use a self-signed certificate, as Packer's own XAPI client accepts.
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -1516,6 +1528,45 @@ async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
     )
     .await?;
     let s = session.as_str().context("XAPI session is not a string")?.to_string();
+    Ok((client, url, s))
+}
+
+/// Before Packer: drop older detached ISO uploads, and reuse the checksum-named disk if present.
+async fn prepare_iso_vdi(config: &mut BuildConfig) -> Result<()> {
+    let (client, url, s) = xapi_login(config).await?;
+    let result = async {
+        let iso = iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum);
+        let stem = iso_stem(&config.almalinux_iso_url);
+        let records = xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
+        let mut removed = 0;
+        let mut current = 0;
+        for (vdi, record) in records.as_object().into_iter().flatten() {
+            if record["name_label"].as_str() == Some(iso.as_str()) {
+                current += 1;
+            } else if is_stale_iso_upload(record, stem, &iso) {
+                xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
+                removed += 1;
+            }
+        }
+        // The plugin refuses a name held by two disks, so only an unambiguous one is reused.
+        config.reuse_iso_vdi = current == 1;
+        info!(
+            "ISO disk {:?} on {}: {}; removed {} older upload(s)",
+            iso,
+            config.xcpng_ip,
+            if config.reuse_iso_vdi { "reused, no upload" } else { "absent, Packer uploads it" },
+            removed
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let _ = xapi_call(&client, &url, "session.logout", serde_json::json!([s])).await;
+    result
+}
+
+/// Destroys the Packer VM `uuid` and its disks, keeping the current ISO upload for the next build.
+async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
+    let (client, url, s) = xapi_login(config).await?;
 
     let result = async {
         let vm = xapi_call(&client, &url, "VM.get_by_uuid", serde_json::json!([s, uuid])).await?;
@@ -1539,17 +1590,29 @@ async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
         }
         info!("Removed build VM {} and {} disk(s) from {}", uuid, vdis.len(), config.xcpng_ip);
 
-        // The current ISO disk stays for reuse; older AlmaLinux uploads go once detached.
-        let stem = iso_stem(&config.almalinux_iso_url);
-        let records = xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
-        let mut removed = 0;
-        for (vdi, record) in records.as_object().into_iter().flatten() {
-            if is_stale_iso_upload(record, stem, &iso) {
-                xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
-                removed += 1;
+        // A fresh upload carries the URL's file name; give it the checksum name so the next build reuses it.
+        if !config.reuse_iso_vdi {
+            let stem = iso_stem(&config.almalinux_iso_url);
+            let plain = format!("{}.iso", stem);
+            let records = xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
+            let named = |n: &str| {
+                records.as_object().into_iter().flatten()
+                    .filter(|(_, r)| r["name_label"].as_str() == Some(n))
+                    .map(|(v, r)| (v.clone(), r.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let uploads: Vec<_> = named(&plain)
+                .into_iter()
+                .filter(|(_, r)| r["other_config"]["temp"].as_str() == Some("temp"))
+                .filter(|(_, r)| r["VBDs"].as_array().is_some_and(|v| v.is_empty()))
+                .collect();
+            if uploads.len() == 1 && named(&iso).is_empty() {
+                xapi_call(&client, &url, "VDI.set_name_label", serde_json::json!([s, uploads[0].0, iso])).await?;
+                info!("Kept the uploaded ISO disk on {} as {:?} for the next build", config.xcpng_ip, iso);
+            } else {
+                warn!("Found {} fresh ISO upload(s) named {:?}; none renamed", uploads.len(), plain);
             }
         }
-        info!("Kept ISO disk {:?}, removed {} older upload(s) from {}", iso, removed, config.xcpng_ip);
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -2082,12 +2145,18 @@ VM_MEMORY_MB="4096"
     }
 
     #[test]
-    fn packer_template_names_the_iso_disk_by_checksum() {
+    fn packer_template_names_the_iso_disk_only_when_reused() {
         let mut config = BuildConfig::default();
         config.almalinux_iso_checksum = "sha256:7762a4b45a66235726db".to_string();
-        let json: serde_json::Value =
+        let upload: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&config)).unwrap();
-        assert_eq!(json["builders"][0]["iso_name"], "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso");
+        assert!(upload["builders"][0].get("iso_name").is_none());
+        assert_eq!(upload["builders"][0]["iso_url"], ALMALINUX_ISO_URL);
+
+        config.reuse_iso_vdi = true;
+        let reuse: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&config)).unwrap();
+        assert_eq!(reuse["builders"][0]["iso_name"], "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso");
     }
 
     #[test]

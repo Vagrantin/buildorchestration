@@ -6,6 +6,15 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 
 ### Fixed
 
+- **xoa-vm-agent**: v0.3.1 always set Packer's `iso_name`, but the xenserver
+  plugin treats `iso_name` as "the ISO is already on the host": it skips the
+  download and upload and halts when no such disk exists, so any build with
+  no reusable disk failed at once. The agent now checks the build host
+  through XAPI before Packer: it removes older detached uploads (including
+  the plain-named one), sets `iso_name` only when the checksum-named disk
+  exists, and otherwise lets Packer download and upload, then renames that
+  upload to the checksum name after a successful build. The ISO is uploaded
+  once per AlmaLinux release.
 - **xoa-vm-agent**: a `--force` rebuild on a day that already had an image
   reused that day's release and then failed its upload, because GitHub
   refuses a second asset named `XOA-hl.xva`. The new XVA now goes up as
