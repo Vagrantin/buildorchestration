@@ -2,6 +2,31 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-09-28
+
+### Fixed
+
+- **shared / iso-agent / xoa-vm-agent**: `locate_tag_triggered_run` listed the
+  latest push runs of *every* workflow in the repo and took the first one whose
+  branch matched the tag. Since `secret-scan` also runs on every tag push and
+  finishes in seconds, it could be picked instead of the RPM build: iso-agent
+  then saw "success" and dispatched the ISO build while the xolite-ce RPM was
+  still building, so `v8.3-ce37` failed at "Fetch community xo-lite RPM" (the
+  ISO was dispatched at 19:01:11, the release published at 19:02:27). The
+  lookup now takes the workflow file and only lists that workflow's runs
+  (`build-xolite-ce.yml`, `xoa-proxy.yml`, `build-xoa.yml`).
+
+### Added
+
+- **shared**: `load_credential` falls back to an environment variable of the
+  same name when `CREDENTIALS_DIRECTORY` is not set, so Jenkins can inject
+  vault-resolved secrets. An unresolved `pass://` reference is rejected rather
+  than used as a secret. The systemd path is unchanged, so rolling back to the
+  timers needs no rebuild.
+- **CI**: `.github/workflows/xcp-orchestrator.yml` tests every change and, on
+  `xcp-orchestrator-v*` tags, publishes static x86_64 musl builds of
+  `iso-agent` and `xoa-vm-agent` with sha256 files. Jenkins pins one.
+
 ## 2026-08-18
 
 ### Changed

@@ -44,6 +44,15 @@ sudo ./force-run.sh                 # run all agents in force mode
 sudo ./force-run.sh xoa-vm-agent    # run only one agent
 ```
 
+## Running under Jenkins
+
+`iso-agent` is moving to Jenkins (xcp-hl#77): the `iso-agent` job in
+`jenkins-infra` runs the released binary on the Jenkins host, with
+`GITHUB_TOKEN` resolved from the vault into the environment and
+`/var/lib/xcp-hl-orchestrator` bind-mounted so its version state persists.
+Binaries come from `xcp-orchestrator-v*` releases built by
+`.github/workflows/xcp-orchestrator.yml`, not from `deploy.sh`.
+
 ## Tech Stack
 
 * Language: Rust (Edition 2021)
