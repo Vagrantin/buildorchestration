@@ -2,6 +2,20 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+### Removed
+
+- **orchestrator, orchestrator-api, orchestratorhost** (xcp-hl#77): both
+  agents run under Jenkins, which provides status, history and manual runs.
+  Removed the `orchestrator` aggregator (dashboard `build_report.html`,
+  run history, Ollama diagnostics of failed runs), the `orchestrator-api`
+  trigger service on `0.0.0.0:8787`, the systemd units, `deploy.sh` (which
+  wrote the plaintext `/etc/xcp-hl-credentials/`), `force-run.sh`, and the
+  `orchestratorhost/` VM builder. From `shared`: the `ollama` module,
+  `extract_failed_log_context`, `PipelineStatus`, `get_badge_class` and the
+  dashboard and Ollama constants. The agents are unchanged.
+
 ## 2026-09-28 (xcp-orchestrator-v0.3.1)
 
 ### Fixed

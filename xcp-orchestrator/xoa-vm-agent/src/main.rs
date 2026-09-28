@@ -38,8 +38,8 @@ use tracing::{debug, error, info, warn};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const STATUS_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa-vm-agent.status.json";
-/// Infrastructure config (non-secret), installed by deploy.sh from
-/// xoa-vm-agent/build.config.sample. Missing file = baked-in defaults.
+/// Infrastructure config (non-secret), format of xoa-vm-agent/build.config.sample.
+/// Missing file = baked-in defaults.
 const BUILD_CONFIG_FILE: &str = "/etc/xcp-orchestrator/build.config";
 /// Overrides BUILD_CONFIG_FILE; Jenkins renders its own config per run.
 const BUILD_CONFIG_ENV: &str = "XOA_BUILD_CONFIG";
@@ -225,7 +225,7 @@ impl BuildConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
                     "No {} found, using baked-in default build config. \
-                     Run deploy.sh to install one from build.config.sample.",
+                     Set XOA_BUILD_CONFIG or install one from build.config.sample.",
                     path
                 );
             }

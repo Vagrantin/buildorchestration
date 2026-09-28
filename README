@@ -12,10 +12,12 @@ This repository is the build system for [XCP-ng HL](https://vagrantin.github.io/
 
 ## What's in here
 
-* **`orchestratorhost/`** — builds the machine the automation itself runs on.
-* **`xcp-orchestrator/`** — the automation: the agents that watch, build and publish.
+* **`xcp-orchestrator/`**: the automation, the agents that watch, build and publish. They run as Jenkins jobs (`jenkins-infra`).
 
-Each folder has its own README covering setup, configuration and the technical
+The dedicated orchestrator VM and its builder (`orchestratorhost/`) were
+retired in xcp-hl#77 and remain in git history.
+
+`xcp-orchestrator/README.md` covers setup, configuration and the technical
 details.
 
 ## License

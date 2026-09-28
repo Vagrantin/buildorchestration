@@ -2,59 +2,45 @@
 
 ## Overview
 
-XCP-orchestrator automate and manage the build processes for XCP-HL components. Each binary is its own systemd service on its own daily timer:
+XCP-orchestrator holds the build agents for XCP-HL components. They run as
+Jenkins jobs on the Jenkins host (`jenkins-infra`: `docs/iso-agent.md`,
+`docs/xoa-vm-agent.md`), nightly at 19:00 UTC:
 
-* **`iso-agent`** (04:00) — checks `xolite-ce` and `xoa-proxy` for upstream changes, dispatches/monitors their GitHub Actions builds, then builds and tags `xcp-ng-ce-iso`.
-* **`xoa-vm-agent`** (04:00) — checks `xoa-hl` and `build-xoa-hl` for changes, pushes the `v{version}-ce{N}` tag that starts xoa-hl's RPM release, waits for it, then runs Packer locally against the target XCP-ng host to build and publish the XOA VM (XVA) image.
-* **`orchestrator`** (09:00, after the two agents above) — aggregates their status/history, runs AI diagnostics on any failed build via Ollama, and renders the dashboard.
-* **`orchestrator-api`** — API behind the dashboard's to trigger manual build and status update.
-* **`shared`** — GitHub API client, version-state types, and status/report types used by all of the above.
+* **`iso-agent`**: checks `xolite-ce` and `xoa-proxy` for upstream changes, dispatches and monitors their GitHub Actions builds, then builds and tags `xcp-ng-ce-iso`.
+* **`xoa-vm-agent`**: checks `xoa-hl` and `build-xoa-hl` for changes, pushes the `v{version}-ce{N}` tag that starts xoa-hl's RPM release, waits for it, then runs Packer against the Test XCP-ng host to build and publish the XOA VM (XVA) image.
+* **`shared`**: GitHub API client, version-state and status types used by both agents.
 
-The builds are managed across these agents:
-* XOA VM / xoa-hl(via `xoa-vm-agent`)
-* XO Lite CE / xoa-proxy / xcp-ng-ce-iso (via `iso-agent`)
+Status, history and manual runs are Jenkins' own: the build console and
+history, and "Build with Parameters" (`FORCE`) on each job.
 
 ## Key Features
 
-* Version and State Management: Each agent persists its own version-state JSON under `/var/lib/xcp-hl-orchestrator/`, so a rebuild only fires when what it actually depends on has moved.
-* Automated build: Build are triggered automatically daily at 4 AM.
-* GitHub Integration: Trigger github workflow for build and releases.
-* Monitoring: Dashboard to visualize where is the status of each build.
+* Version and state management: each agent persists its version-state JSON under `/var/lib/xcp-hl-orchestrator/` (bind-mounted from the Jenkins host and backed up nightly), so a rebuild only fires when what it depends on has moved.
+* GitHub integration: tags and dispatches the component workflows and follows them to a published release.
 
-## Manual Agent Triggers
+## Secrets and configuration
 
-The dashboard (`build_report.html`) has "Run now" buttons for each agent.
-They call a small API (`orchestrator-api`, systemd unit
-`orchestrator-api.service`) that starts the matching systemd unit
-(`xcp-orchestrator.service`, `iso-agent.service`, `xoa-vm-agent.service`) on
-request. It binds to `0.0.0.0:8787` and requires a bearer token
-(`/etc/xcp-hl-credentials/trigger_token`, set by `deploy.sh`) on every
-request; the browser is prompted for the token on first use and remembers it
-in `localStorage`.
+The agents read `GITHUB_TOKEN`, and for `xoa-vm-agent` also
+`XCPNG_PASSWORD` and `ALMALINUX_ROOT_PASSWORD`, from the environment, where
+Jenkins' `with-secrets` puts the values resolved from the vault. An
+unresolved `pass://` reference is rejected. `xoa-vm-agent` reads its build
+config from the path in `XOA_BUILD_CONFIG` (the job renders it per run).
+They still accept systemd credentials (`CREDENTIALS_DIRECTORY`), but no
+systemd deployment is shipped any more (xcp-hl#77).
 
-The dashboard's JS calls this API directly on port 8787 (CORS-enabled), so
-if a firewall is active on the host, allow inbound TCP 8787 from
-wherever the dashboard is viewed from.
+## Releases
 
-From the command line, `force-run.sh` runs the same agents outside the
-dashboard, with the credentials each systemd unit declares:
-
-```bash
-sudo ./force-run.sh                 # run all agents in force mode
-sudo ./force-run.sh xoa-vm-agent    # run only one agent
-```
-
-## Running under Jenkins
-
-`iso-agent` (xcp-hl#77) and `xoa-vm-agent` (xcp-hl#76) run as the
-`iso-agent` and `xoa-vm-agent` jobs in `jenkins-infra`, which run the
-released binaries on the Jenkins host, with secrets resolved from the vault
-into the environment and `/var/lib/xcp-hl-orchestrator` bind-mounted so the
-version state persists. `xoa-vm-agent` also reads `XCPNG_PASSWORD` and
-`ALMALINUX_ROOT_PASSWORD` from the environment, and its build config from
-the path in `XOA_BUILD_CONFIG`.
 Binaries come from `xcp-orchestrator-v*` releases built by
-`.github/workflows/xcp-orchestrator.yml`, not from `deploy.sh`.
+`.github/workflows/xcp-orchestrator.yml` (static x86_64 musl). Jenkins' agent
+image pins one release by version and sha256 (`jenkins-infra/agent/Dockerfile`).
+
+## History
+
+Until 2026-09-28 the agents ran on a dedicated orchestrator VM from systemd
+timers, with an `orchestrator` aggregator (dashboard `build_report.html` and
+Ollama diagnostics of failed runs) and an `orchestrator-api` trigger service
+on port 8787. Both were retired with that VM in xcp-hl#77; they remain in git
+history.
 
 ## Tech Stack
 
