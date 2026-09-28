@@ -13,9 +13,12 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
   build.config, and the new `MIN_FREE_DISK_GB` key replaces the hardcoded
   100 GB free-space check (default unchanged). The build config is now read
   before any tag is pushed.
-- **xoa-vm-agent**: Packer `keep_vm` is `never` instead of `always`. A
-  successful build now destroys its VM and disks on the XCP-ng host; a failed
-  one still leaves them, because `-on-error=abort` skips all cleanup.
+- **xoa-vm-agent**: a successful build now removes its VM and disks (the
+  uploaded AlmaLinux ISO included) from the XCP-ng host through XAPI; a failed
+  build still leaves them for inspection. Packer keeps `keep_vm: always`,
+  because the xenserver plugin ignores `-on-error` and would otherwise clean
+  up failures too. The VM is identified by the uuid Packer reports, so VMs
+  left by earlier failed runs are never touched.
 
 ## 2026-09-28
 

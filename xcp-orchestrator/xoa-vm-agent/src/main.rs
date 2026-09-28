@@ -690,12 +690,25 @@ async fn main() -> Result<()> {
     status.detail = "Running packer validate + build".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = run_packer(&build_dir).await {
-        error!("Packer build failed: {}", e);
-        status.status = WorkflowStatus::Failure;
-        status.detail = format!("Packer error: {}", e);
-        status.write_to_file(STATUS_FILE)?;
-        return Err(e);
+    let build_vm = match run_packer(&build_dir).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            error!("Packer build failed: {}", e);
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("Packer error: {}", e);
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
+        }
+    };
+
+    // Success: the XVA is exported, so the build VM and its disks can go. Failures keep them.
+    match build_vm {
+        Some(uuid) => {
+            if let Err(e) = destroy_build_vm(&config, &uuid).await {
+                warn!("Could not remove build VM {} from {}: {:#}", uuid, config.xcpng_ip, e);
+            }
+        }
+        None => warn!("Packer never reported a VM uuid; nothing removed from {}", config.xcpng_ip),
     }
 
     // ── PHASE 8: Locate XVA ───────────────────────────────────────────────────
@@ -1204,7 +1217,7 @@ usermod -aG wheel xo
     )
 }
 
-/// keep_vm "never" destroys the VM on success; -on-error=abort skips that cleanup on failure.
+/// keep_vm "always": the plugin ignores -on-error, so the agent destroys the VM itself on success.
 fn generate_packer_template(config: &BuildConfig) -> String {
     format!(
         r#"{{
@@ -1231,7 +1244,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "ssh_password": "{rootpw}",
     "ssh_timeout": "30m",
     "format": "xva_compressed",
-    "keep_vm": "never",
+    "keep_vm": "always",
     "skip_set_template": "true",
     "output_directory": "{output_dir}"
   }}],
@@ -1295,7 +1308,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
 
 // ── PHASE 7: Run Packer ───────────────────────────────────────────────────────
 
-async fn run_packer(build_dir: &Path) -> Result<()> {
+/// Runs Packer; returns the uuid of the VM it created, read from its "Created instance" line.
+async fn run_packer(build_dir: &Path) -> Result<Option<String>> {
     let packer_file = build_dir.join("almalinux-build.json");
 
     // Validate first, cheap and catches template errors before a long build
@@ -1325,7 +1339,7 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
     let mut child = AsyncCommand::new("packer")
         .arg("build")
         // FIX #10: was "-on-error=ask" which blocks on stdin forever in automation.
-        //          "-on-error=abort" exits on failure without cleanup, so the VM stays for debugging.
+        //          The xenserver plugin ignores -on-error; keep_vm decides what stays on failure.
         .arg("-on-error=abort")
         .arg(&packer_file)
         .current_dir(build_dir)
@@ -1336,6 +1350,8 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
+    let instance = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let instance_seen = instance.clone();
 
     // Stream packer output to the agent log without blocking the wait
     let stdout_task = tokio::spawn(async move {
@@ -1345,7 +1361,12 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
-                Ok(_) => info!("[packer] {}", line.trim_end()),
+                Ok(_) => {
+                    info!("[packer] {}", line.trim_end());
+                    if let Some(uuid) = parse_created_instance(&line) {
+                        *instance_seen.lock().unwrap() = Some(uuid);
+                    }
+                }
                 Err(e) => {
                     error!("packer stdout read error: {}", e);
                     break;
@@ -1378,7 +1399,7 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
     match build_result {
         Ok(Ok(exit)) if exit.success() => {
             info!("Packer build finished in {:?}", start.elapsed());
-            Ok(())
+            Ok(instance.lock().unwrap().clone())
         }
         Ok(Ok(exit)) => {
             bail!("Packer build failed (exit code: {:?})", exit.code());
@@ -1410,6 +1431,79 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
             bail!("Packer build timed out after {:?}", PACKER_TIMEOUT);
         }
     }
+}
+
+/// Packer prints `Created instance '<uuid>'`, wrapped in ANSI colour codes.
+fn parse_created_instance(line: &str) -> Option<String> {
+    let rest = line.split("Created instance '").nth(1)?;
+    let uuid = rest.split('\'').next()?;
+    (uuid.len() == 36 && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .then(|| uuid.to_string())
+}
+
+/// One XAPI JSON-RPC call; XAPI answers errors inside a 200 response.
+async fn xapi_call(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let body = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1});
+    let reply: serde_json::Value = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("XAPI {} request failed", method))?
+        .json()
+        .await
+        .with_context(|| format!("XAPI {} reply unreadable", method))?;
+    if let Some(err) = reply.get("error").filter(|e| !e.is_null()) {
+        bail!("XAPI {} failed: {}", method, err);
+    }
+    Ok(reply.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// Destroys the Packer VM `uuid` and every disk it had attached, including the uploaded ISO.
+async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
+    // XCP-ng hosts use a self-signed certificate, as Packer's own XAPI client accepts.
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let url = format!("https://{}/jsonrpc", config.xcpng_ip);
+    let session = xapi_call(
+        &client,
+        &url,
+        "session.login_with_password",
+        serde_json::json!([config.xcpng_user, config.xcpng_password, "1.0", "xoa-vm-agent"]),
+    )
+    .await?;
+    let s = session.as_str().context("XAPI session is not a string")?.to_string();
+
+    let result = async {
+        let vm = xapi_call(&client, &url, "VM.get_by_uuid", serde_json::json!([s, uuid])).await?;
+        let mut vdis = Vec::new();
+        let vbds = xapi_call(&client, &url, "VM.get_VBDs", serde_json::json!([s, vm])).await?;
+        for vbd in vbds.as_array().into_iter().flatten() {
+            let vdi = xapi_call(&client, &url, "VBD.get_VDI", serde_json::json!([s, vbd])).await?;
+            if vdi.as_str().is_some_and(|r| r != "OpaqueRef:NULL") {
+                vdis.push(vdi);
+            }
+        }
+        // Already halted after the export; a failed shutdown only means that.
+        let _ = xapi_call(&client, &url, "VM.hard_shutdown", serde_json::json!([s, vm])).await;
+        xapi_call(&client, &url, "VM.destroy", serde_json::json!([s, vm])).await?;
+        for vdi in &vdis {
+            xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
+        }
+        info!("Removed build VM {} and {} disk(s) from {}", uuid, vdis.len(), config.xcpng_ip);
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let _ = xapi_call(&client, &url, "session.logout", serde_json::json!([s])).await;
+    result
 }
 
 // ── PHASE 8: Locate XVA ───────────────────────────────────────────────────────
@@ -1857,10 +1951,21 @@ VM_MEMORY_MB="4096"
     }
 
     #[test]
-    fn packer_template_destroys_vm_only_on_success() {
+    fn packer_template_keeps_vm_for_the_agent_to_remove() {
         let json: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
-        assert_eq!(json["builders"][0]["keep_vm"], "never");
+        assert_eq!(json["builders"][0]["keep_vm"], "always");
+    }
+
+    #[test]
+    fn created_instance_uuid_is_read_through_colour_codes() {
+        let line = "\x1b[1;32m==> xenserver-iso: Created instance '0b5c7d1e-2f3a-4b6c-8d9e-0f1a2b3c4d5e'\x1b[0m\n";
+        assert_eq!(
+            parse_created_instance(line).as_deref(),
+            Some("0b5c7d1e-2f3a-4b6c-8d9e-0f1a2b3c4d5e")
+        );
+        assert_eq!(parse_created_instance("==> xenserver-iso: Destroying VM"), None);
+        assert_eq!(parse_created_instance("Created instance 'not-a-uuid'"), None);
     }
 
     #[test]
