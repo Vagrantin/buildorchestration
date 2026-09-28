@@ -1,0 +1,77 @@
+name: xcp-orchestrator
+
+# Tests every change under xcp-orchestrator/, builds static x86_64 binaries,
+# and publishes them as release assets on xcp-orchestrator-v* tags.
+# Jenkins' agent image pins one of these releases by version and sha256.
+
+on:
+  push:
+    branches: [main]
+    paths: ["xcp-orchestrator/**", ".github/workflows/xcp-orchestrator.yml"]
+    tags: ["xcp-orchestrator-v*"]
+  pull_request:
+    paths: ["xcp-orchestrator/**", ".github/workflows/xcp-orchestrator.yml"]
+
+defaults:
+  run:
+    working-directory: xcp-orchestrator
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+  BINARIES: iso-agent xoa-vm-agent
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: xcp-orchestrator
+      - run: cargo test --locked
+
+  # Static musl build (rustls, no OpenSSL), so the binaries run in any agent image.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: xcp-orchestrator
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: |
+          args=()
+          for b in $BINARIES; do args+=(--bin "$b"); done
+          cargo build --release --locked --target "$TARGET" "${args[@]}"
+      - name: Package with checksums
+        run: |
+          mkdir -p dist
+          for b in $BINARIES; do
+              cp "target/$TARGET/release/$b" "dist/$b-$TARGET"
+              (cd dist && sha256sum "$b-$TARGET" > "$b-$TARGET.sha256")
+          done
+          file dist/*-"$TARGET" | tee /dev/stderr | grep -qE "statically linked|static-pie linked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: xcp-orchestrator/dist/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/xcp-orchestrator-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

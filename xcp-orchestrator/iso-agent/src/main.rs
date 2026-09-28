@@ -30,6 +30,9 @@ use tracing::{info, warn, debug};
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const STATUS_FILE: &str = "/var/lib/xcp-hl-orchestrator/xcp-iso-agent.status.json";
+/// The RPM build each component tag push starts; the one to wait on.
+const XOLITE_WORKFLOW: &str = "build-xolite-ce.yml";
+const XOA_PROXY_WORKFLOW: &str = "xoa-proxy.yml";
 const VERSION_STATE_FILE: &str = "/var/lib/xcp-hl-orchestrator/iso_agent_version_state.json";
 
 /// FIX #13: hard cap on the component (xolite-ce + xoa-proxy) monitoring loop.
@@ -309,7 +312,7 @@ async fn main() -> Result<(), OrchestratorError> {
             let actual_tag =
                 create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
             let (id, url) =
-                locate_tag_triggered_run(&client, "xolite-ce", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xolite-ce", XOLITE_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xolite_id = Some(id);
             xolite_url = url;
@@ -323,7 +326,7 @@ async fn main() -> Result<(), OrchestratorError> {
             let actual_tag =
                 create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
             let (id, url) =
-                locate_tag_triggered_run(&client, "xolite-ce", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xolite-ce", XOLITE_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xolite_id = Some(id);
             xolite_url = url;
@@ -362,7 +365,7 @@ async fn main() -> Result<(), OrchestratorError> {
             let actual_tag =
                 create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
             let (id, url) =
-                locate_tag_triggered_run(&client, "xoa-proxy", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xoa-proxy", XOA_PROXY_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xoa_id = Some(id);
             xoa_url = url;
@@ -376,7 +379,7 @@ async fn main() -> Result<(), OrchestratorError> {
             let actual_tag =
                 create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
             let (id, url) =
-                locate_tag_triggered_run(&client, "xoa-proxy", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xoa-proxy", XOA_PROXY_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xoa_id = Some(id);
             xoa_url = url;

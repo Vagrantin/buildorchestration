@@ -547,7 +547,7 @@ async fn main() -> Result<()> {
                 };
 
             let (run_id, run_url) =
-                match locate_tag_triggered_run(&client, "xoa-hl", &actual_tag, trigger_time).await {
+                match locate_tag_triggered_run(&client, "xoa-hl", "build-xoa.yml", &actual_tag, trigger_time).await {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Could not locate the run triggered by {}: {}", actual_tag, e);
