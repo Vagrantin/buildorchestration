@@ -356,7 +356,8 @@ fn next_tag_candidate(tag: &str) -> Option<String> {
 mod tests {
     use super::{
         next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag,
-        parse_upstream_xo, split_leading_comments, ReleaseInfo, UpstreamXoPin,
+        parse_upstream_xo, split_leading_comments, workflow_push_runs_url, ReleaseInfo,
+        UpstreamXoPin,
     };
 
     /// GitHub sends `"body": null` for a release created without notes (every
@@ -494,19 +495,33 @@ mod tests {
         assert_eq!(header, "");
         assert_eq!(entries, "- a: 1\n");
     }
+
+    #[test]
+    fn tag_run_lookup_is_scoped_to_one_workflow() {
+        assert_eq!(
+            workflow_push_runs_url("xolite-ce", "build-xolite-ce.yml"),
+            "https://api.github.com/repos/Vagrantin/xolite-ce/actions/workflows/build-xolite-ce.yml/runs?event=push&per_page=5"
+        );
+    }
 }
 
-/// Locate a workflow run triggered by a tag push
+/// Only this workflow's push runs: secret-scan also runs on tag push and must not stand in for the build.
+fn workflow_push_runs_url(repo: &str, workflow_file: &str) -> String {
+    format!(
+        "https://api.github.com/repos/{}/{}/actions/workflows/{}/runs?event=push&per_page=5",
+        OWNER, repo, workflow_file
+    )
+}
+
+/// Locate the run of `workflow_file` triggered by pushing `tag`.
 pub async fn locate_tag_triggered_run(
     client: &Client,
     repo: &str,
+    workflow_file: &str,
     tag: &str,
     trigger_marker: DateTime<Utc>,
 ) -> Result<(u64, String), OrchestratorError> {
-    let check_url = format!(
-        "https://api.github.com/repos/{}/{}/actions/runs?event=push&per_page=5",
-        OWNER, repo
-    );
+    let check_url = workflow_push_runs_url(repo, workflow_file);
     let timeout_limit = Instant::now() + Duration::from_secs(180);
 
     while Instant::now() < timeout_limit {
@@ -531,8 +546,8 @@ pub async fn locate_tag_triggered_run(
     }
 
     Err(OrchestratorError::WorkflowRunNotFound(format!(
-        "Timeout waiting for tag-push run matching {} in repo {}",
-        tag, repo
+        "Timeout waiting for a {} run for tag {} in repo {}",
+        workflow_file, tag, repo
     )))
 }
 
@@ -642,49 +657,6 @@ pub async fn query_run_conclusion(
     } else {
         Ok("In Progress".to_string())
     }
-}
-
-/// Extract log context from a failed job
-pub async fn extract_failed_log_context(
-    client: &Client,
-    repo: &str,
-    run_id: u64,
-) -> Result<String, OrchestratorError> {
-    let jobs_url = format!(
-        "https://api.github.com/repos/{}/{}/actions/runs/{}/jobs",
-        OWNER, repo, run_id
-    );
-    let res: GHJobsResponse = parse_github_response(
-        client
-            .get(&jobs_url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(run_id.to_string(), e.to_string()))?,
-        "extract_failed_log_context jobs list",
-    )
-    .await?;
-
-    if let Some(failed_job) = res.jobs.iter().find(|j| j.conclusion.as_deref() == Some("failure")) {
-        let log_url = format!(
-            "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
-            OWNER, repo, failed_job.id
-        );
-        let log_text = client
-            .get(&log_url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(run_id.to_string(), e.to_string()))?
-            .text()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(run_id.to_string(), e.to_string()))?;
-
-        let lines: Vec<&str> = log_text.lines().collect();
-        let tail_count = lines.len().min(250);
-        let truncated = lines[lines.len() - tail_count..].join("\n");
-        return Ok(truncated);
-    }
-
-    Ok("Could not resolve failed job log metrics.".to_string())
 }
 
 /// Fetch the latest upstream XO Lite tag

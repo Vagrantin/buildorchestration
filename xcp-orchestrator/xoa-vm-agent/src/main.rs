@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use shared::{
     AgentStatus, ComponentVersionState, WorkflowStatus,
-    create_github_client, load_github_token,
+    create_github_client, load_credential, load_github_token,
     create_and_push_tag, fetch_release_by_tag, fetch_repo_head_sha, fetch_releases,
     fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, ReleaseInfo,
     locate_tag_triggered_run, parse_ce_tag, query_run_conclusion,
@@ -38,9 +38,11 @@ use tracing::{debug, error, info, warn};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const STATUS_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa-vm-agent.status.json";
-/// Infrastructure config (non-secret), installed by deploy.sh from
-/// xoa-vm-agent/build.config.sample. Missing file = baked-in defaults.
+/// Infrastructure config (non-secret), format of xoa-vm-agent/build.config.sample.
+/// Missing file = baked-in defaults.
 const BUILD_CONFIG_FILE: &str = "/etc/xcp-orchestrator/build.config";
+/// Overrides BUILD_CONFIG_FILE; Jenkins renders its own config per run.
+const BUILD_CONFIG_ENV: &str = "XOA_BUILD_CONFIG";
 const VERSION_STATE_FILE: &str = "/var/lib/xcp-hl-orchestrator/xoa_agent_version_state.json";
 const REPO_DIR: &str = "/var/lib/xcp-hl-orchestrator/repos/build-xoa-hl";
 const BUILD_DIR: &str = "/var/lib/xcp-hl-orchestrator/build/xoa-hl";
@@ -66,8 +68,8 @@ const ALMALINUX_VERSION: &str = "9";
 const ALMALINUX_ISO_URL: &str =
     "https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso";
 
-/// 100 GB minimum free space for build + output artefacts.
-const REQUIRED_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+/// Default minimum free space (GB) for build + output artefacts; MIN_FREE_DISK_GB overrides.
+const DEFAULT_MIN_FREE_DISK_GB: u64 = 100;
 
 /// Ports Packer's embedded HTTP server may bind to (kickstart delivery).
 /// All must be free at build time.
@@ -155,9 +157,12 @@ struct BuildConfig {
     almalinux_root_password: String,
     almalinux_iso_url: String,
     almalinux_iso_checksum: String,
+    /// The checksum-named ISO disk is already on the build host: Packer attaches it, no upload.
+    reuse_iso_vdi: bool,
     xoa_hl_rpm_url: String,
     xe_guest_utilities_url: String,
     xe_guest_utilities_xenstore_url: String,
+    min_free_disk_gb: u64,
 }
 
 impl Default for BuildConfig {
@@ -174,6 +179,7 @@ impl Default for BuildConfig {
             almalinux_root_password: String::new(),
             almalinux_iso_url: ALMALINUX_ISO_URL.to_string(),
             almalinux_iso_checksum: String::new(),
+            reuse_iso_vdi: false,
             xoa_hl_rpm_url: String::new(),
             xe_guest_utilities_url:
                 "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-10.0.0-1.x86_64.rpm"
@@ -181,6 +187,7 @@ impl Default for BuildConfig {
             xe_guest_utilities_xenstore_url:
                 "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-xenstore-10.0.0-1.x86_64.rpm"
                     .to_string(),
+            min_free_disk_gb: DEFAULT_MIN_FREE_DISK_GB,
         }
     }
 }
@@ -191,15 +198,23 @@ impl BuildConfig {
     /// that exists but fails to parse is fatal, a half-applied config
     /// pointing at the wrong host is worse than stopping.
     fn load() -> Result<Self> {
+        let path = std::env::var(BUILD_CONFIG_ENV)
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| BUILD_CONFIG_FILE.to_string());
+        Self::load_from(&path)
+    }
+
+    fn load_from(path: &str) -> Result<Self> {
         let mut config = Self::default();
-        match std::fs::read_to_string(BUILD_CONFIG_FILE) {
+        match std::fs::read_to_string(path) {
             Ok(content) => {
                 apply_build_config(&mut config, &content)
-                    .with_context(|| format!("Failed to parse {}", BUILD_CONFIG_FILE))?;
+                    .with_context(|| format!("Failed to parse {}", path))?;
                 info!(
                     "Build config loaded from {}: xcpng_ip={}, xcpng_user={}, sr_name={:?}, \
-                     network={:?}, vm_name={}, disk={}MB, memory={}MB",
-                    BUILD_CONFIG_FILE,
+                     network={:?}, vm_name={}, disk={}MB, memory={}MB, min_free={}GB",
+                    path,
                     config.xcpng_ip,
                     config.xcpng_user,
                     config.sr_name,
@@ -207,17 +222,18 @@ impl BuildConfig {
                     config.vm_name,
                     config.vm_disk_size_mb,
                     config.vm_memory_mb,
+                    config.min_free_disk_gb,
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
                     "No {} found, using baked-in default build config. \
-                     Run deploy.sh to install one from build.config.sample.",
-                    BUILD_CONFIG_FILE
+                     Set XOA_BUILD_CONFIG or install one from build.config.sample.",
+                    path
                 );
             }
             Err(e) => {
-                return Err(e).with_context(|| format!("Failed to read {}", BUILD_CONFIG_FILE));
+                return Err(e).with_context(|| format!("Failed to read {}", path));
             }
         }
         Ok(config)
@@ -249,6 +265,10 @@ fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
             v.parse::<u32>()
                 .with_context(|| format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v))
         };
+        let parse_gb = |v: &str| {
+            v.parse::<u64>()
+                .with_context(|| format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v))
+        };
 
         match key {
             "XCPNG_IP" => config.xcpng_ip = value.to_string(),
@@ -258,6 +278,7 @@ fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
             "VM_NAME" => config.vm_name = value.to_string(),
             "VM_DISK_SIZE_MB" => config.vm_disk_size_mb = parse_mb(value)?,
             "VM_MEMORY_MB" => config.vm_memory_mb = parse_mb(value)?,
+            "MIN_FREE_DISK_GB" => config.min_free_disk_gb = parse_gb(value)?,
             "ALMALINUX_ISO_URL" => config.almalinux_iso_url = value.to_string(),
             "XE_GUEST_UTILITIES_URL" => config.xe_guest_utilities_url = value.to_string(),
             "XE_GUEST_UTILITIES_XENSTORE_URL" => {
@@ -411,6 +432,17 @@ async fn main() -> Result<()> {
     let mut status = AgentStatus::new("initialization", WorkflowStatus::InProgress);
     status.write_to_file(STATUS_FILE)?;
 
+    // Load the build config first: a bad config must fail before any tag is pushed.
+    let mut config = match BuildConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("Build config invalid: {}", e);
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
+        }
+    };
+
     let mut version_state = XoaHlVersionState::load()?;
     let token = load_github_token().context("Failed to load GitHub token")?;
     let client = create_github_client(&token)?;
@@ -547,7 +579,7 @@ async fn main() -> Result<()> {
                 };
 
             let (run_id, run_url) =
-                match locate_tag_triggered_run(&client, "xoa-hl", &actual_tag, trigger_time).await {
+                match locate_tag_triggered_run(&client, "xoa-hl", "build-xoa.yml", &actual_tag, trigger_time).await {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Could not locate the run triggered by {}: {}", actual_tag, e);
@@ -608,7 +640,7 @@ async fn main() -> Result<()> {
     status.phase = "phase_3_validate_prerequisites".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = validate_prerequisites().await {
+    if let Err(e) = validate_prerequisites(config.min_free_disk_gb).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Prerequisite check failed: {}", e);
         status.write_to_file(STATUS_FILE)?;
@@ -632,20 +664,16 @@ async fn main() -> Result<()> {
     status.phase = "phase_5_resolve_values".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    let mut config = match BuildConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            status.status = WorkflowStatus::Failure;
-            status.detail = format!("Build config invalid: {}", e);
-            status.write_to_file(STATUS_FILE)?;
-            return Err(e);
-        }
-    };
     if let Err(e) = resolve_dynamic_values(&client, &mut config, &rpm_tag).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Value resolution failed: {}", e);
         status.write_to_file(STATUS_FILE)?;
         return Err(e);
+    }
+    // Not fatal: without it, Packer simply uploads the ISO again.
+    if let Err(e) = prepare_iso_vdi(&mut config).await {
+        config.reuse_iso_vdi = false;
+        warn!("Could not check the ISO disk on {}: {:#}", config.xcpng_ip, e);
     }
 
     // ── PHASE 6: Generate build files ────────────────────────────────────────
@@ -670,12 +698,25 @@ async fn main() -> Result<()> {
     status.detail = "Running packer validate + build".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = run_packer(&build_dir).await {
-        error!("Packer build failed: {}", e);
-        status.status = WorkflowStatus::Failure;
-        status.detail = format!("Packer error: {}", e);
-        status.write_to_file(STATUS_FILE)?;
-        return Err(e);
+    let build_vm = match run_packer(&build_dir).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            error!("Packer build failed: {}", e);
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("Packer error: {}", e);
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
+        }
+    };
+
+    // Success: the XVA is exported, so the build VM and its disks can go. Failures keep them.
+    match build_vm {
+        Some(uuid) => {
+            if let Err(e) = destroy_build_vm(&config, &uuid).await {
+                warn!("Could not remove build VM {} from {}: {:#}", uuid, config.xcpng_ip, e);
+            }
+        }
+        None => warn!("Packer never reported a VM uuid; nothing removed from {}", config.xcpng_ip),
     }
 
     // ── PHASE 8: Locate XVA ───────────────────────────────────────────────────
@@ -704,7 +745,7 @@ async fn main() -> Result<()> {
     let image_tag = generate_image_tag(&repo_head_sha);
     let image_name = format!("XOA HomeLab Edition - {}", image_tag);
 
-    let (upload_url, release_url) = match create_github_release(
+    let (upload_url, release_url, assets_url) = match create_github_release(
         &client,
         &image_tag,
         &image_name,
@@ -726,7 +767,7 @@ async fn main() -> Result<()> {
     status.set_component("xoa-image", WorkflowStatus::InProgress, release_url.clone());
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = upload_asset(&client, &upload_url, &xva_path).await {
+    if let Err(e) = upload_asset(&client, &upload_url, &assets_url, &xva_path).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Asset upload failed: {}", e);
         status.set_component("xoa-image", WorkflowStatus::Failure, release_url.clone());
@@ -862,7 +903,7 @@ async fn wait_for_workflow(
 
 // ── PHASE 3: Validate Prerequisites ──────────────────────────────────────────
 
-async fn validate_prerequisites() -> Result<()> {
+async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
     // FIX #16: was using blocking std::process::Command throughout.
     //          All checks now use AsyncCommand so the executor is not blocked.
 
@@ -914,10 +955,10 @@ async fn validate_prerequisites() -> Result<()> {
         if parts.len() >= 4 {
             let avail_kb: u64 = parts[3].parse().unwrap_or(0);
             let avail_bytes = avail_kb * 1024;
-            if avail_bytes < REQUIRED_DISK_SPACE_BYTES {
+            if avail_bytes < min_free_disk_gb * 1024 * 1024 * 1024 {
                 bail!(
                     "Insufficient disk space, required {}GB, have {}GB",
-                    REQUIRED_DISK_SPACE_BYTES / (1024 * 1024 * 1024),
+                    min_free_disk_gb,
                     avail_bytes / (1024 * 1024 * 1024),
                 );
             }
@@ -1000,25 +1041,11 @@ async fn resolve_dynamic_values(
     config: &mut BuildConfig,
     rpm_tag: &str,
 ) -> Result<()> {
-    // Credentials come exclusively from systemd LoadCredential, never from env vars set manually
-    let creds_dir = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
-        anyhow::anyhow!(
-            "CREDENTIALS_DIRECTORY not set, configure systemd LoadCredential= \
-             for XCPNG_PASSWORD and ALMALINUX_ROOT_PASSWORD"
-        )
-    })?;
-    let creds = std::path::PathBuf::from(creds_dir);
-
-    config.xcpng_password = std::fs::read_to_string(creds.join("XCPNG_PASSWORD"))
-        .context("XCPNG_PASSWORD credential missing")?
-        .trim()
-        .to_string();
-
-    config.almalinux_root_password =
-        std::fs::read_to_string(creds.join("ALMALINUX_ROOT_PASSWORD"))
-            .context("ALMALINUX_ROOT_PASSWORD credential missing")?
-            .trim()
-            .to_string();
+    // systemd LoadCredential= files, or resolved environment variables under Jenkins.
+    config.xcpng_password =
+        load_credential("XCPNG_PASSWORD").context("XCPNG_PASSWORD credential missing")?;
+    config.almalinux_root_password = load_credential("ALMALINUX_ROOT_PASSWORD")
+        .context("ALMALINUX_ROOT_PASSWORD credential missing")?;
 
     info!("Resolving AlmaLinux ISO checksum...");
     config.almalinux_iso_checksum = resolve_almalinux_checksum(client)
@@ -1104,7 +1131,7 @@ async fn generate_build_files(build_dir: &Path, config: &BuildConfig) -> Result<
     async_fs::create_dir_all(build_dir.join("systemd")).await?;
 
     info!("Generating inst.ks...");
-    async_fs::write(build_dir.join("inst.ks"), generate_kickstart(config)).await?;
+    async_fs::write(build_dir.join("inst.ks"), generate_kickstart(config)?).await?;
 
     info!("Generating almalinux-build.json...");
     async_fs::write(
@@ -1139,13 +1166,20 @@ async fn generate_build_files(build_dir: &Path, config: &BuildConfig) -> Result<
     Ok(())
 }
 
-fn generate_kickstart(config: &BuildConfig) -> String {
-    format!(
+/// Kickstart splits lines like a shell, so a plaintext password with #, quotes or spaces breaks.
+fn kickstart_root_hash(password: &str) -> Result<String> {
+    sha_crypt::sha512_simple(password, &sha_crypt::Sha512Params::default())
+        .map_err(|e| anyhow::anyhow!("Failed to hash the AlmaLinux root password: {:?}", e))
+}
+
+fn generate_kickstart(config: &BuildConfig) -> Result<String> {
+    let rootpw = kickstart_root_hash(&config.almalinux_root_password)?;
+    Ok(format!(
         r#"# AlmaLinux {ver} Minimal Kickstart, XOA HomeLab Edition
 lang en_US.UTF-8
 keyboard us
 network --onboot yes --device eth0 --bootproto dhcp
-rootpw --plaintext {rootpw}
+rootpw --iscrypted --allow-ssh {rootpw}
 timezone Asia/Tokyo --utc
 selinux --disabled
 firewall --disabled
@@ -1194,10 +1228,11 @@ usermod -aG wheel xo
 %end
 "#,
         ver = ALMALINUX_VERSION,
-        rootpw = config.almalinux_root_password,
-    )
+        rootpw = rootpw,
+    ))
 }
 
+/// keep_vm "always": the plugin ignores -on-error, so the agent destroys the VM itself on success.
 fn generate_packer_template(config: &BuildConfig) -> String {
     format!(
         r#"{{
@@ -1205,23 +1240,23 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     "type": "xenserver-iso",
     "remote_host": "{xcpng_ip}",
     "remote_username": "{xcpng_user}",
-    "remote_password": "{xcpng_pass}",
+    "remote_password": {xcpng_pass},
     "iso_url": "{iso_url}",
-    "iso_checksum": "{iso_chk}",
+    "iso_checksum": "{iso_chk}",{iso_name}
     "sr_name": "{sr_name}",
     "vm_name": "{vm_name}",
     "vm_description": "XOA HomeLab Edition, AlmaLinux {ver}",
     "disk_size": {disk_mb},
     "vm_memory": {mem_mb},
     "http_directory": ".",
-    "network_names": ["{net}"],
+    "network_names": [{net}],
     "boot_command": [
       "<wait5><esc><wait>",
       "linux inst.ks=http://{{{{ .HTTPIP }}}}:{{{{ .HTTPPort }}}}/inst.ks inst.text<enter>"
     ],
     "boot_wait": "5s",
     "ssh_username": "root",
-    "ssh_password": "{rootpw}",
+    "ssh_password": {rootpw},
     "ssh_timeout": "30m",
     "format": "xva_compressed",
     "keep_vm": "always",
@@ -1269,16 +1304,26 @@ fn generate_packer_template(config: &BuildConfig) -> String {
 }}"#,
         xcpng_ip = config.xcpng_ip,
         xcpng_user = config.xcpng_user,
-        xcpng_pass = config.xcpng_password,
+        // Values that may hold quotes or backslashes go in JSON-encoded, quotes included.
+        xcpng_pass = serde_json::Value::from(config.xcpng_password.as_str()),
         iso_url = config.almalinux_iso_url,
         iso_chk = config.almalinux_iso_checksum,
+        // iso_name makes the plugin skip download and upload and attach that disk instead.
+        iso_name = if config.reuse_iso_vdi {
+            format!(
+                "\n    \"iso_name\": {},",
+                serde_json::Value::from(iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum))
+            )
+        } else {
+            String::new()
+        },
         sr_name = config.sr_name,
         vm_name = config.vm_name,
         disk_mb = config.vm_disk_size_mb,
         mem_mb = config.vm_memory_mb,
         ver = ALMALINUX_VERSION,
-        net = config.vm_network_name,
-        rootpw = config.almalinux_root_password,
+        net = serde_json::Value::from(config.vm_network_name.as_str()),
+        rootpw = serde_json::Value::from(config.almalinux_root_password.as_str()),
         xe_xenstore_url = config.xe_guest_utilities_xenstore_url,
         xe_url = config.xe_guest_utilities_url,
         rpm_url = config.xoa_hl_rpm_url,
@@ -1288,7 +1333,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
 
 // ── PHASE 7: Run Packer ───────────────────────────────────────────────────────
 
-async fn run_packer(build_dir: &Path) -> Result<()> {
+/// Runs Packer; returns the uuid of the VM it created, read from its "Created instance" line.
+async fn run_packer(build_dir: &Path) -> Result<Option<String>> {
     let packer_file = build_dir.join("almalinux-build.json");
 
     // Validate first, cheap and catches template errors before a long build
@@ -1318,7 +1364,7 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
     let mut child = AsyncCommand::new("packer")
         .arg("build")
         // FIX #10: was "-on-error=ask" which blocks on stdin forever in automation.
-        //          "-on-error=abort" tears down and exits immediately on failure.
+        //          The xenserver plugin ignores -on-error; keep_vm decides what stays on failure.
         .arg("-on-error=abort")
         .arg(&packer_file)
         .current_dir(build_dir)
@@ -1329,6 +1375,8 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
+    let instance = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let instance_seen = instance.clone();
 
     // Stream packer output to the agent log without blocking the wait
     let stdout_task = tokio::spawn(async move {
@@ -1338,7 +1386,12 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
-                Ok(_) => info!("[packer] {}", line.trim_end()),
+                Ok(_) => {
+                    info!("[packer] {}", line.trim_end());
+                    if let Some(uuid) = parse_created_instance(&line) {
+                        *instance_seen.lock().unwrap() = Some(uuid);
+                    }
+                }
                 Err(e) => {
                     error!("packer stdout read error: {}", e);
                     break;
@@ -1371,7 +1424,7 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
     match build_result {
         Ok(Ok(exit)) if exit.success() => {
             info!("Packer build finished in {:?}", start.elapsed());
-            Ok(())
+            Ok(instance.lock().unwrap().clone())
         }
         Ok(Ok(exit)) => {
             bail!("Packer build failed (exit code: {:?})", exit.code());
@@ -1403,6 +1456,169 @@ async fn run_packer(build_dir: &Path) -> Result<()> {
             bail!("Packer build timed out after {:?}", PACKER_TIMEOUT);
         }
     }
+}
+
+/// Packer prints `Created instance '<uuid>'`, wrapped in ANSI colour codes.
+fn parse_created_instance(line: &str) -> Option<String> {
+    let rest = line.split("Created instance '").nth(1)?;
+    let uuid = rest.split('\'').next()?;
+    (uuid.len() == 36 && uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .then(|| uuid.to_string())
+}
+
+/// One XAPI JSON-RPC call; XAPI answers errors inside a 200 response.
+async fn xapi_call(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let body = serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1});
+    let reply: serde_json::Value = client
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("XAPI {} request failed", method))?
+        .json()
+        .await
+        .with_context(|| format!("XAPI {} reply unreadable", method))?;
+    if let Some(err) = reply.get("error").filter(|e| !e.is_null()) {
+        bail!("XAPI {} failed: {}", method, err);
+    }
+    Ok(reply.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// ISO file name without ".iso", e.g. "AlmaLinux-9-latest-x86_64-minimal".
+fn iso_stem(iso_url: &str) -> &str {
+    let path = iso_url.split(['?', '#']).next().unwrap_or(iso_url);
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.strip_suffix(".iso").unwrap_or(file)
+}
+
+/// ISO disk name on the build host, keyed on the checksum: Packer reuses it until the ISO changes.
+fn iso_vdi_name(iso_url: &str, checksum: &str) -> String {
+    let hex = checksum.rsplit(':').next().unwrap_or(checksum);
+    format!("{}-{}.iso", iso_stem(iso_url), &hex[..12.min(hex.len())])
+}
+
+/// An older, detached ISO upload of the same image (plugin marker temp=temp), not the current one.
+fn is_stale_iso_upload(record: &serde_json::Value, stem: &str, current: &str) -> bool {
+    let name = record["name_label"].as_str().unwrap_or("");
+    let family = name == format!("{stem}.iso")
+        || (name.starts_with(&format!("{stem}-")) && name.ends_with(".iso"));
+    let temp = record["other_config"]["temp"].as_str() == Some("temp");
+    let detached = record["VBDs"].as_array().is_some_and(|v| v.is_empty());
+    family && temp && detached && name != current
+}
+
+/// Logs in to the build host's XAPI; returns the client, the JSON-RPC URL and the session.
+async fn xapi_login(config: &BuildConfig) -> Result<(reqwest::Client, String, String)> {
+    // XCP-ng hosts use a self-signed certificate, as Packer's own XAPI client accepts.
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(60))
+        .build()?;
+    let url = format!("https://{}/jsonrpc", config.xcpng_ip);
+    let session = xapi_call(
+        &client,
+        &url,
+        "session.login_with_password",
+        serde_json::json!([config.xcpng_user, config.xcpng_password, "1.0", "xoa-vm-agent"]),
+    )
+    .await?;
+    let s = session.as_str().context("XAPI session is not a string")?.to_string();
+    Ok((client, url, s))
+}
+
+/// Before Packer: drop older detached ISO uploads, and reuse the checksum-named disk if present.
+async fn prepare_iso_vdi(config: &mut BuildConfig) -> Result<()> {
+    let (client, url, s) = xapi_login(config).await?;
+    let result = async {
+        let iso = iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum);
+        let stem = iso_stem(&config.almalinux_iso_url);
+        let records = xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
+        let mut removed = 0;
+        let mut current = 0;
+        for (vdi, record) in records.as_object().into_iter().flatten() {
+            if record["name_label"].as_str() == Some(iso.as_str()) {
+                current += 1;
+            } else if is_stale_iso_upload(record, stem, &iso) {
+                xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
+                removed += 1;
+            }
+        }
+        // The plugin refuses a name held by two disks, so only an unambiguous one is reused.
+        config.reuse_iso_vdi = current == 1;
+        info!(
+            "ISO disk {:?} on {}: {}; removed {} older upload(s)",
+            iso,
+            config.xcpng_ip,
+            if config.reuse_iso_vdi { "reused, no upload" } else { "absent, Packer uploads it" },
+            removed
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let _ = xapi_call(&client, &url, "session.logout", serde_json::json!([s])).await;
+    result
+}
+
+/// Destroys the Packer VM `uuid` and its disks, keeping the current ISO upload for the next build.
+async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
+    let (client, url, s) = xapi_login(config).await?;
+
+    let result = async {
+        let vm = xapi_call(&client, &url, "VM.get_by_uuid", serde_json::json!([s, uuid])).await?;
+        let mut vdis = Vec::new();
+        let vbds = xapi_call(&client, &url, "VM.get_VBDs", serde_json::json!([s, vm])).await?;
+        let iso = iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum);
+        for vbd in vbds.as_array().into_iter().flatten() {
+            let vdi = xapi_call(&client, &url, "VBD.get_VDI", serde_json::json!([s, vbd])).await?;
+            if vdi.as_str().is_some_and(|r| r != "OpaqueRef:NULL") {
+                let name = xapi_call(&client, &url, "VDI.get_name_label", serde_json::json!([s, vdi])).await?;
+                if name.as_str() != Some(iso.as_str()) {
+                    vdis.push(vdi);
+                }
+            }
+        }
+        // Already halted after the export; a failed shutdown only means that.
+        let _ = xapi_call(&client, &url, "VM.hard_shutdown", serde_json::json!([s, vm])).await;
+        xapi_call(&client, &url, "VM.destroy", serde_json::json!([s, vm])).await?;
+        for vdi in &vdis {
+            xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
+        }
+        info!("Removed build VM {} and {} disk(s) from {}", uuid, vdis.len(), config.xcpng_ip);
+
+        // A fresh upload carries the URL's file name; give it the checksum name so the next build reuses it.
+        if !config.reuse_iso_vdi {
+            let stem = iso_stem(&config.almalinux_iso_url);
+            let plain = format!("{}.iso", stem);
+            let records = xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
+            let named = |n: &str| {
+                records.as_object().into_iter().flatten()
+                    .filter(|(_, r)| r["name_label"].as_str() == Some(n))
+                    .map(|(v, r)| (v.clone(), r.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let uploads: Vec<_> = named(&plain)
+                .into_iter()
+                .filter(|(_, r)| r["other_config"]["temp"].as_str() == Some("temp"))
+                .filter(|(_, r)| r["VBDs"].as_array().is_some_and(|v| v.is_empty()))
+                .collect();
+            if uploads.len() == 1 && named(&iso).is_empty() {
+                xapi_call(&client, &url, "VDI.set_name_label", serde_json::json!([s, uploads[0].0, iso])).await?;
+                info!("Kept the uploaded ISO disk on {} as {:?} for the next build", config.xcpng_ip, iso);
+            } else {
+                warn!("Found {} fresh ISO upload(s) named {:?}; none renamed", uploads.len(), plain);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let _ = xapi_call(&client, &url, "session.logout", serde_json::json!([s])).await;
+    result
 }
 
 // ── PHASE 8: Locate XVA ───────────────────────────────────────────────────────
@@ -1487,11 +1703,12 @@ async fn create_github_release(
     name: &str,
     target_sha: &str,
     build_xoa_hl_sha: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     #[derive(serde::Deserialize)]
     struct ReleaseResp {
         upload_url: String,
         html_url: String,
+        assets_url: String,
     }
 
     // Check whether this exact tag already has a release (retry-safe)
@@ -1506,6 +1723,7 @@ async fn create_github_release(
                 return Ok((
                     r.upload_url.trim_end_matches("{?name,label}").to_string(),
                     r.html_url,
+                    r.assets_url,
                 ));
             }
         }
@@ -1549,13 +1767,17 @@ async fn create_github_release(
     Ok((
         release.upload_url.trim_end_matches("{?name,label}").to_string(),
         release.html_url,
+        release.assets_url,
     ))
 }
 
 /// Stream-upload `xva_path` to an existing GitHub Release upload URL.
+/// Uploads the XVA. If the release already holds one (a forced rebuild), the new file goes
+/// up under a temporary name, then replaces the old asset, so the download URL never breaks.
 async fn upload_asset(
     client: &reqwest::Client,
     upload_url: &str,
+    assets_url: &str,
     xva_path: &Path,
 ) -> Result<()> {
     let file_size = async_fs::metadata(xva_path)
@@ -1581,8 +1803,34 @@ async fn upload_asset(
 
     let stream = tokio_util::io::ReaderStream::new(file);
 
+    #[derive(serde::Deserialize)]
+    struct Asset {
+        id: u64,
+        name: String,
+        url: String,
+    }
+    let existing: Vec<Asset> = client
+        .get(assets_url)
+        .query(&[("per_page", "100")])
+        .send()
+        .await
+        .context("Failed to list release assets")?
+        .error_for_status()
+        .context("Failed to list release assets")?
+        .json()
+        .await
+        .context("Failed to parse release assets")?;
+    let temp_name = format!("{}.new", file_name);
+    let old = existing.iter().find(|a| a.name == file_name);
+    // A leftover from an interrupted replacement would block the temporary name.
+    if let Some(stale) = existing.iter().find(|a| a.name == temp_name) {
+        client.delete(&stale.url).send().await?.error_for_status()
+            .with_context(|| format!("Failed to delete stale asset {} ({})", stale.name, stale.id))?;
+    }
+    let upload_name = if old.is_some() { temp_name.as_str() } else { file_name.as_str() };
+
     let res = client
-        .post(&format!("{}?name={}", upload_url, file_name))
+        .post(&format!("{}?name={}", upload_url, upload_name))
         .header("Content-Type", "application/octet-stream")
         .header("Content-Length", file_size)
         .body(reqwest::Body::wrap_stream(stream))
@@ -1594,6 +1842,20 @@ async fn upload_asset(
         let code = res.status();
         let body = res.text().await.unwrap_or_default();
         bail!("GitHub asset upload failed ({}): {}", code, body);
+    }
+
+    if let Some(old) = old {
+        let new: Asset = res.json().await.context("Failed to parse the uploaded asset")?;
+        client.delete(&old.url).send().await?.error_for_status()
+            .with_context(|| format!("Failed to delete the previous {} ({})", old.name, old.id))?;
+        client
+            .patch(&new.url)
+            .json(&serde_json::json!({ "name": file_name }))
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("Failed to rename {} to {}", new.name, file_name))?;
+        info!("Replaced the previous {} (asset {}) with asset {}", file_name, old.id, new.id);
     }
 
     info!("XVA uploaded successfully");
@@ -1828,9 +2090,105 @@ VM_MEMORY_MB="4096"
         assert_eq!(config.vm_name, d.vm_name);
         assert_eq!(config.vm_disk_size_mb, d.vm_disk_size_mb);
         assert_eq!(config.vm_memory_mb, d.vm_memory_mb);
+        assert_eq!(config.min_free_disk_gb, d.min_free_disk_gb);
         assert_eq!(config.almalinux_iso_url, d.almalinux_iso_url);
         assert_eq!(config.xe_guest_utilities_url, d.xe_guest_utilities_url);
         assert_eq!(config.xe_guest_utilities_xenstore_url, d.xe_guest_utilities_xenstore_url);
+    }
+
+    #[test]
+    fn build_config_min_free_disk_overrides_default() {
+        let mut config = BuildConfig::default();
+        assert_eq!(config.min_free_disk_gb, DEFAULT_MIN_FREE_DISK_GB);
+        apply_build_config(&mut config, "MIN_FREE_DISK_GB=20\n").unwrap();
+        assert_eq!(config.min_free_disk_gb, 20);
+        assert!(apply_build_config(&mut config, "MIN_FREE_DISK_GB=-1\n").is_err());
+    }
+
+    #[test]
+    fn build_config_load_from_missing_path_uses_defaults() {
+        let config = BuildConfig::load_from("/nonexistent/xoa-build.config").unwrap();
+        assert_eq!(config.xcpng_ip, BuildConfig::default().xcpng_ip);
+    }
+
+    #[test]
+    fn packer_template_keeps_vm_for_the_agent_to_remove() {
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
+        assert_eq!(json["builders"][0]["keep_vm"], "always");
+    }
+
+    #[test]
+    fn awkward_passwords_survive_template_and_kickstart() {
+        let mut config = BuildConfig::default();
+        config.almalinux_root_password = r#"a#b'c"d\e f"#.to_string();
+        config.xcpng_password = r#"x"y\z"#.to_string();
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&config)).unwrap();
+        assert_eq!(json["builders"][0]["ssh_password"], config.almalinux_root_password.as_str());
+        assert_eq!(json["builders"][0]["remote_password"], config.xcpng_password.as_str());
+
+        let ks = generate_kickstart(&config).unwrap();
+        let line = ks.lines().find(|l| l.starts_with("rootpw ")).unwrap();
+        let hash = line.rsplit(' ').next().unwrap();
+        assert!(line.starts_with("rootpw --iscrypted --allow-ssh $6$"));
+        assert!(!ks.contains(&config.almalinux_root_password));
+        assert!(sha_crypt::sha512_check(&config.almalinux_root_password, hash).is_ok());
+    }
+
+    #[test]
+    fn iso_vdi_name_changes_with_the_checksum() {
+        let a = iso_vdi_name(ALMALINUX_ISO_URL, "sha256:7762a4b45a66235726db");
+        assert_eq!(a, "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso");
+        assert_ne!(a, iso_vdi_name(ALMALINUX_ISO_URL, "sha256:0123456789abcdef"));
+        assert_eq!(iso_vdi_name("https://h/x/a.iso?checksum=x", "sha256:ab"), "a-ab.iso");
+    }
+
+    #[test]
+    fn packer_template_names_the_iso_disk_only_when_reused() {
+        let mut config = BuildConfig::default();
+        config.almalinux_iso_checksum = "sha256:7762a4b45a66235726db".to_string();
+        let upload: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&config)).unwrap();
+        assert!(upload["builders"][0].get("iso_name").is_none());
+        assert_eq!(upload["builders"][0]["iso_url"], ALMALINUX_ISO_URL);
+
+        config.reuse_iso_vdi = true;
+        let reuse: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&config)).unwrap();
+        assert_eq!(reuse["builders"][0]["iso_name"], "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso");
+    }
+
+    #[test]
+    fn only_older_detached_uploads_are_stale() {
+        let stem = "AlmaLinux-9-latest-x86_64-minimal";
+        let current = "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso";
+        let rec = |name: &str, temp: bool, vbds: &[&str]| {
+            serde_json::json!({
+                "name_label": name,
+                "other_config": if temp { serde_json::json!({"temp": "temp"}) } else { serde_json::json!({}) },
+                "VBDs": vbds,
+            })
+        };
+        // Older checksum and the pre-checksum name, detached: stale.
+        assert!(is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal-0123456789ab.iso", true, &[]), stem, current));
+        assert!(is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal.iso", true, &[]), stem, current));
+        // Current ISO, a kept failed build's attached ISO, a user's own disk, another image: kept.
+        assert!(!is_stale_iso_upload(&rec(current, true, &[]), stem, current));
+        assert!(!is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal-0123456789ab.iso", true, &["OpaqueRef:1"]), stem, current));
+        assert!(!is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal.iso", false, &[]), stem, current));
+        assert!(!is_stale_iso_upload(&rec("Rocky-9-minimal.iso", true, &[]), stem, current));
+    }
+
+    #[test]
+    fn created_instance_uuid_is_read_through_colour_codes() {
+        let line = "\x1b[1;32m==> xenserver-iso: Created instance '0b5c7d1e-2f3a-4b6c-8d9e-0f1a2b3c4d5e'\x1b[0m\n";
+        assert_eq!(
+            parse_created_instance(line).as_deref(),
+            Some("0b5c7d1e-2f3a-4b6c-8d9e-0f1a2b3c4d5e")
+        );
+        assert_eq!(parse_created_instance("==> xenserver-iso: Destroying VM"), None);
+        assert_eq!(parse_created_instance("Created instance 'not-a-uuid'"), None);
     }
 
     #[test]

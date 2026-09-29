@@ -2,6 +2,110 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-09-28 (xcp-orchestrator-v0.3.2)
+
+### Fixed
+
+- **xoa-vm-agent**: v0.3.1 always set Packer's `iso_name`, but the xenserver
+  plugin treats `iso_name` as "the ISO is already on the host": it skips the
+  download and upload and halts when no such disk exists, so any build with
+  no reusable disk failed at once. The agent now checks the build host
+  through XAPI before Packer: it removes older detached uploads (including
+  the plain-named one), sets `iso_name` only when the checksum-named disk
+  exists, and otherwise lets Packer download and upload, then renames that
+  upload to the checksum name after a successful build. The ISO is uploaded
+  once per AlmaLinux release.
+- **xoa-vm-agent**: a `--force` rebuild on a day that already had an image
+  reused that day's release and then failed its upload, because GitHub
+  refuses a second asset named `XOA-hl.xva`. The new XVA now goes up as
+  `XOA-hl.xva.new`, the previous asset is deleted, and the new one is renamed,
+  so the release keeps one `XOA-hl.xva` and its download URL throughout.
+
+### Removed
+
+- **orchestrator, orchestrator-api, orchestratorhost** (xcp-hl#77): both
+  agents run under Jenkins, which provides status, history and manual runs.
+  Removed the `orchestrator` aggregator (dashboard `build_report.html`,
+  run history, Ollama diagnostics of failed runs), the `orchestrator-api`
+  trigger service on `0.0.0.0:8787`, the systemd units, `deploy.sh` (which
+  wrote the plaintext `/etc/xcp-hl-credentials/`), `force-run.sh`, and the
+  `orchestratorhost/` VM builder. From `shared`: the `ollama` module,
+  `extract_failed_log_context`, `PipelineStatus`, `get_badge_class` and the
+  dashboard and Ollama constants. The agents are unchanged.
+
+## 2026-09-28 (xcp-orchestrator-v0.3.1)
+
+### Fixed
+
+- **xoa-vm-agent**: the AlmaLinux ISO disk on the build host is now named
+  after its checksum (`iso_name`, e.g.
+  `AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso`). Packer reuses a disk
+  of that exact name without uploading, so an unchanged ISO is uploaded once
+  and reused by every later build; a new AlmaLinux release gets a new name and
+  is uploaded once. The disk used to be named after the URL only, so a newer
+  "latest" would have kept reusing the old disk. After a successful build the
+  agent removes older detached uploads of the same ISO (plugin marker
+  `other_config temp=temp`, no VBD) and keeps the current one; a kept failed
+  build's ISO is still attached, so it stays.
+
+## 2026-09-28 (xcp-orchestrator-v0.3.0)
+
+### Fixed
+
+- **xoa-vm-agent**: the kickstart set the root password with an unquoted
+  `rootpw --plaintext`, and the Packer template embedded passwords without
+  JSON escaping. Kickstart splits lines like a shell, so a password holding
+  `#`, quotes, backslashes or spaces was silently changed and Packer never got
+  in over SSH. The kickstart now carries a SHA-512 crypt hash
+  (`rootpw --iscrypted --allow-ssh`), and template values are JSON-encoded.
+
+### Changed
+
+- **xoa-vm-agent**: can run under Jenkins (Vagrantin/xcp-hl#76).
+  `XCPNG_PASSWORD` and `ALMALINUX_ROOT_PASSWORD` go through `load_credential`
+  like the GitHub token, so they come from systemd credentials or from a
+  resolved environment variable. `XOA_BUILD_CONFIG` points at another
+  build.config, and the new `MIN_FREE_DISK_GB` key replaces the hardcoded
+  100 GB free-space check (default unchanged). The build config is now read
+  before any tag is pushed.
+- **xoa-vm-agent**: a successful build now removes its VM and disks (the
+  uploaded AlmaLinux ISO included) from the XCP-ng host through XAPI; a failed
+  build still leaves them for inspection. Packer keeps `keep_vm: always`,
+  because the xenserver plugin ignores `-on-error` and would otherwise clean
+  up failures too. The VM is identified by the uuid Packer reports, so VMs
+  left by earlier failed runs are never touched.
+
+## 2026-09-28
+
+### Fixed
+
+- **iso-agent**: after a tag collision, `create_and_push_tag` moves on to
+  the next free tag, but the agent still recorded the counter it *asked*
+  for. The ISO state ended up at `ce_counter: 21` with `last_tag:
+  v8.3-ce38`, so every later build first walked through about 17 existing
+  tags (and would stop at the 99-attempt cap). The counter is now read back
+  from the tag actually pushed, for the ISO, xolite-ce and xoa-proxy alike.
+- **shared / iso-agent / xoa-vm-agent**: `locate_tag_triggered_run` listed the
+  latest push runs of *every* workflow in the repo and took the first one whose
+  branch matched the tag. Since `secret-scan` also runs on every tag push and
+  finishes in seconds, it could be picked instead of the RPM build: iso-agent
+  then saw "success" and dispatched the ISO build while the xolite-ce RPM was
+  still building, so `v8.3-ce37` failed at "Fetch community xo-lite RPM" (the
+  ISO was dispatched at 19:01:11, the release published at 19:02:27). The
+  lookup now takes the workflow file and only lists that workflow's runs
+  (`build-xolite-ce.yml`, `xoa-proxy.yml`, `build-xoa.yml`).
+
+### Added
+
+- **shared**: `load_credential` falls back to an environment variable of the
+  same name when `CREDENTIALS_DIRECTORY` is not set, so Jenkins can inject
+  vault-resolved secrets. An unresolved `pass://` reference is rejected rather
+  than used as a secret. The systemd path is unchanged, so rolling back to the
+  timers needs no rebuild.
+- **CI**: `.github/workflows/xcp-orchestrator.yml` tests every change and, on
+  `xcp-orchestrator-v*` tags, publishes static x86_64 musl builds of
+  `iso-agent` and `xoa-vm-agent` with sha256 files. Jenkins pins one.
+
 ## 2026-08-18
 
 ### Changed

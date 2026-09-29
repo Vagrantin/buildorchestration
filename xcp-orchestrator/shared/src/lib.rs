@@ -1,18 +1,16 @@
-//! Shared types, utilities, and helpers for XCP-HL Orchestrator and its agents.
+//! Shared types, utilities, and helpers for the XCP-HL build agents (iso-agent, xoa-vm-agent).
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration;
 use thiserror::Error;
 
 pub mod github;
-pub mod ollama;
 pub mod status;
 pub mod storage;
 pub mod util;
 pub mod version_state;
 pub use github::*;
-pub use ollama::*;
 pub use status::*;
 pub use util::*;
 pub use version_state::*;
@@ -36,18 +34,6 @@ pub const XCPNG_TARGET_VERSION: &str = "8.3";
 
 /// Base directory for all orchestrator state files
 pub const STATE_DIR: &str = "/var/lib/xcp-hl-orchestrator";
-
-/// History file path
-pub const HISTORY_FILE: &str = "/var/lib/xcp-hl-orchestrator/history.json";
-
-/// Ollama API endpoint
-pub const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
-
-/// Ollama model for diagnostics
-pub const MODEL_NAME: &str = "qwen3-coder:30b";
-
-/// Dashboard output directory
-pub const TARGET_REPORT_DIR: &str = "/var/www/html/orchestrator";
 
 // ── Error Types ────────────────────────────────────────────────────────────
 

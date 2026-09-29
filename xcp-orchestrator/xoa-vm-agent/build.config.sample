@@ -1,14 +1,13 @@
 # ==========================================================
-#  xoa-vm-agent — Infrastructure & Target VM Configuration
+#  xoa-vm-agent: Infrastructure & Target VM Configuration
 # ==========================================================
-# Deployed by deploy.sh to /etc/xcp-orchestrator/build.config
-# (only if missing — an existing file is never overwritten).
-# Edit the deployed copy to match your infrastructure; the agent
-# falls back to these baked-in defaults when the file is absent.
+# Read from the path in XOA_BUILD_CONFIG, else
+# /etc/xcp-orchestrator/build.config. The Jenkins job renders its own
+# per run (jenkins-infra/agent/xoa-image-build.sh); the agent falls back
+# to these baked-in defaults when no file is found.
 #
-# NO SECRETS HERE. Passwords are loaded exclusively via systemd
-# LoadCredential= from /etc/xcp-hl-credentials/ (github_token,
-# xcpng_password, almalinux_root_password).
+# NO SECRETS HERE. XCPNG_PASSWORD and ALMALINUX_ROOT_PASSWORD come from
+# resolved environment variables (Jenkins) or systemd credentials.
 
 # XCP-ng Hypervisor Connection
 XCPNG_IP="192.168.1.10"
@@ -20,6 +19,9 @@ VM_NETWORK_NAME="Pool-wide network associated with eth0"
 VM_NAME="XOA-hl"
 VM_DISK_SIZE_MB=10000
 VM_MEMORY_MB=2048
+
+# Free space required under /var/lib/xcp-hl-orchestrator before a build
+MIN_FREE_DISK_GB=100
 
 # Installation Media (AlmaLinux 9 minimal)
 ALMALINUX_ISO_URL="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"

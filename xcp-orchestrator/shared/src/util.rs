@@ -5,15 +5,12 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
-/// Load a named credential from the systemd credentials directory
-/// (`$CREDENTIALS_DIRECTORY/<name>`, as written by a unit's `LoadCredential=`).
+/// Load a named credential: from `$CREDENTIALS_DIRECTORY/<name>` under systemd
+/// `LoadCredential=`, otherwise from the environment variable `<name>` (Jenkins).
 pub fn load_credential(name: &str) -> Result<String, OrchestratorError> {
-    let creds_dir = std::env::var("CREDENTIALS_DIRECTORY").map_err(|_| {
-        OrchestratorError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "CREDENTIALS_DIRECTORY is not set — configure systemd LoadCredential=",
-        ))
-    })?;
+    let Ok(creds_dir) = std::env::var("CREDENTIALS_DIRECTORY") else {
+        return credential_from_env(name, std::env::var(name).ok());
+    };
 
     let path = Path::new(&creds_dir).join(name);
     let value = fs::read_to_string(&path).map_err(|e| {
@@ -34,10 +31,21 @@ pub fn load_credential(name: &str) -> Result<String, OrchestratorError> {
     Ok(value)
 }
 
-/// Load GitHub token from systemd credential directory.
-///
-/// Reads `$CREDENTIALS_DIRECTORY/GITHUB_TOKEN` as written by:
-///   `LoadCredential=GITHUB_TOKEN:/etc/xcp-hl-credentials/github_token`
+/// Jenkins resolves vault references into the environment; an unresolved one must never pass as a token.
+fn credential_from_env(name: &str, value: Option<String>) -> Result<String, OrchestratorError> {
+    let value = value.map(|v| v.trim().to_string()).unwrap_or_default();
+    if value.is_empty() || value.starts_with("pass://") {
+        return Err(OrchestratorError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "{name} is not available: set CREDENTIALS_DIRECTORY (systemd) or a resolved {name} environment variable (Jenkins)"
+            ),
+        )));
+    }
+    Ok(value)
+}
+
+/// Load the GitHub token: systemd `LoadCredential=GITHUB_TOKEN:...`, or `GITHUB_TOKEN` from Jenkins.
 pub fn load_github_token() -> Result<String, OrchestratorError> {
     load_credential("GITHUB_TOKEN")
 }
@@ -77,5 +85,22 @@ pub fn load_json_with_default<T: serde::de::DeserializeOwned + Default>(
         Ok(serde_json::from_str(&content).unwrap_or_default())
     } else {
         Ok(T::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_credential_is_trimmed() {
+        assert_eq!(credential_from_env("GITHUB_TOKEN", Some(" ghp_x\n".into())).unwrap(), "ghp_x");
+    }
+
+    #[test]
+    fn missing_empty_or_unresolved_env_credential_is_an_error() {
+        assert!(credential_from_env("GITHUB_TOKEN", None).is_err());
+        assert!(credential_from_env("GITHUB_TOKEN", Some("  ".into())).is_err());
+        assert!(credential_from_env("GITHUB_TOKEN", Some("pass://xcp-hl-prod/github_token/password".into())).is_err());
     }
 }

@@ -30,6 +30,9 @@ use tracing::{info, warn, debug};
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const STATUS_FILE: &str = "/var/lib/xcp-hl-orchestrator/xcp-iso-agent.status.json";
+/// The RPM build each component tag push starts; the one to wait on.
+const XOLITE_WORKFLOW: &str = "build-xolite-ce.yml";
+const XOA_PROXY_WORKFLOW: &str = "xoa-proxy.yml";
 const VERSION_STATE_FILE: &str = "/var/lib/xcp-hl-orchestrator/iso_agent_version_state.json";
 
 /// FIX #13: hard cap on the component (xolite-ce + xoa-proxy) monitoring loop.
@@ -84,6 +87,14 @@ enum BumpDecision {
 /// Whether xcp-ng-ce-iso needs a new build: either component advanced, the
 /// target base version changed, or the ISO repo's own HEAD moved since the
 /// last build (a commit with no accompanying component release).
+/// Counter of the tag actually pushed: on a collision, create_and_push_tag moves past the requested one.
+fn issued_counter(actual_tag: &str, requested: u32) -> u32 {
+    parse_ce_tag(actual_tag)
+        .map(|(_, counter)| counter)
+        .or_else(|| parse_plain_version_tag(actual_tag).map(|(_, counter)| counter))
+        .unwrap_or(requested)
+}
+
 fn needs_iso_build(
     force: bool,
     state: &IsoVersionState,
@@ -308,8 +319,9 @@ async fn main() -> Result<(), OrchestratorError> {
             version_state.xolite_ce.ce_counter = 1;
             let actual_tag =
                 create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
+            version_state.xolite_ce.ce_counter = issued_counter(&actual_tag, version_state.xolite_ce.ce_counter);
             let (id, url) =
-                locate_tag_triggered_run(&client, "xolite-ce", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xolite-ce", XOLITE_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xolite_id = Some(id);
             xolite_url = url;
@@ -322,8 +334,9 @@ async fn main() -> Result<(), OrchestratorError> {
             version_state.xolite_ce.ce_counter = next_counter;
             let actual_tag =
                 create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
+            version_state.xolite_ce.ce_counter = issued_counter(&actual_tag, version_state.xolite_ce.ce_counter);
             let (id, url) =
-                locate_tag_triggered_run(&client, "xolite-ce", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xolite-ce", XOLITE_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xolite_id = Some(id);
             xolite_url = url;
@@ -361,8 +374,9 @@ async fn main() -> Result<(), OrchestratorError> {
             version_state.xoa_proxy.ce_counter = 1;
             let actual_tag =
                 create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
+            version_state.xoa_proxy.ce_counter = issued_counter(&actual_tag, version_state.xoa_proxy.ce_counter);
             let (id, url) =
-                locate_tag_triggered_run(&client, "xoa-proxy", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xoa-proxy", XOA_PROXY_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xoa_id = Some(id);
             xoa_url = url;
@@ -375,8 +389,9 @@ async fn main() -> Result<(), OrchestratorError> {
             version_state.xoa_proxy.ce_counter = next_counter;
             let actual_tag =
                 create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
+            version_state.xoa_proxy.ce_counter = issued_counter(&actual_tag, version_state.xoa_proxy.ce_counter);
             let (id, url) =
-                locate_tag_triggered_run(&client, "xoa-proxy", &actual_tag, trigger_time)
+                locate_tag_triggered_run(&client, "xoa-proxy", XOA_PROXY_WORKFLOW, &actual_tag, trigger_time)
                     .await?;
             xoa_id = Some(id);
             xoa_url = url;
@@ -719,7 +734,7 @@ async fn main() -> Result<(), OrchestratorError> {
 
             if iso_final_status == WorkflowStatus::Success {
                 version_state.iso.xcpng_version = XCPNG_TARGET_VERSION.to_string();
-                version_state.iso.ce_counter = next_counter;
+                version_state.iso.ce_counter = issued_counter(&actual_iso_tag, next_counter);
                 version_state.iso.last_tag = actual_iso_tag.clone();
                 version_state.iso.last_xolite_tag = xolite_version.clone();
                 version_state.iso.last_xoa_proxy_tag = xoa_proxy_version.clone();
@@ -759,6 +774,15 @@ async fn main() -> Result<(), OrchestratorError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issued_counter_follows_the_tag_actually_pushed() {
+        // ce22 requested, ce38 pushed after collisions: the state must say 38.
+        assert_eq!(super::issued_counter("v8.3-ce38", 22), 38);
+        assert_eq!(super::issued_counter("v0.21.0-ce25", 25), 25);
+        assert_eq!(super::issued_counter("v0.1.1.14", 13), 14);
+        assert_eq!(super::issued_counter("not-a-tag", 7), 7);
+    }
+
     use super::*;
 
     fn built_state() -> IsoVersionState {
