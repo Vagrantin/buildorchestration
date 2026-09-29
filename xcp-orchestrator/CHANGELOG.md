@@ -2,6 +2,16 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- **iso-agent, xoa-vm-agent**: messages logged by the `shared` crate were
+  filtered out, so the "only non-build files changed" decision of v0.3.4
+  never showed in the Jenkins console, and iso-agent also hid `shared`
+  warnings such as tag retries. Both now log `shared` at info, and other
+  crates at warn.
+
 ## 2026-09-29 (xcp-orchestrator-v0.3.4)
 
 ### Changed

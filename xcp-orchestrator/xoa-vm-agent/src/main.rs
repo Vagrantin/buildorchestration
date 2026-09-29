@@ -414,7 +414,7 @@ async fn decide_rpm_bump(
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("xoa_vm_agent=info,warn")
+        .with_env_filter("xoa_vm_agent=info,shared=info,warn")
         .init();
 
     info!("Starting XOA VM Agent...");
