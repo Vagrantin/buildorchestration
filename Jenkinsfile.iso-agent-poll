@@ -3,9 +3,7 @@
 // xolite-ce/xoa-proxy/xcp-ng-ce-iso releases, reports what it sees,
 // dispatches and publishes nothing.
 //
-// Not yet run by a Test pipeline (xcp-hl#75) and not merged to main:
-// per xcp-hl#57 section 4.3, only Test re-proving this on prod-shaped
-// hardware clears it for that. Tracked in xcp-hl#72.
+// Test re-proves it before merge: jenkins-infra job iso-agent-poll-test, BRANCH=<branch>.
 pipeline {
   agent { label 'test' }
   options { timeout(time: 5, unit: 'MINUTES') }
