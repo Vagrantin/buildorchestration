@@ -273,7 +273,7 @@ fn bump_check_failure_detail(checks: &[(&str, Option<OrchestratorError>)]) -> St
 #[tokio::main]
 async fn main() -> Result<(), OrchestratorError> {
     tracing_subscriber::fmt()
-        .with_env_filter("iso_agent=info")
+        .with_env_filter("iso_agent=info,shared=info,warn")
         .init();
 
     info!("Starting ISO Agent...");
