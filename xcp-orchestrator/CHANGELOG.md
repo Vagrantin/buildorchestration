@@ -2,6 +2,26 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+### Changed
+
+- **iso-agent, xoa-vm-agent**: a new commit on `main` no longer releases by
+  itself when it touches only non-build files: `AGENTS.md`, `README.md`,
+  `CLAUDE.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
+  `LICENSE`, `docs/`, and GitHub issue and PR templates. The agents compare
+  the last built commit with `main` through GitHub's compare API; any other
+  file, a truncated or failed comparison, or an empty state still counts as
+  a change. On 2026-09-29 an `AGENTS.md`-only merge in five repos had
+  produced component, RPM and image releases.
+
+### Fixed
+
+- **iso-agent**: when the ISO workflow dispatch fails, the tag pushed just
+  before it is deleted again, so a failure no longer leaves a release-less
+  `-ceN` tag (and the next run no longer skips a number). On 2026-09-29 a
+  403 on the dispatch had left `v8.3-ce39` behind.
+
 ## 2026-09-29 (xcp-orchestrator-v0.3.3)
 
 ### Changed
