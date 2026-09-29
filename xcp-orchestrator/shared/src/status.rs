@@ -66,7 +66,7 @@ pub struct AgentStatus {
     pub detail: String,
     /// Timestamp of the last status update
     pub timestamp: DateTime<Utc>,
-    /// Per-component statuses — the dashboard links each entry's URL as "Logs"
+    /// Per-component statuses, each with a link to its release or run
     #[serde(default)]
     pub components: Vec<ComponentStatus>,
 }
@@ -122,18 +122,6 @@ impl AgentStatus {
 
         tracing::debug!("Wrote status to {}", path.display());
         Ok(())
-    }
-
-    /// Load status from a JSON file
-    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Option<Self>, OrchestratorError> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let content = std::fs::read_to_string(path)?;
-        let status: AgentStatus = serde_json::from_str(&content)?;
-        Ok(Some(status))
     }
 }
 

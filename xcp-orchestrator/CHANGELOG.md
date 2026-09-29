@@ -2,6 +2,15 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+### Removed
+
+- **shared**: leftovers of the retired aggregator (xcp-hl#77): the unused
+  `storage` module, `OllamaError` and `HeaderValueError`, `STATE_DIR`,
+  `GHJob`/`GHJobsResponse`, `util::load_json_with_default` and
+  `AgentStatus::load_from_file`. Stale "dashboard" comments reworded.
+
 ## 2026-09-28 (xcp-orchestrator-v0.3.2)
 
 ### Fixed
