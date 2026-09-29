@@ -88,6 +88,97 @@ pub async fn fetch_repo_head_sha(client: &Client, repo: &str) -> Result<String, 
     Ok(resp.sha)
 }
 
+/// Repo files that never feed a build: a commit touching only these is not a reason to release.
+/// Deliberately narrow; a packaged file such as a CHANGELOG.md must still trigger.
+pub fn is_non_build_path(path: &str) -> bool {
+    const ROOT_FILES: [&str; 7] = [
+        "AGENTS.md", "README.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md",
+        "CODE_OF_CONDUCT.md", "LICENSE",
+    ];
+    ROOT_FILES.contains(&path)
+        || path.starts_with("docs/")
+        || path.starts_with(".github/ISSUE_TEMPLATE/")
+        || path.eq_ignore_ascii_case(".github/pull_request_template.md")
+}
+
+/// Files changed between two commits, or `None` when GitHub cannot give the full list.
+pub async fn fetch_changed_files(
+    client: &Client,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> Result<Option<Vec<String>>, OrchestratorError> {
+    #[derive(Deserialize)]
+    struct File {
+        filename: String,
+    }
+    #[derive(Deserialize)]
+    struct Compare {
+        status: String,
+        total_commits: u64,
+        #[serde(default)]
+        files: Vec<File>,
+    }
+    let ctx = format!("fetch_changed_files for {} {}...{}", repo, base, head);
+    let url = format!("https://api.github.com/repos/{}/{}/compare/{}...{}", OWNER, repo, base, head);
+    let cmp: Compare = parse_github_response(
+        client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::GitHubApi(ctx.clone(), e.to_string()))?,
+        &ctx,
+    )
+    .await?;
+    // GitHub lists at most 300 files; a rewritten history is not a plain "ahead" either.
+    if cmp.status != "ahead" || cmp.total_commits == 0 || cmp.files.is_empty() || cmp.files.len() >= 300 {
+        return Ok(None);
+    }
+    Ok(Some(cmp.files.into_iter().map(|f| f.filename).collect()))
+}
+
+/// True only when `head` differs from `base` by non-build files alone (`is_non_build_path`).
+/// Any doubt (empty base, API error, truncated list) answers false, so the change counts.
+pub async fn only_non_build_changes(client: &Client, repo: &str, base: &str, head: &str) -> bool {
+    if base.is_empty() || base == head {
+        return false;
+    }
+    match fetch_changed_files(client, repo, base, head).await {
+        Ok(Some(files)) if files.iter().all(|f| is_non_build_path(f)) => {
+            tracing::info!(
+                "{}: only non-build files changed since {} ({}), not a reason to release",
+                repo,
+                &base[..base.len().min(7)],
+                files.join(", ")
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            tracing::warn!("{}: could not list changes since {} ({}); treating as a change", repo, base, e);
+            false
+        }
+    }
+}
+
+/// Delete a tag, used to roll back a tag whose build could not be started.
+pub async fn delete_tag(client: &Client, repo: &str, tag: &str) -> Result<(), OrchestratorError> {
+    let ctx = format!("delete_tag {} on {}", tag, repo);
+    let url = format!("https://api.github.com/repos/{}/{}/git/refs/tags/{}", OWNER, repo, tag);
+    let res = client
+        .delete(&url)
+        .send()
+        .await
+        .map_err(|e| OrchestratorError::GitHubApi(ctx.clone(), e.to_string()))?;
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        Err(OrchestratorError::GitHubApi(ctx, format!("{}: {}", status, body)))
+    }
+}
+
 /// Create and push a tag to a repository
 pub async fn create_and_push_tag(
     client: &Client,
@@ -354,6 +445,17 @@ fn next_tag_candidate(tag: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_build_paths_are_narrow() {
+        use super::is_non_build_path;
+        for p in ["AGENTS.md", "README.md", "LICENSE", "docs/automatic-updates.md", ".github/ISSUE_TEMPLATE/bug.yml", ".github/pull_request_template.md"] {
+            assert!(is_non_build_path(p), "{p} should not trigger a release");
+        }
+        for p in ["CHANGELOG.md", "SPECS/xoa-hl.spec", "pages/README.md", ".github/workflows/build.yml", "src/main.rs", "UPSTREAM_TAG", "LICENSE.md", "sub/AGENTS.md"] {
+            assert!(!is_non_build_path(p), "{p} must trigger a release");
+        }
+    }
+
     use super::{
         next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag,
         parse_upstream_xo, split_leading_comments, workflow_push_runs_url, ReleaseInfo,

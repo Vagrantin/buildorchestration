@@ -23,7 +23,7 @@ use shared::{
     create_github_client, load_credential, load_github_token,
     create_and_push_tag, fetch_release_by_tag, fetch_repo_head_sha, fetch_releases,
     fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, ReleaseInfo,
-    locate_tag_triggered_run, parse_ce_tag, query_run_conclusion,
+    locate_tag_triggered_run, only_non_build_changes, parse_ce_tag, query_run_conclusion,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -369,8 +369,9 @@ async fn decide_rpm_bump(
     info!("xoa-hl: upstream pin {} resolves to version {}", pin.xo_version, version);
 
     if version == state.upstream_version
-        && head_sha == state.last_built_sha
         && !state.last_tag.is_empty()
+        && (head_sha == state.last_built_sha
+            || only_non_build_changes(client, "xoa-hl", &state.last_built_sha, head_sha).await)
     {
         return Ok(RpmBump::NoChange { tag: state.last_tag.clone() });
     }
@@ -465,10 +466,21 @@ async fn main() -> Result<()> {
     // unchanged xoa-hl code: the workflow's RPM release and this agent's XVA
     // image release are separate artefacts, and the image is the one this
     // agent exists to ship.
+    // Commits touching only non-build files (AGENTS.md, docs/...) do not call for a new image.
+    let xoa_hl_unchanged = repo_head_sha == version_state.image_xoa_hl_sha
+        || only_non_build_changes(&client, "xoa-hl", &version_state.image_xoa_hl_sha, &repo_head_sha).await;
+    let build_xoa_hl_unchanged = build_xoa_hl_head_sha == version_state.image_build_xoa_hl_sha
+        || only_non_build_changes(
+            &client,
+            "build-xoa-hl",
+            &version_state.image_build_xoa_hl_sha,
+            &build_xoa_hl_head_sha,
+        )
+        .await;
     if !force
         && !version_state.image_xoa_hl_sha.is_empty()
-        && repo_head_sha == version_state.image_xoa_hl_sha
-        && build_xoa_hl_head_sha == version_state.image_build_xoa_hl_sha
+        && xoa_hl_unchanged
+        && build_xoa_hl_unchanged
         && version_state.image_tag.starts_with(IMAGE_TAG_PREFIX)
     {
         info!(

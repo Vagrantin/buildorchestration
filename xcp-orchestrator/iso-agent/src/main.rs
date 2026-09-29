@@ -18,7 +18,7 @@ use shared::{
     parse_ce_tag, parse_plain_version_tag,
     create_and_push_tag, dispatch_workflow, locate_tag_triggered_run,
     locate_dispatch_triggered_run, query_run_conclusion,
-    append_release_matrix_entry,
+    append_release_matrix_entry, delete_tag, only_non_build_changes,
     XCPNG_TARGET_VERSION,
 };
 use std::fs;
@@ -149,7 +149,11 @@ async fn decide_xoa_proxy_bump(
     let cargo_version = fetch_xoa_proxy_version(client).await?;
     let head_sha = fetch_repo_head_sha(client, "xoa-proxy").await?;
 
-    if !force && cargo_version == state.upstream_version && head_sha == state.last_built_sha {
+    if !force
+        && cargo_version == state.upstream_version
+        && (head_sha == state.last_built_sha
+            || only_non_build_changes(client, "xoa-proxy", &state.last_built_sha, &head_sha).await)
+    {
         return Ok(BumpDecision::NoChange);
     }
 
@@ -193,7 +197,11 @@ async fn decide_xolite_bump(
     let upstream_version = fetch_upstream_xolite_version(client, &upstream_tag).await?;
     let head_sha = fetch_repo_head_sha(client, "xolite-ce").await?;
 
-    if !force && upstream_version == state.upstream_version && head_sha == state.last_built_sha {
+    if !force
+        && upstream_version == state.upstream_version
+        && (head_sha == state.last_built_sha
+            || only_non_build_changes(client, "xolite-ce", &state.last_built_sha, &head_sha).await)
+    {
         return Ok(BumpDecision::NoChange);
     }
 
@@ -606,11 +614,24 @@ async fn main() -> Result<(), OrchestratorError> {
     }
 
     let iso_head_sha = fetch_repo_head_sha(&client, "xcp-ng-ce-iso").await?;
+    // A move of main that touches only non-build files (AGENTS.md, docs/...) compares as unchanged.
+    let iso_source_sha = if only_non_build_changes(
+        &client,
+        "xcp-ng-ce-iso",
+        &version_state.iso.last_built_sha,
+        &iso_head_sha,
+    )
+    .await
+    {
+        version_state.iso.last_built_sha.clone()
+    } else {
+        iso_head_sha.clone()
+    };
 
     if !needs_iso_build(
         force.iso,
         &version_state.iso,
-        &iso_head_sha,
+        &iso_source_sha,
         &xolite_version,
         &xoa_proxy_version,
     ) {
@@ -646,7 +667,7 @@ async fn main() -> Result<(), OrchestratorError> {
         // previously fetched `releases/latest`, which raced with the component
         // release publish and could bake a stale RPM into the ISO.
         let post_iso_trigger = Utc::now();
-        dispatch_workflow(
+        if let Err(e) = dispatch_workflow(
             &client,
             "xcp-ng-ce-iso",
             "build-iso.yml",
@@ -656,7 +677,15 @@ async fn main() -> Result<(), OrchestratorError> {
                 "xoa_proxy_tag": xoa_proxy_version,
             }),
         )
-        .await?;
+        .await
+        {
+            // No build started: remove the tag so it does not stay as a release-less gap.
+            match delete_tag(&client, "xcp-ng-ce-iso", &actual_iso_tag).await {
+                Ok(()) => warn!("ISO dispatch failed; removed tag {} so a later run can issue it", actual_iso_tag),
+                Err(d) => warn!("ISO dispatch failed and tag {} could not be removed ({}); delete it by hand", actual_iso_tag, d),
+            }
+            return Err(e);
+        }
         let (iso_id, iso_url) =
             locate_dispatch_triggered_run(&client, "xcp-ng-ce-iso", post_iso_trigger).await?;
         Ok((iso_id, iso_url, actual_iso_tag))
