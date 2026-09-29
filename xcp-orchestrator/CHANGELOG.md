@@ -2,6 +2,23 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-09-29 (xcp-orchestrator-v0.3.6)
+
+### Fixed
+
+- **xoa-vm-agent**: the agent now waits until no `xoa-hl` workflow run is
+  queued or in progress before deciding on an RPM bump, whoever started it.
+  Before, an RPM build in flight could be missed and a duplicate tag pushed
+  (Vagrantin/xcp-hl#48).
+
+### Changed
+
+- **xoa-vm-agent**: a failed, cancelled, skipped or timed out `xoa-hl` RPM
+  build no longer aborts the run when `xoa-hl` is unchanged since the last
+  image. The image is built on the newest published RPM and records that
+  RPM's commit, so the next run retries HEAD. If `xoa-hl` changed, the run
+  still aborts.
+
 ## 2026-09-29 (xcp-orchestrator-v0.3.5)
 
 ### Fixed
