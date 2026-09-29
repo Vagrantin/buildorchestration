@@ -734,6 +734,31 @@ pub async fn dispatch_workflow(
     Ok(())
 }
 
+/// Run states that still hold the repo's build pipeline busy.
+const ACTIVE_RUN_STATUSES: [&str; 3] = ["queued", "in_progress", "waiting"];
+
+/// URLs of the runs of `repo` (any workflow) that are queued or in progress.
+pub async fn list_active_runs(client: &Client, repo: &str) -> Result<Vec<String>, OrchestratorError> {
+    let mut urls = Vec::new();
+    for status in ACTIVE_RUN_STATUSES {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/actions/runs?status={}&per_page=20",
+            OWNER, repo, status
+        );
+        let response: GHRunsResponse = parse_github_response(
+            client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| OrchestratorError::GitHubApi(format!("list_active_runs for {}", repo), e.to_string()))?,
+            &format!("list_active_runs for {} ({})", repo, status),
+        )
+        .await?;
+        urls.extend(response.workflow_runs.into_iter().map(|r| r.html_url));
+    }
+    Ok(urls)
+}
+
 /// Query the conclusion of a workflow run
 pub async fn query_run_conclusion(
     client: &Client,

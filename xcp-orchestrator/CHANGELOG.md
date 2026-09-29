@@ -2,7 +2,7 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
-## Unreleased
+## 2026-09-29 (xcp-orchestrator-v0.3.5)
 
 ### Fixed
 
