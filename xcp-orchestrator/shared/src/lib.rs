@@ -62,6 +62,9 @@ pub enum OrchestratorError {
     #[error("Workflow run not found: {0}")]
     WorkflowRunNotFound(String),
 
+    #[error("{0}")]
+    BumpCheckFailed(String),
+
     #[error("Invalid version format: {0}")]
     VersionFormat(String),
 

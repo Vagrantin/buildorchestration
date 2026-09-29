@@ -4,6 +4,15 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 
 ## Unreleased
 
+### Changed
+
+- **iso-agent** (xcp-hl#129): a failed upstream bump check (GitHub error,
+  rate limit, timeout) used to be reported as `Skipped`, the same as "no
+  change", and the ISO could then build on a stale component pin. The run
+  now aborts right after the checks, before any tag, dispatch or state
+  write: it exits non-zero, so the Jenkins build fails, and the status file
+  shows the new `CheckFailed` state per component. The next run retries.
+
 ### Removed
 
 - **shared**: leftovers of the retired aggregator (xcp-hl#77): the unused

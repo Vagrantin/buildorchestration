@@ -20,6 +20,8 @@ pub enum WorkflowStatus {
     Timeout,
     /// Workflow was aborted
     Aborted,
+    /// The change check itself failed, so nothing was decided or built
+    CheckFailed,
     /// Unknown status (with custom message)
     Unknown(String),
 }
@@ -33,6 +35,7 @@ impl std::fmt::Display for WorkflowStatus {
             WorkflowStatus::Failure => write!(f, "Failure"),
             WorkflowStatus::Timeout => write!(f, "Timeout"),
             WorkflowStatus::Aborted => write!(f, "Aborted"),
+            WorkflowStatus::CheckFailed => write!(f, "Check failed"),
             WorkflowStatus::Unknown(s) => write!(f, "{}", s),
         }
     }

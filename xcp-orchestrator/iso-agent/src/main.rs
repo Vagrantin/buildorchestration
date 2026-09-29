@@ -251,6 +251,15 @@ async fn latest_release_matches(
     }
 }
 
+/// One line naming each upstream check that failed, for the log, the status file and the exit error.
+fn bump_check_failure_detail(checks: &[(&str, Option<OrchestratorError>)]) -> String {
+    let failed: Vec<String> = checks
+        .iter()
+        .filter_map(|(name, err)| err.as_ref().map(|e| format!("{}: {}", name, e)))
+        .collect();
+    format!("Bump detection failed, run aborted before any tag: {}", failed.join("; "))
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -301,24 +310,41 @@ async fn main() -> Result<(), OrchestratorError> {
     version_state.xolite_ce = xolite_state;
     version_state.xoa_proxy = xoa_state;
 
+    // A failed check must not pass for "no change": abort before any tag, state untouched (xcp-hl#129).
+    let ((xolite_head_sha, xolite_decision), (xoa_head_sha, xoa_decision)) = match (xolite_res, xoa_res) {
+        (Ok(xolite), Ok(xoa)) => (xolite, xoa),
+        (xolite, xoa) => {
+            let checks = [("xolite-ce", xolite.err()), ("xoa-proxy", xoa.err())];
+            let detail = bump_check_failure_detail(&checks);
+            warn!("{}", detail);
+            status.phase = "bump_check".to_string();
+            status.status = WorkflowStatus::CheckFailed;
+            status.detail = detail.clone();
+            for (name, err) in &checks {
+                let s = if err.is_some() { WorkflowStatus::CheckFailed } else { WorkflowStatus::Skipped };
+                status.set_component(*name, s, String::new());
+            }
+            status.write_to_file(STATUS_FILE)?;
+            return Err(OrchestratorError::BumpCheckFailed(detail));
+        }
+    };
+
     // ── Process XO Lite CE ────────────────────────────────────────────────────
-    let xolite_head_sha: String;
     let mut xolite_tag: Option<String> = None;
     let mut xolite_status = WorkflowStatus::Skipped;
     let mut xolite_url = String::new();
     let mut xolite_id: Option<u64> = None;
 
-    match xolite_res {
-        Ok((head_sha, BumpDecision::NoChange)) => {
+    match xolite_decision {
+        BumpDecision::NoChange => {
             info!("xolite-ce: no change detected, skipping.");
-            xolite_head_sha = head_sha;
         }
-        Ok((head_sha, BumpDecision::UpstreamBump { upstream_version })) => {
+        BumpDecision::UpstreamBump { upstream_version } => {
             let tag = format!("v{}-ce1", upstream_version);
             version_state.xolite_ce.upstream_version = upstream_version;
             version_state.xolite_ce.ce_counter = 1;
             let actual_tag =
-                create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
+                create_and_push_tag(&client, "xolite-ce", &tag, &xolite_head_sha).await?;
             version_state.xolite_ce.ce_counter = issued_counter(&actual_tag, version_state.xolite_ce.ce_counter);
             let (id, url) =
                 locate_tag_triggered_run(&client, "xolite-ce", XOLITE_WORKFLOW, &actual_tag, trigger_time)
@@ -326,14 +352,13 @@ async fn main() -> Result<(), OrchestratorError> {
             xolite_id = Some(id);
             xolite_url = url;
             xolite_status = WorkflowStatus::InProgress;
-            xolite_head_sha = head_sha;
             xolite_tag = Some(actual_tag);
         }
-        Ok((head_sha, BumpDecision::PatchBump { upstream_version, next_counter })) => {
+        BumpDecision::PatchBump { upstream_version, next_counter } => {
             let tag = format!("v{}-ce{}", upstream_version, next_counter);
             version_state.xolite_ce.ce_counter = next_counter;
             let actual_tag =
-                create_and_push_tag(&client, "xolite-ce", &tag, &head_sha).await?;
+                create_and_push_tag(&client, "xolite-ce", &tag, &xolite_head_sha).await?;
             version_state.xolite_ce.ce_counter = issued_counter(&actual_tag, version_state.xolite_ce.ce_counter);
             let (id, url) =
                 locate_tag_triggered_run(&client, "xolite-ce", XOLITE_WORKFLOW, &actual_tag, trigger_time)
@@ -341,39 +366,26 @@ async fn main() -> Result<(), OrchestratorError> {
             xolite_id = Some(id);
             xolite_url = url;
             xolite_status = WorkflowStatus::InProgress;
-            xolite_head_sha = head_sha;
             xolite_tag = Some(actual_tag);
-        }
-        Err(e) => {
-            warn!("xolite-ce bump detection failed: {}. Skipping this run.", e);
-            // FIX #18: was `fetch_repo_head_sha(...).unwrap_or_default()` which
-            // risked storing "" as xolite_head_sha if that second fetch also failed.
-            // An empty SHA would then differ from version_state.last_built_sha on
-            // the next run and trigger a spurious rebuild.
-            // Use the previously-known good SHA instead — safe because xolite_status
-            // stays Skipped and the SHA is never written to version_state in that case.
-            xolite_head_sha = version_state.xolite_ce.last_built_sha.clone();
         }
     }
 
     // ── Process xoa-proxy ─────────────────────────────────────────────────────
-    let xoa_head_sha: String;
     let mut xoa_tag: Option<String> = None;
     let mut xoa_status = WorkflowStatus::Skipped;
     let mut xoa_url = String::new();
     let mut xoa_id: Option<u64> = None;
 
-    match xoa_res {
-        Ok((head_sha, BumpDecision::NoChange)) => {
+    match xoa_decision {
+        BumpDecision::NoChange => {
             info!("xoa-proxy: no change detected, skipping.");
-            xoa_head_sha = head_sha;
         }
-        Ok((head_sha, BumpDecision::UpstreamBump { upstream_version })) => {
+        BumpDecision::UpstreamBump { upstream_version } => {
             let tag = format!("v{}", upstream_version);
             version_state.xoa_proxy.upstream_version = upstream_version;
             version_state.xoa_proxy.ce_counter = 1;
             let actual_tag =
-                create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
+                create_and_push_tag(&client, "xoa-proxy", &tag, &xoa_head_sha).await?;
             version_state.xoa_proxy.ce_counter = issued_counter(&actual_tag, version_state.xoa_proxy.ce_counter);
             let (id, url) =
                 locate_tag_triggered_run(&client, "xoa-proxy", XOA_PROXY_WORKFLOW, &actual_tag, trigger_time)
@@ -381,14 +393,13 @@ async fn main() -> Result<(), OrchestratorError> {
             xoa_id = Some(id);
             xoa_url = url;
             xoa_status = WorkflowStatus::InProgress;
-            xoa_head_sha = head_sha;
             xoa_tag = Some(actual_tag);
         }
-        Ok((head_sha, BumpDecision::PatchBump { upstream_version, next_counter })) => {
+        BumpDecision::PatchBump { upstream_version, next_counter } => {
             let tag = format!("v{}.{}", upstream_version, next_counter);
             version_state.xoa_proxy.ce_counter = next_counter;
             let actual_tag =
-                create_and_push_tag(&client, "xoa-proxy", &tag, &head_sha).await?;
+                create_and_push_tag(&client, "xoa-proxy", &tag, &xoa_head_sha).await?;
             version_state.xoa_proxy.ce_counter = issued_counter(&actual_tag, version_state.xoa_proxy.ce_counter);
             let (id, url) =
                 locate_tag_triggered_run(&client, "xoa-proxy", XOA_PROXY_WORKFLOW, &actual_tag, trigger_time)
@@ -396,13 +407,7 @@ async fn main() -> Result<(), OrchestratorError> {
             xoa_id = Some(id);
             xoa_url = url;
             xoa_status = WorkflowStatus::InProgress;
-            xoa_head_sha = head_sha;
             xoa_tag = Some(actual_tag);
-        }
-        Err(e) => {
-            warn!("xoa-proxy bump detection failed: {}. Skipping this run.", e);
-            // FIX #18: same as xolite — preserve the last known-good SHA
-            xoa_head_sha = version_state.xoa_proxy.last_built_sha.clone();
         }
     }
 
@@ -774,6 +779,17 @@ async fn main() -> Result<(), OrchestratorError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bump_check_failure_detail_names_only_failed_checks() {
+        let checks = [
+            ("xolite-ce", Some(OrchestratorError::Timeout("GitHub".into()))),
+            ("xoa-proxy", None),
+        ];
+        let detail = super::bump_check_failure_detail(&checks);
+        assert!(detail.contains("xolite-ce: Timeout waiting for GitHub"), "{detail}");
+        assert!(!detail.contains("xoa-proxy"), "{detail}");
+    }
+
     #[test]
     fn issued_counter_follows_the_tag_actually_pushed() {
         // ce22 requested, ce38 pushed after collisions: the state must say 38.
