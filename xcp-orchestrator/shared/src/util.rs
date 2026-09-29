@@ -74,20 +74,6 @@ pub fn write_atomic_json<T: Serialize>(
     Ok(())
 }
 
-/// Load JSON from `path`, returning `T::default()` if the file does not exist.
-/// Malformed JSON also falls back to `default()`.
-pub fn load_json_with_default<T: serde::de::DeserializeOwned + Default>(
-    path: impl AsRef<Path>,
-) -> Result<T, OrchestratorError> {
-    let path = path.as_ref();
-    if path.exists() {
-        let content = fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&content).unwrap_or_default())
-    } else {
-        Ok(T::default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

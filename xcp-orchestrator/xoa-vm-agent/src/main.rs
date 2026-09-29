@@ -301,7 +301,7 @@ enum RpmBump {
     Bump { version: String, counter: u32 },
 }
 
-/// Web page of an xoa-hl release, for the dashboard status entries.
+/// Web page of an xoa-hl release, for the status file entries.
 fn release_url_for(tag: &str) -> String {
     format!("https://github.com/{}/releases/tag/{}", XOA_HL_REPO, tag)
 }
@@ -1690,7 +1690,7 @@ fn is_image_release_for(release: &ReleaseInfo, short_sha: &str, build_xoa_hl_sha
 }
 
 /// Create a GitHub Release on `build-xoa-hl`, or reuse the existing one
-/// (idempotent). Returns `(upload_url, html_url)`.
+/// (idempotent). Returns `(upload_url, html_url, assets_url)`.
 ///
 /// The tag is created by the GitHub API on that repo's default branch. It
 /// cannot be anchored to `target_sha`: that is an `xoa-hl` commit, which does

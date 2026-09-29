@@ -7,7 +7,6 @@ use thiserror::Error;
 
 pub mod github;
 pub mod status;
-pub mod storage;
 pub mod util;
 pub mod version_state;
 pub use github::*;
@@ -31,9 +30,6 @@ pub const RELEASES_DATA_PATH: &str = "docs/_data/releases.yml";
 
 /// Target XCP-ng base release version
 pub const XCPNG_TARGET_VERSION: &str = "8.3";
-
-/// Base directory for all orchestrator state files
-pub const STATE_DIR: &str = "/var/lib/xcp-hl-orchestrator";
 
 // ── Error Types ────────────────────────────────────────────────────────────
 
@@ -66,14 +62,11 @@ pub enum OrchestratorError {
     #[error("Workflow run not found: {0}")]
     WorkflowRunNotFound(String),
 
-    #[error("Ollama error: {0}")]
-    OllamaError(String),
+    #[error("{0}")]
+    BumpCheckFailed(String),
 
     #[error("Invalid version format: {0}")]
     VersionFormat(String),
-
-    #[error("Header value error: {0}")]
-    HeaderValueError(String),
 
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
@@ -96,19 +89,6 @@ pub struct GHRun {
 #[derive(Deserialize, Debug)]
 pub struct GHRunsResponse {
     pub workflow_runs: Vec<GHRun>,
-}
-
-/// GitHub job response
-#[derive(Deserialize, Debug)]
-pub struct GHJob {
-    pub id: u64,
-    pub conclusion: Option<String>,
-}
-
-/// GitHub jobs list response
-#[derive(Deserialize, Debug)]
-pub struct GHJobsResponse {
-    pub jobs: Vec<GHJob>,
 }
 
 /// GitHub file content response
