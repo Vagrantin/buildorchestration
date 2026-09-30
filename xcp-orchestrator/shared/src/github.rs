@@ -18,19 +18,19 @@ pub fn create_github_client(token: &str) -> Result<Client, OrchestratorError> {
     );
     headers.insert(
         "User-Agent",
-        "XCP-Orchestrator-Rust-Agent"
-            .parse()
-            .map_err(|e: reqwest::header::InvalidHeaderValue| {
+        "XCP-Orchestrator-Rust-Agent".parse().map_err(
+            |e: reqwest::header::InvalidHeaderValue| {
                 OrchestratorError::GitHubApi("header creation".to_string(), e.to_string())
-            })?,
+            },
+        )?,
     );
     headers.insert(
         "Accept",
-        "application/vnd.github+json"
-            .parse()
-            .map_err(|e: reqwest::header::InvalidHeaderValue| {
+        "application/vnd.github+json".parse().map_err(
+            |e: reqwest::header::InvalidHeaderValue| {
                 OrchestratorError::GitHubApi("header creation".to_string(), e.to_string())
-            })?,
+            },
+        )?,
     );
 
     let client = Client::builder()
@@ -59,15 +59,15 @@ pub async fn parse_github_response<T: serde::de::DeserializeOwned>(
         ));
     }
 
-   serde_json::from_str(&body)
-        .map_err(|e| OrchestratorError::Json(e))
-
-
+    serde_json::from_str(&body).map_err(OrchestratorError::Json)
 }
 
 /// Fetch the HEAD SHA of a repository
 pub async fn fetch_repo_head_sha(client: &Client, repo: &str) -> Result<String, OrchestratorError> {
-    let url = format!("https://api.github.com/repos/{}/{}/commits/{}", OWNER, repo, DEFAULT_BRANCH);
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/commits/{}",
+        OWNER, repo, DEFAULT_BRANCH
+    );
 
     #[derive(Deserialize)]
     struct CommitResp {
@@ -76,10 +76,7 @@ pub async fn fetch_repo_head_sha(client: &Client, repo: &str) -> Result<String, 
 
     let resp: CommitResp = parse_github_response(
         client.get(&url).send().await.map_err(|e| {
-            OrchestratorError::GitHubApi(
-                format!("fetch_repo_head_sha for {}", repo),
-                e.to_string(),
-            )
+            OrchestratorError::GitHubApi(format!("fetch_repo_head_sha for {}", repo), e.to_string())
         })?,
         &format!("fetch_repo_head_sha for {}", repo),
     )
@@ -92,8 +89,13 @@ pub async fn fetch_repo_head_sha(client: &Client, repo: &str) -> Result<String, 
 /// Deliberately narrow; a packaged file such as a CHANGELOG.md must still trigger.
 pub fn is_non_build_path(path: &str) -> bool {
     const ROOT_FILES: [&str; 7] = [
-        "AGENTS.md", "README.md", "CLAUDE.md", "CONTRIBUTING.md", "SECURITY.md",
-        "CODE_OF_CONDUCT.md", "LICENSE",
+        "AGENTS.md",
+        "README.md",
+        "CLAUDE.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "CODE_OF_CONDUCT.md",
+        "LICENSE",
     ];
     ROOT_FILES.contains(&path)
         || path.starts_with("docs/")
@@ -120,7 +122,10 @@ pub async fn fetch_changed_files(
         files: Vec<File>,
     }
     let ctx = format!("fetch_changed_files for {} {}...{}", repo, base, head);
-    let url = format!("https://api.github.com/repos/{}/{}/compare/{}...{}", OWNER, repo, base, head);
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/compare/{}...{}",
+        OWNER, repo, base, head
+    );
     let cmp: Compare = parse_github_response(
         client
             .get(&url)
@@ -131,7 +136,11 @@ pub async fn fetch_changed_files(
     )
     .await?;
     // GitHub lists at most 300 files; a rewritten history is not a plain "ahead" either.
-    if cmp.status != "ahead" || cmp.total_commits == 0 || cmp.files.is_empty() || cmp.files.len() >= 300 {
+    if cmp.status != "ahead"
+        || cmp.total_commits == 0
+        || cmp.files.is_empty()
+        || cmp.files.len() >= 300
+    {
         return Ok(None);
     }
     Ok(Some(cmp.files.into_iter().map(|f| f.filename).collect()))
@@ -155,7 +164,12 @@ pub async fn only_non_build_changes(client: &Client, repo: &str, base: &str, hea
         }
         Ok(_) => false,
         Err(e) => {
-            tracing::warn!("{}: could not list changes since {} ({}); treating as a change", repo, base, e);
+            tracing::warn!(
+                "{}: could not list changes since {} ({}); treating as a change",
+                repo,
+                base,
+                e
+            );
             false
         }
     }
@@ -164,7 +178,10 @@ pub async fn only_non_build_changes(client: &Client, repo: &str, base: &str, hea
 /// Delete a tag, used to roll back a tag whose build could not be started.
 pub async fn delete_tag(client: &Client, repo: &str, tag: &str) -> Result<(), OrchestratorError> {
     let ctx = format!("delete_tag {} on {}", tag, repo);
-    let url = format!("https://api.github.com/repos/{}/{}/git/refs/tags/{}", OWNER, repo, tag);
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/git/refs/tags/{}",
+        OWNER, repo, tag
+    );
     let res = client
         .delete(&url)
         .send()
@@ -175,7 +192,10 @@ pub async fn delete_tag(client: &Client, repo: &str, tag: &str) -> Result<(), Or
     } else {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        Err(OrchestratorError::GitHubApi(ctx, format!("{}: {}", status, body)))
+        Err(OrchestratorError::GitHubApi(
+            ctx,
+            format!("{}: {}", status, body),
+        ))
     }
 }
 
@@ -205,7 +225,12 @@ pub async fn create_and_push_tag(
             .map_err(|e| OrchestratorError::GitHubApi(tag.clone(), e.to_string()))?;
 
         if res.status().is_success() {
-            tracing::info!("Pushed tag {} on {} (sha {})", tag, repo, &sha[..7.min(sha.len())]);
+            tracing::info!(
+                "Pushed tag {} on {} (sha {})",
+                tag,
+                repo,
+                &sha[..7.min(sha.len())]
+            );
             return Ok(tag);
         }
 
@@ -255,12 +280,13 @@ pub async fn fetch_latest_release_ref(
     client: &Client,
     repo: &str,
 ) -> Result<Option<(String, String)>, OrchestratorError> {
-    let url = format!("https://api.github.com/repos/{}/{}/releases/latest", OWNER, repo);
-    let res = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| OrchestratorError::GitHubApi(format!("latest release for {}", repo), e.to_string()))?;
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/releases/latest",
+        OWNER, repo
+    );
+    let res = client.get(&url).send().await.map_err(|e| {
+        OrchestratorError::GitHubApi(format!("latest release for {}", repo), e.to_string())
+    })?;
 
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -290,7 +316,10 @@ pub async fn fetch_tag_commit_sha(
         object: RefObject,
     }
 
-    let url = format!("https://api.github.com/repos/{}/{}/git/ref/tags/{}", OWNER, repo, tag);
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/git/ref/tags/{}",
+        OWNER, repo, tag
+    );
     let resp: RefResp = parse_github_response(
         client
             .get(&url)
@@ -362,11 +391,9 @@ pub async fn fetch_releases(
         OWNER, repo, per_page
     );
     parse_github_response(
-        client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(format!("releases for {}", repo), e.to_string()))?,
+        client.get(&url).send().await.map_err(|e| {
+            OrchestratorError::GitHubApi(format!("releases for {}", repo), e.to_string())
+        })?,
         &format!("fetch_releases for {}", repo),
     )
     .await
@@ -448,10 +475,26 @@ mod tests {
     #[test]
     fn non_build_paths_are_narrow() {
         use super::is_non_build_path;
-        for p in ["AGENTS.md", "README.md", "LICENSE", "docs/automatic-updates.md", ".github/ISSUE_TEMPLATE/bug.yml", ".github/pull_request_template.md"] {
+        for p in [
+            "AGENTS.md",
+            "README.md",
+            "LICENSE",
+            "docs/automatic-updates.md",
+            ".github/ISSUE_TEMPLATE/bug.yml",
+            ".github/pull_request_template.md",
+        ] {
             assert!(is_non_build_path(p), "{p} should not trigger a release");
         }
-        for p in ["CHANGELOG.md", "SPECS/xoa-hl.spec", "pages/README.md", ".github/workflows/build.yml", "src/main.rs", "UPSTREAM_TAG", "LICENSE.md", "sub/AGENTS.md"] {
+        for p in [
+            "CHANGELOG.md",
+            "SPECS/xoa-hl.spec",
+            "pages/README.md",
+            ".github/workflows/build.yml",
+            "src/main.rs",
+            "UPSTREAM_TAG",
+            "LICENSE.md",
+            "sub/AGENTS.md",
+        ] {
             assert!(!is_non_build_path(p), "{p} must trigger a release");
         }
     }
@@ -529,13 +572,22 @@ mod tests {
         assert_eq!(parse_upstream_xo("XO_VERSION=5.113.2\n"), None);
         assert_eq!(parse_upstream_xo("XO_COMMIT=e281c536d3b1e97c\n"), None);
         // A commit too short to slice an 8-character prefix from.
-        assert_eq!(parse_upstream_xo("XO_VERSION=5.113.2\nXO_COMMIT=e281\n"), None);
+        assert_eq!(
+            parse_upstream_xo("XO_VERSION=5.113.2\nXO_COMMIT=e281\n"),
+            None
+        );
     }
 
     #[test]
     fn plain_version_tags_parse() {
-        assert_eq!(parse_plain_version_tag("v0.1.1"), Some(("0.1.1".to_string(), 0)));
-        assert_eq!(parse_plain_version_tag("v0.1.1.3"), Some(("0.1.1".to_string(), 3)));
+        assert_eq!(
+            parse_plain_version_tag("v0.1.1"),
+            Some(("0.1.1".to_string(), 0))
+        );
+        assert_eq!(
+            parse_plain_version_tag("v0.1.1.3"),
+            Some(("0.1.1".to_string(), 3))
+        );
         assert_eq!(parse_plain_version_tag("v0.21.0-ce6"), None);
         assert_eq!(parse_plain_version_tag("v5.113.2_e281c536"), None);
         assert_eq!(parse_plain_version_tag("v0.1"), None);
@@ -543,8 +595,14 @@ mod tests {
 
     #[test]
     fn ce_suffix_increments() {
-        assert_eq!(next_tag_candidate("v0.23.0-ce1").as_deref(), Some("v0.23.0-ce2"));
-        assert_eq!(next_tag_candidate("v8.3-ce12").as_deref(), Some("v8.3-ce13"));
+        assert_eq!(
+            next_tag_candidate("v0.23.0-ce1").as_deref(),
+            Some("v0.23.0-ce2")
+        );
+        assert_eq!(
+            next_tag_candidate("v8.3-ce12").as_deref(),
+            Some("v8.3-ce13")
+        );
     }
 
     #[test]
@@ -567,8 +625,14 @@ mod tests {
 
     #[test]
     fn pinned_xolite_tags_parse() {
-        assert_eq!(parse_pinned_xolite_tag("xo-lite-v0.21.0\n"), Some("0.21.0".to_string()));
-        assert_eq!(parse_pinned_xolite_tag("  xo-lite-v0.23.0  "), Some("0.23.0".to_string()));
+        assert_eq!(
+            parse_pinned_xolite_tag("xo-lite-v0.21.0\n"),
+            Some("0.21.0".to_string())
+        );
+        assert_eq!(
+            parse_pinned_xolite_tag("  xo-lite-v0.23.0  "),
+            Some("0.23.0".to_string())
+        );
         assert_eq!(parse_pinned_xolite_tag(""), None);
         assert_eq!(parse_pinned_xolite_tag("xo-lite-v"), None);
         assert_eq!(parse_pinned_xolite_tag("v0.21.0"), None);
@@ -713,12 +777,9 @@ pub async fn dispatch_workflow(
     );
     let payload = serde_json::json!({ "ref": git_ref, "inputs": inputs });
 
-    let res = client
-        .post(&url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| OrchestratorError::GitHubApi(format!("dispatch_workflow for {}", repo), e.to_string()))?;
+    let res = client.post(&url).json(&payload).send().await.map_err(|e| {
+        OrchestratorError::GitHubApi(format!("dispatch_workflow for {}", repo), e.to_string())
+    })?;
 
     // workflow_dispatch returns 204 No Content on success
     if res.status() != reqwest::StatusCode::NO_CONTENT {
@@ -738,7 +799,10 @@ pub async fn dispatch_workflow(
 const ACTIVE_RUN_STATUSES: [&str; 3] = ["queued", "in_progress", "waiting"];
 
 /// URLs of the runs of `repo` (any workflow) that are queued or in progress.
-pub async fn list_active_runs(client: &Client, repo: &str) -> Result<Vec<String>, OrchestratorError> {
+pub async fn list_active_runs(
+    client: &Client,
+    repo: &str,
+) -> Result<Vec<String>, OrchestratorError> {
     let mut urls = Vec::new();
     for status in ACTIVE_RUN_STATUSES {
         let url = format!(
@@ -746,11 +810,12 @@ pub async fn list_active_runs(client: &Client, repo: &str) -> Result<Vec<String>
             OWNER, repo, status
         );
         let response: GHRunsResponse = parse_github_response(
-            client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| OrchestratorError::GitHubApi(format!("list_active_runs for {}", repo), e.to_string()))?,
+            client.get(&url).send().await.map_err(|e| {
+                OrchestratorError::GitHubApi(
+                    format!("list_active_runs for {}", repo),
+                    e.to_string(),
+                )
+            })?,
             &format!("list_active_runs for {} ({})", repo, status),
         )
         .await?;
@@ -787,14 +852,14 @@ pub async fn query_run_conclusion(
 }
 
 /// Fetch the latest upstream XO Lite tag
-pub async fn fetch_latest_upstream_xolite_tag(client: &Client) -> Result<String, OrchestratorError> {
+pub async fn fetch_latest_upstream_xolite_tag(
+    client: &Client,
+) -> Result<String, OrchestratorError> {
     let url = "https://api.github.com/repos/vatesfr/xen-orchestra/releases?per_page=10";
     let releases: Vec<GHRelease> = parse_github_response(
-        client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi("fetch releases".to_string(), e.to_string()))?,
+        client.get(url).send().await.map_err(|e| {
+            OrchestratorError::GitHubApi("fetch releases".to_string(), e.to_string())
+        })?,
         "fetch_latest_upstream_xolite_tag",
     )
     .await?;
@@ -825,27 +890,35 @@ pub async fn fetch_upstream_xolite_version(
         content: String,
     }
 
-    let resp: ContentResp = parse_github_response(
-        client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi(upstream_tag.to_string(), e.to_string()))?,
-        &format!("fetch_upstream_xolite_version for tag xo-lite-v{}", upstream_tag),
-    )
-    .await?;
+    let resp: ContentResp =
+        parse_github_response(
+            client.get(&url).send().await.map_err(|e| {
+                OrchestratorError::GitHubApi(upstream_tag.to_string(), e.to_string())
+            })?,
+            &format!(
+                "fetch_upstream_xolite_version for tag xo-lite-v{}",
+                upstream_tag
+            ),
+        )
+        .await?;
 
     use base64::{engine::general_purpose, Engine as _};
-    let cleaned: String = resp.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned: String = resp
+        .content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let decoded = general_purpose::STANDARD
         .decode(cleaned)
         .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
-    let pkg: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|e| OrchestratorError::Json(e))?;
+    let pkg: serde_json::Value =
+        serde_json::from_slice(&decoded).map_err(OrchestratorError::Json)?;
 
     Ok(pkg["version"]
         .as_str()
-        .ok_or_else(|| OrchestratorError::VersionFormat("package.json missing version field".into()))?
+        .ok_or_else(|| {
+            OrchestratorError::VersionFormat("package.json missing version field".into())
+        })?
         .to_string())
 }
 
@@ -872,11 +945,9 @@ pub async fn fetch_repo_text_file(
         "https://api.github.com/repos/{}/{}/contents/{}?ref={}",
         OWNER, repo, path, DEFAULT_BRANCH
     );
-    let res = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| OrchestratorError::GitHubApi(format!("fetch {} from {}", path, repo), e.to_string()))?;
+    let res = client.get(&url).send().await.map_err(|e| {
+        OrchestratorError::GitHubApi(format!("fetch {} from {}", path, repo), e.to_string())
+    })?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -884,7 +955,11 @@ pub async fn fetch_repo_text_file(
         parse_github_response(res, &format!("fetch_repo_text_file {}@{}", repo, path)).await?;
 
     use base64::{engine::general_purpose, Engine as _};
-    let cleaned: String = file.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned: String = file
+        .content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let decoded = general_purpose::STANDARD
         .decode(cleaned)
         .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
@@ -963,11 +1038,16 @@ pub fn parse_upstream_xo(content: &str) -> Option<UpstreamXoPin> {
 
     let xo_version = xo_version.filter(|v| !v.is_empty())?;
     let xo_commit = xo_commit.filter(|c| c.len() >= XO_SHORT_SHA_LEN)?;
-    Some(UpstreamXoPin { xo_version, xo_commit })
+    Some(UpstreamXoPin {
+        xo_version,
+        xo_commit,
+    })
 }
 
 /// Read xoa-hl's `UPSTREAM_XO` pin, the version oracle for its RPM releases.
-pub async fn fetch_xoa_hl_upstream_pin(client: &Client) -> Result<UpstreamXoPin, OrchestratorError> {
+pub async fn fetch_xoa_hl_upstream_pin(
+    client: &Client,
+) -> Result<UpstreamXoPin, OrchestratorError> {
     let content = fetch_repo_text_file(client, "xoa-hl", "UPSTREAM_XO")
         .await?
         .ok_or_else(|| {
@@ -1011,32 +1091,31 @@ pub async fn fetch_xoa_proxy_version(client: &Client) -> Result<String, Orchestr
         OWNER, DEFAULT_BRANCH
     );
     let cargo_content: GHFileContent = parse_github_response(
-        client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi("fetch Cargo.toml".to_string(), e.to_string()))?,
+        client.get(&url).send().await.map_err(|e| {
+            OrchestratorError::GitHubApi("fetch Cargo.toml".to_string(), e.to_string())
+        })?,
         "decide_xoa_proxy_bump Cargo.toml",
     )
     .await?;
 
     use base64::{engine::general_purpose, Engine as _};
-    let cleaned: String = cargo_content.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned: String = cargo_content
+        .content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let cargo_toml_bytes = general_purpose::STANDARD
         .decode(cleaned)
         .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
-    let cargo_toml = String::from_utf8(cargo_toml_bytes)
-        .map_err(|e| OrchestratorError::FromUtf8(e))?;
+    let cargo_toml = String::from_utf8(cargo_toml_bytes).map_err(OrchestratorError::FromUtf8)?;
 
     cargo_toml
         .lines()
         .find(|line| line.starts_with("version"))
-        .and_then(|line| {
-            line.split('"')
-                .nth(1)
-                .map(|v| v.to_string())
+        .and_then(|line| line.split('"').nth(1).map(|v| v.to_string()))
+        .ok_or_else(|| {
+            OrchestratorError::VersionFormat("Could not parse version from Cargo.toml".into())
         })
-        .ok_or_else(|| OrchestratorError::VersionFormat("Could not parse version from Cargo.toml".into()))
 }
 
 /// Split a YAML document into its leading comment block and the rest.
@@ -1074,13 +1153,9 @@ pub async fn fetch_release_rpm_name(
         OWNER, repo, tag
     );
     let release: ReleaseInfo = parse_github_response(
-        client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::GitHubApi(format!("release {} of {}", tag, repo), e.to_string())
-            })?,
+        client.get(&url).send().await.map_err(|e| {
+            OrchestratorError::GitHubApi(format!("release {} of {}", tag, repo), e.to_string())
+        })?,
         &format!("fetch_release_rpm_name for {}@{}", repo, tag),
     )
     .await?;
@@ -1112,21 +1187,26 @@ pub async fn append_release_matrix_entry(
         OWNER, DOCS_REPO, RELEASES_DATA_PATH
     );
     let existing: GHFileContent = parse_github_response(
-        client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::GitHubApi("append_release_matrix_entry GET".to_string(), e.to_string()))?,
+        client.get(&url).send().await.map_err(|e| {
+            OrchestratorError::GitHubApi(
+                "append_release_matrix_entry GET".to_string(),
+                e.to_string(),
+            )
+        })?,
         "append_release_matrix_entry GET",
     )
     .await?;
 
-    let cleaned: String = existing.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned: String = existing
+        .content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let current_yaml_bytes = general_purpose::STANDARD
         .decode(cleaned)
         .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
-    let current_yaml = String::from_utf8(current_yaml_bytes)
-        .map_err(|e| OrchestratorError::FromUtf8(e))?;
+    let current_yaml =
+        String::from_utf8(current_yaml_bytes).map_err(OrchestratorError::FromUtf8)?;
 
     let new_entry = format!(
         "- iso_version: \"{iso}\"\n  build_date: \"{date}\"\n  components:\n    xolite_ce:\n      version: \"{xv}\"\n      rpm: \"{xr}\"\n      upstream: \"{xu}\"\n      upstream_url: \"https://github.com/vatesfr/xen-orchestra/releases/tag/xo-lite-v{xu}\"\n    xoa_proxy:\n      version: \"{pv}\"\n      rpm: \"{pr}\"\n",
@@ -1165,6 +1245,9 @@ pub async fn append_release_matrix_entry(
         ));
     }
 
-    tracing::info!("Release matrix updated with {} (push will trigger pages.yml)", iso_tag);
+    tracing::info!(
+        "Release matrix updated with {} (push will trigger pages.yml)",
+        iso_tag
+    );
     Ok(())
 }

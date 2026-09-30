@@ -15,15 +15,15 @@
 //! 10. Persist version state
 //! 11. Write final status
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use chrono::{DateTime, Utc};
 use shared::{
-    AgentStatus, ComponentVersionState, WorkflowStatus,
-    create_github_client, load_credential, load_github_token,
-    create_and_push_tag, fetch_release_by_tag, fetch_repo_head_sha, fetch_releases,
-    fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, ReleaseInfo,
-    list_active_runs, locate_tag_triggered_run, only_non_build_changes, parse_ce_tag, query_run_conclusion,
+    create_and_push_tag, create_github_client, fetch_release_by_tag, fetch_releases,
+    fetch_repo_head_sha, fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, list_active_runs,
+    load_credential, load_github_token, locate_tag_triggered_run, only_non_build_changes,
+    parse_ce_tag, query_run_conclusion, AgentStatus, ComponentVersionState, ReleaseInfo,
+    WorkflowStatus,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -73,7 +73,9 @@ const DEFAULT_MIN_FREE_DISK_GB: u64 = 100;
 
 /// Ports Packer's embedded HTTP server may bind to (kickstart delivery).
 /// All must be free at build time.
-const REQUIRED_PORTS: &[u16] = &[8000, 8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008, 8009, 9000];
+const REQUIRED_PORTS: &[u16] = &[
+    8000, 8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008, 8009, 9000,
+];
 
 /// Hard timeout for the full Packer build.
 const PACKER_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -265,12 +267,14 @@ fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
             .unwrap_or(value);
 
         let parse_mb = |v: &str| {
-            v.parse::<u32>()
-                .with_context(|| format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v))
+            v.parse::<u32>().with_context(|| {
+                format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v)
+            })
         };
         let parse_gb = |v: &str| {
-            v.parse::<u64>()
-                .with_context(|| format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v))
+            v.parse::<u64>().with_context(|| {
+                format!("line {}: {} must be a number, got {:?}", lineno + 1, key, v)
+            })
         };
 
         match key {
@@ -287,7 +291,11 @@ fn apply_build_config(config: &mut BuildConfig, content: &str) -> Result<()> {
             "XE_GUEST_UTILITIES_XENSTORE_URL" => {
                 config.xe_guest_utilities_xenstore_url = value.to_string()
             }
-            _ => warn!("build.config line {}: unknown key {:?} ignored", lineno + 1, key),
+            _ => warn!(
+                "build.config line {}: unknown key {:?} ignored",
+                lineno + 1,
+                key
+            ),
         }
     }
     Ok(())
@@ -369,20 +377,28 @@ async fn decide_rpm_bump(
         .await
         .context("Failed to read the xoa-hl UPSTREAM_XO pin")?;
     let version = pin.version_string();
-    info!("xoa-hl: upstream pin {} resolves to version {}", pin.xo_version, version);
+    info!(
+        "xoa-hl: upstream pin {} resolves to version {}",
+        pin.xo_version, version
+    );
 
     if version == state.upstream_version
         && !state.last_tag.is_empty()
         && (head_sha == state.last_built_sha
             || only_non_build_changes(client, "xoa-hl", &state.last_built_sha, head_sha).await)
     {
-        return Ok(RpmBump::NoChange { tag: state.last_tag.clone() });
+        return Ok(RpmBump::NoChange {
+            tag: state.last_tag.clone(),
+        });
     }
 
     let releases = match fetch_releases(client, "xoa-hl", XOA_HL_RELEASE_SCAN).await {
         Ok(r) => r,
         Err(e) => {
-            warn!("Could not list xoa-hl releases ({}); trusting local state.", e);
+            warn!(
+                "Could not list xoa-hl releases ({}); trusting local state.",
+                e
+            );
             Vec::new()
         }
     };
@@ -391,11 +407,17 @@ async fn decide_rpm_bump(
     if let Some((release, counter)) = newest {
         let tag = release.tag_name.clone();
         if rpm_asset_url(release).is_none() {
-            warn!("xoa-hl release {} carries no RPM asset, a new release is needed.", tag);
+            warn!(
+                "xoa-hl release {} carries no RPM asset, a new release is needed.",
+                tag
+            );
         } else {
             match fetch_tag_commit_sha(client, "xoa-hl", &tag).await {
                 Ok(sha) if sha == head_sha => {
-                    info!("xoa-hl: release {} already matches HEAD, backfilling state.", tag);
+                    info!(
+                        "xoa-hl: release {} already matches HEAD, backfilling state.",
+                        tag
+                    );
                     state.upstream_version = version;
                     state.ce_counter = counter;
                     state.last_tag = tag.clone();
@@ -426,7 +448,10 @@ async fn main() -> Result<()> {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--force" => force = true,
-            other => bail!("Invalid argument: {} (usage: xoa-vm-agent [--force])", other),
+            other => bail!(
+                "Invalid argument: {} (usage: xoa-vm-agent [--force])",
+                other
+            ),
         }
     }
     if force {
@@ -471,7 +496,13 @@ async fn main() -> Result<()> {
     // agent exists to ship.
     // Commits touching only non-build files (AGENTS.md, docs/...) do not call for a new image.
     let xoa_hl_unchanged = repo_head_sha == version_state.image_xoa_hl_sha
-        || only_non_build_changes(&client, "xoa-hl", &version_state.image_xoa_hl_sha, &repo_head_sha).await;
+        || only_non_build_changes(
+            &client,
+            "xoa-hl",
+            &version_state.image_xoa_hl_sha,
+            &repo_head_sha,
+        )
+        .await;
     let build_xoa_hl_unchanged = build_xoa_hl_head_sha == version_state.image_build_xoa_hl_sha
         || only_non_build_changes(
             &client,
@@ -526,10 +557,16 @@ async fn main() -> Result<()> {
                     version_state.image_built_at = Some(Utc::now());
                     version_state.save()?;
                     status.status = WorkflowStatus::Skipped;
-                    status.detail =
-                        format!("Image {} already published (SHA: {})", image.tag_name, short_sha);
+                    status.detail = format!(
+                        "Image {} already published (SHA: {})",
+                        image.tag_name, short_sha
+                    );
                     status.set_component("xoa-hl", WorkflowStatus::Skipped, String::new());
-                    status.set_component("xoa-image", WorkflowStatus::Success, image.html_url.clone());
+                    status.set_component(
+                        "xoa-image",
+                        WorkflowStatus::Success,
+                        image.html_url.clone(),
+                    );
                     status.write_to_file(STATUS_FILE)?;
                     return Ok(());
                 }
@@ -591,7 +628,10 @@ async fn main() -> Result<()> {
         }
         RpmBump::Bump { version, counter } => {
             let base_tag = format!("v{}-ce{}", version, counter);
-            info!("xoa-hl: pushing tag {} on HEAD to trigger the RPM build.", base_tag);
+            info!(
+                "xoa-hl: pushing tag {} on HEAD to trigger the RPM build.",
+                base_tag
+            );
             status.detail = format!("Pushing xoa-hl tag {}", base_tag);
             status.write_to_file(STATUS_FILE)?;
 
@@ -609,29 +649,40 @@ async fn main() -> Result<()> {
                     }
                 };
 
-            let (run_id, run_url) =
-                match locate_tag_triggered_run(&client, "xoa-hl", "build-xoa.yml", &actual_tag, trigger_time).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("Could not locate the run triggered by {}: {}", actual_tag, e);
-                        status.status = WorkflowStatus::Failure;
-                        status.detail = format!("Workflow run not found: {}", e);
-                        status.set_component(
-                            "xoa-hl",
-                            WorkflowStatus::Failure,
-                            release_url_for(&actual_tag),
-                        );
-                        status.write_to_file(STATUS_FILE)?;
-                        return Err(e.into());
-                    }
-                };
+            let (run_id, run_url) = match locate_tag_triggered_run(
+                &client,
+                "xoa-hl",
+                "build-xoa.yml",
+                &actual_tag,
+                trigger_time,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(
+                        "Could not locate the run triggered by {}: {}",
+                        actual_tag, e
+                    );
+                    status.status = WorkflowStatus::Failure;
+                    status.detail = format!("Workflow run not found: {}", e);
+                    status.set_component(
+                        "xoa-hl",
+                        WorkflowStatus::Failure,
+                        release_url_for(&actual_tag),
+                    );
+                    status.write_to_file(STATUS_FILE)?;
+                    return Err(e.into());
+                }
+            };
 
             status.url = run_url.clone();
             status.detail = format!("Waiting for workflow: {}", run_url);
             status.set_component("xoa-hl", WorkflowStatus::InProgress, run_url.clone());
             status.write_to_file(STATUS_FILE)?;
 
-            let outcome = match wait_for_workflow(&client, run_id, &run_url, WORKFLOW_TIMEOUT).await {
+            let outcome = match wait_for_workflow(&client, run_id, &run_url, WORKFLOW_TIMEOUT).await
+            {
                 Ok(o) => o,
                 Err(e) => {
                     error!("xoa-hl workflow failed: {}", e);
@@ -653,11 +704,22 @@ async fn main() -> Result<()> {
                     status.write_to_file(STATUS_FILE)?;
                     bail!(msg);
                 }
-                warn!("{}; xoa-hl is unchanged, falling back to the last published RPM.", msg);
+                warn!(
+                    "{}; xoa-hl is unchanged, falling back to the last published RPM.",
+                    msg
+                );
                 match resolve_fallback_rpm(&client).await {
                     Ok((tag, sha)) => {
-                        warn!("Building on RPM release {} (xoa-hl commit {}).", tag, &sha[..7.min(sha.len())]);
-                        status.set_component("xoa-hl", WorkflowStatus::Skipped, release_url_for(&tag));
+                        warn!(
+                            "Building on RPM release {} (xoa-hl commit {}).",
+                            tag,
+                            &sha[..7.min(sha.len())]
+                        );
+                        status.set_component(
+                            "xoa-hl",
+                            WorkflowStatus::Skipped,
+                            release_url_for(&tag),
+                        );
                         image_source_sha = sha;
                         tag
                     }
@@ -675,7 +737,9 @@ async fn main() -> Result<()> {
 
                 // The workflow publishes the release as its last step; the API can
                 // still lag behind it, so wait for the asset itself.
-                if let Err(e) = wait_for_rpm_release(&client, &actual_tag, RPM_RELEASE_TIMEOUT).await {
+                if let Err(e) =
+                    wait_for_rpm_release(&client, &actual_tag, RPM_RELEASE_TIMEOUT).await
+                {
                     error!("xoa-hl release {} never carried an RPM: {}", actual_tag, e);
                     status.status = WorkflowStatus::Failure;
                     status.detail = format!("RPM release unavailable: {}", e);
@@ -692,7 +756,9 @@ async fn main() -> Result<()> {
                     parse_ce_tag(&actual_tag).map(|(_, c)| c).unwrap_or(counter);
                 version_state.rpm.last_tag = actual_tag.clone();
                 version_state.rpm.last_built_sha = repo_head_sha.clone();
-                version_state.save().context("Failed to persist xoa-hl RPM state")?;
+                version_state
+                    .save()
+                    .context("Failed to persist xoa-hl RPM state")?;
 
                 actual_tag
             }
@@ -737,7 +803,10 @@ async fn main() -> Result<()> {
     // Not fatal: without it, Packer simply uploads the ISO again.
     if let Err(e) = prepare_iso_vdi(&mut config).await {
         config.reuse_iso_vdi = false;
-        warn!("Could not check the ISO disk on {}: {:#}", config.xcpng_ip, e);
+        warn!(
+            "Could not check the ISO disk on {}: {:#}",
+            config.xcpng_ip, e
+        );
     }
 
     // ── PHASE 6: Generate build files ────────────────────────────────────────
@@ -777,10 +846,16 @@ async fn main() -> Result<()> {
     match build_vm {
         Some(uuid) => {
             if let Err(e) = destroy_build_vm(&config, &uuid).await {
-                warn!("Could not remove build VM {} from {}: {:#}", uuid, config.xcpng_ip, e);
+                warn!(
+                    "Could not remove build VM {} from {}: {:#}",
+                    uuid, config.xcpng_ip, e
+                );
             }
         }
-        None => warn!("Packer never reported a VM uuid; nothing removed from {}", config.xcpng_ip),
+        None => warn!(
+            "Packer never reported a VM uuid; nothing removed from {}",
+            config.xcpng_ip
+        ),
     }
 
     // ── PHASE 8: Locate XVA ───────────────────────────────────────────────────
@@ -818,15 +893,15 @@ async fn main() -> Result<()> {
     )
     .await
     {
-            Ok(u) => u,
-            Err(e) => {
-                status.status = WorkflowStatus::Failure;
-                status.detail = format!("Release creation failed: {}", e);
-                status.set_component("xoa-image", WorkflowStatus::Failure, String::new());
-                status.write_to_file(STATUS_FILE)?;
-                return Err(e);
-            }
-        };
+        Ok(u) => u,
+        Err(e) => {
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("Release creation failed: {}", e);
+            status.set_component("xoa-image", WorkflowStatus::Failure, String::new());
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
+        }
+    };
 
     status.set_component("xoa-image", WorkflowStatus::InProgress, release_url.clone());
     status.write_to_file(STATUS_FILE)?;
@@ -850,7 +925,9 @@ async fn main() -> Result<()> {
     version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
     version_state.image_tag = image_tag.clone(); // FIX #12: was never set
     version_state.image_built_at = Some(Utc::now());
-    version_state.save().context("Failed to persist version state")?;
+    version_state
+        .save()
+        .context("Failed to persist version state")?;
 
     // ── PHASE 11: Write final status ──────────────────────────────────────────
     info!("PHASE 11: Finalizing...");
@@ -989,7 +1066,10 @@ async fn wait_for_xoa_hl_idle(client: &reqwest::Client, timeout: Duration) -> Re
         }
 
         if Instant::now() + IDLE_POLL_INTERVAL >= deadline {
-            bail!("Timed out after {:?} waiting for xoa-hl workflows to finish", timeout);
+            bail!(
+                "Timed out after {:?} waiting for xoa-hl workflows to finish",
+                timeout
+            );
         }
         sleep(IDLE_POLL_INTERVAL).await;
     }
@@ -1053,7 +1133,9 @@ async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
         .arg("version")
         .output()
         .await
-        .context("Packer binary not found, install from https://developer.hashicorp.com/packer/downloads")?;
+        .context(
+        "Packer binary not found, install from https://developer.hashicorp.com/packer/downloads",
+    )?;
 
     if !packer_out.status.success() {
         bail!(
@@ -1061,7 +1143,10 @@ async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
             String::from_utf8_lossy(&packer_out.stderr)
         );
     }
-    info!("Packer: {}", String::from_utf8_lossy(&packer_out.stdout).trim());
+    info!(
+        "Packer: {}",
+        String::from_utf8_lossy(&packer_out.stdout).trim()
+    );
 
     // Check xenserver plugin
     info!("Checking xenserver Packer plugin...");
@@ -1102,10 +1187,7 @@ async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
                     avail_bytes / (1024 * 1024 * 1024),
                 );
             }
-            info!(
-                "Disk: {}GB available",
-                avail_bytes / (1024 * 1024 * 1024)
-            );
+            info!("Disk: {}GB available", avail_bytes / (1024 * 1024 * 1024));
         }
     }
 
@@ -1140,7 +1222,10 @@ async fn sync_repository() -> Result<()> {
 
     if !repo_path.exists() {
         let status = AsyncCommand::new("git")
-            .args(["clone", &format!("https://github.com/{}", BUILD_XOA_HL_REPO)])
+            .args([
+                "clone",
+                &format!("https://github.com/{}", BUILD_XOA_HL_REPO),
+            ])
             .arg(repo_path)
             .status()
             .await
@@ -1230,8 +1315,7 @@ async fn resolve_almalinux_checksum(client: &reqwest::Client) -> Result<String> 
         if res.status().is_success() {
             let body = res.text().await?;
             for line in body.lines() {
-                if line.starts_with(|c: char| c.is_ascii_hexdigit())
-                    && line.contains(iso_filename)
+                if line.starts_with(|c: char| c.is_ascii_hexdigit()) && line.contains(iso_filename)
                 {
                     // GNU format: "<hash>  filename"
                     if let Some(hash) = line.split_whitespace().next() {
@@ -1452,7 +1536,10 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         iso_name = if config.reuse_iso_vdi {
             format!(
                 "\n    \"iso_name\": {},",
-                serde_json::Value::from(iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum))
+                serde_json::Value::from(iso_vdi_name(
+                    &config.almalinux_iso_url,
+                    &config.almalinux_iso_checksum
+                ))
             )
         } else {
             String::new()
@@ -1626,7 +1713,10 @@ async fn xapi_call(
     if let Some(err) = reply.get("error").filter(|e| !e.is_null()) {
         bail!("XAPI {} failed: {}", method, err);
     }
-    Ok(reply.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(reply
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 /// ISO file name without ".iso", e.g. "AlmaLinux-9-latest-x86_64-minimal".
@@ -1664,10 +1754,18 @@ async fn xapi_login(config: &BuildConfig) -> Result<(reqwest::Client, String, St
         &client,
         &url,
         "session.login_with_password",
-        serde_json::json!([config.xcpng_user, config.xcpng_password, "1.0", "xoa-vm-agent"]),
+        serde_json::json!([
+            config.xcpng_user,
+            config.xcpng_password,
+            "1.0",
+            "xoa-vm-agent"
+        ]),
     )
     .await?;
-    let s = session.as_str().context("XAPI session is not a string")?.to_string();
+    let s = session
+        .as_str()
+        .context("XAPI session is not a string")?
+        .to_string();
     Ok((client, url, s))
 }
 
@@ -1677,7 +1775,8 @@ async fn prepare_iso_vdi(config: &mut BuildConfig) -> Result<()> {
     let result = async {
         let iso = iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum);
         let stem = iso_stem(&config.almalinux_iso_url);
-        let records = xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
+        let records =
+            xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
         let mut removed = 0;
         let mut current = 0;
         for (vdi, record) in records.as_object().into_iter().flatten() {
@@ -1694,7 +1793,11 @@ async fn prepare_iso_vdi(config: &mut BuildConfig) -> Result<()> {
             "ISO disk {:?} on {}: {}; removed {} older upload(s)",
             iso,
             config.xcpng_ip,
-            if config.reuse_iso_vdi { "reused, no upload" } else { "absent, Packer uploads it" },
+            if config.reuse_iso_vdi {
+                "reused, no upload"
+            } else {
+                "absent, Packer uploads it"
+            },
             removed
         );
         Ok::<(), anyhow::Error>(())
@@ -1709,34 +1812,61 @@ async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
     let (client, url, s) = xapi_login(config).await?;
 
     let result = async {
-        let vm = xapi_call(&client, &url, "VM.get_by_uuid", serde_json::json!([s, uuid])).await?;
+        let vm = xapi_call(
+            &client,
+            &url,
+            "VM.get_by_uuid",
+            serde_json::json!([s, uuid]),
+        )
+        .await?;
         let mut vdis = Vec::new();
         let vbds = xapi_call(&client, &url, "VM.get_VBDs", serde_json::json!([s, vm])).await?;
         let iso = iso_vdi_name(&config.almalinux_iso_url, &config.almalinux_iso_checksum);
         for vbd in vbds.as_array().into_iter().flatten() {
             let vdi = xapi_call(&client, &url, "VBD.get_VDI", serde_json::json!([s, vbd])).await?;
             if vdi.as_str().is_some_and(|r| r != "OpaqueRef:NULL") {
-                let name = xapi_call(&client, &url, "VDI.get_name_label", serde_json::json!([s, vdi])).await?;
+                let name = xapi_call(
+                    &client,
+                    &url,
+                    "VDI.get_name_label",
+                    serde_json::json!([s, vdi]),
+                )
+                .await?;
                 if name.as_str() != Some(iso.as_str()) {
                     vdis.push(vdi);
                 }
             }
         }
         // Already halted after the export; a failed shutdown only means that.
-        let _ = xapi_call(&client, &url, "VM.hard_shutdown", serde_json::json!([s, vm])).await;
+        let _ = xapi_call(
+            &client,
+            &url,
+            "VM.hard_shutdown",
+            serde_json::json!([s, vm]),
+        )
+        .await;
         xapi_call(&client, &url, "VM.destroy", serde_json::json!([s, vm])).await?;
         for vdi in &vdis {
             xapi_call(&client, &url, "VDI.destroy", serde_json::json!([s, vdi])).await?;
         }
-        info!("Removed build VM {} and {} disk(s) from {}", uuid, vdis.len(), config.xcpng_ip);
+        info!(
+            "Removed build VM {} and {} disk(s) from {}",
+            uuid,
+            vdis.len(),
+            config.xcpng_ip
+        );
 
         // A fresh upload carries the URL's file name; give it the checksum name so the next build reuses it.
         if !config.reuse_iso_vdi {
             let stem = iso_stem(&config.almalinux_iso_url);
             let plain = format!("{}.iso", stem);
-            let records = xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
+            let records =
+                xapi_call(&client, &url, "VDI.get_all_records", serde_json::json!([s])).await?;
             let named = |n: &str| {
-                records.as_object().into_iter().flatten()
+                records
+                    .as_object()
+                    .into_iter()
+                    .flatten()
                     .filter(|(_, r)| r["name_label"].as_str() == Some(n))
                     .map(|(v, r)| (v.clone(), r.clone()))
                     .collect::<Vec<_>>()
@@ -1747,10 +1877,23 @@ async fn destroy_build_vm(config: &BuildConfig, uuid: &str) -> Result<()> {
                 .filter(|(_, r)| r["VBDs"].as_array().is_some_and(|v| v.is_empty()))
                 .collect();
             if uploads.len() == 1 && named(&iso).is_empty() {
-                xapi_call(&client, &url, "VDI.set_name_label", serde_json::json!([s, uploads[0].0, iso])).await?;
-                info!("Kept the uploaded ISO disk on {} as {:?} for the next build", config.xcpng_ip, iso);
+                xapi_call(
+                    &client,
+                    &url,
+                    "VDI.set_name_label",
+                    serde_json::json!([s, uploads[0].0, iso]),
+                )
+                .await?;
+                info!(
+                    "Kept the uploaded ISO disk on {} as {:?} for the next build",
+                    config.xcpng_ip, iso
+                );
             } else {
-                warn!("Found {} fresh ISO upload(s) named {:?}; none renamed", uploads.len(), plain);
+                warn!(
+                    "Found {} fresh ISO upload(s) named {:?}; none renamed",
+                    uploads.len(),
+                    plain
+                );
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -1822,7 +1965,9 @@ fn generate_image_tag(head_sha: &str) -> String {
 fn is_image_release_for(release: &ReleaseInfo, short_sha: &str, build_xoa_hl_sha: &str) -> bool {
     release.tag_name.starts_with(IMAGE_TAG_PREFIX)
         && release.tag_name.ends_with(&format!("-{}", short_sha))
-        && release.body.contains(&format!("(build-xoa-hl): {}", build_xoa_hl_sha))
+        && release
+            .body
+            .contains(&format!("(build-xoa-hl): {}", build_xoa_hl_sha))
         && release
             .assets
             .iter()
@@ -1905,7 +2050,10 @@ async fn create_github_release(
 
     info!("Created GitHub Release: {}", release.html_url);
     Ok((
-        release.upload_url.trim_end_matches("{?name,label}").to_string(),
+        release
+            .upload_url
+            .trim_end_matches("{?name,label}")
+            .to_string(),
         release.html_url,
         release.assets_url,
     ))
@@ -1964,13 +2112,23 @@ async fn upload_asset(
     let old = existing.iter().find(|a| a.name == file_name);
     // A leftover from an interrupted replacement would block the temporary name.
     if let Some(stale) = existing.iter().find(|a| a.name == temp_name) {
-        client.delete(&stale.url).send().await?.error_for_status()
-            .with_context(|| format!("Failed to delete stale asset {} ({})", stale.name, stale.id))?;
+        client
+            .delete(&stale.url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| {
+                format!("Failed to delete stale asset {} ({})", stale.name, stale.id)
+            })?;
     }
-    let upload_name = if old.is_some() { temp_name.as_str() } else { file_name.as_str() };
+    let upload_name = if old.is_some() {
+        temp_name.as_str()
+    } else {
+        file_name.as_str()
+    };
 
     let res = client
-        .post(&format!("{}?name={}", upload_url, upload_name))
+        .post(format!("{}?name={}", upload_url, upload_name))
         .header("Content-Type", "application/octet-stream")
         .header("Content-Length", file_size)
         .body(reqwest::Body::wrap_stream(stream))
@@ -1985,8 +2143,15 @@ async fn upload_asset(
     }
 
     if let Some(old) = old {
-        let new: Asset = res.json().await.context("Failed to parse the uploaded asset")?;
-        client.delete(&old.url).send().await?.error_for_status()
+        let new: Asset = res
+            .json()
+            .await
+            .context("Failed to parse the uploaded asset")?;
+        client
+            .delete(&old.url)
+            .send()
+            .await?
+            .error_for_status()
             .with_context(|| format!("Failed to delete the previous {} ({})", old.name, old.id))?;
         client
             .patch(&new.url)
@@ -1995,7 +2160,10 @@ async fn upload_asset(
             .await?
             .error_for_status()
             .with_context(|| format!("Failed to rename {} to {}", new.name, file_name))?;
-        info!("Replaced the previous {} (asset {}) with asset {}", file_name, old.id, new.id);
+        info!(
+            "Replaced the previous {} (asset {}) with asset {}",
+            file_name, old.id, new.id
+        );
     }
 
     info!("XVA uploaded successfully");
@@ -2018,7 +2186,10 @@ mod tests {
     fn release_with_body(tag: &str, asset_names: &[&str], body: &str) -> ReleaseInfo {
         ReleaseInfo {
             tag_name: tag.to_string(),
-            html_url: format!("https://github.com/Vagrantin/build-xoa-hl/releases/tag/{}", tag),
+            html_url: format!(
+                "https://github.com/Vagrantin/build-xoa-hl/releases/tag/{}",
+                tag
+            ),
             assets: asset_names
                 .iter()
                 .map(|n| ReleaseAsset {
@@ -2086,7 +2257,10 @@ mod tests {
     fn every_finished_conclusion_is_an_outcome() {
         assert_eq!(workflow_outcome("success"), Some(WorkflowOutcome::Success));
         for c in ["failure", "cancelled", "skipped", "timed_out"] {
-            assert_eq!(workflow_outcome(c), Some(WorkflowOutcome::Ended(c.to_string())));
+            assert_eq!(
+                workflow_outcome(c),
+                Some(WorkflowOutcome::Ended(c.to_string()))
+            );
         }
     }
 
@@ -2128,10 +2302,19 @@ mod tests {
         let releases = vec![
             release("xoa-image-20260713-cb65556", &["xoa.xva.gz"]),
             release("v5.113.2_e281c536", &["xoa-hl-5.113.2.el9.noarch.rpm"]),
-            release("v5.113.2_e281c536-ce7", &["xoa-hl-5.113.2_e281c536-7.noarch.rpm"]),
-            release("v5.113.2_e281c536-ce3", &["xoa-hl-5.113.2_e281c536-3.noarch.rpm"]),
+            release(
+                "v5.113.2_e281c536-ce7",
+                &["xoa-hl-5.113.2_e281c536-7.noarch.rpm"],
+            ),
+            release(
+                "v5.113.2_e281c536-ce3",
+                &["xoa-hl-5.113.2_e281c536-3.noarch.rpm"],
+            ),
             // A ce release of a different upstream pin must not match either.
-            release("v5.114.0_aabbccdd-ce9", &["xoa-hl-5.114.0_aabbccdd-9.noarch.rpm"]),
+            release(
+                "v5.114.0_aabbccdd-ce9",
+                &["xoa-hl-5.114.0_aabbccdd-9.noarch.rpm"],
+            ),
         ];
         let (found, counter) = newest_ce_release(&releases, version).expect("ce release found");
         assert_eq!(found.tag_name, "v5.113.2_e281c536-ce7");
@@ -2161,7 +2344,11 @@ mod tests {
         assert_eq!(next_ce_counter(&state, "5.114.0_aabbccdd", None), 1);
         // Lost state: the published releases decide.
         assert_eq!(
-            next_ce_counter(&ComponentVersionState::default(), "5.113.2_e281c536", Some(7)),
+            next_ce_counter(
+                &ComponentVersionState::default(),
+                "5.113.2_e281c536",
+                Some(7)
+            ),
             8
         );
         // Stale state behind the releases: the releases win.
@@ -2171,7 +2358,10 @@ mod tests {
     #[test]
     fn rpm_asset_url_picks_the_rpm() {
         assert_eq!(
-            rpm_asset_url(&release("v5.113.2_e281c536-ce7", &["notes.txt", "xoa-hl.noarch.rpm"])),
+            rpm_asset_url(&release(
+                "v5.113.2_e281c536-ce7",
+                &["notes.txt", "xoa-hl.noarch.rpm"]
+            )),
             Some("https://example.com/xoa-hl.noarch.rpm".to_string())
         );
         assert_eq!(rpm_asset_url(&release("v5.113.2_e281c536-ce7", &[])), None);
@@ -2245,8 +2435,11 @@ VM_MEMORY_MB="4096"
     #[test]
     fn build_config_unknown_key_is_ignored() {
         let mut config = BuildConfig::default();
-        apply_build_config(&mut config, "DEBIAN_ISO_URL=\"http://example.com\"\nVM_NAME=xoa\n")
-            .unwrap();
+        apply_build_config(
+            &mut config,
+            "DEBIAN_ISO_URL=\"http://example.com\"\nVM_NAME=xoa\n",
+        )
+        .unwrap();
         assert_eq!(config.vm_name, "xoa");
     }
 
@@ -2265,7 +2458,10 @@ VM_MEMORY_MB="4096"
         assert_eq!(config.min_free_disk_gb, d.min_free_disk_gb);
         assert_eq!(config.almalinux_iso_url, d.almalinux_iso_url);
         assert_eq!(config.xe_guest_utilities_url, d.xe_guest_utilities_url);
-        assert_eq!(config.xe_guest_utilities_xenstore_url, d.xe_guest_utilities_xenstore_url);
+        assert_eq!(
+            config.xe_guest_utilities_xenstore_url,
+            d.xe_guest_utilities_xenstore_url
+        );
     }
 
     #[test]
@@ -2292,13 +2488,21 @@ VM_MEMORY_MB="4096"
 
     #[test]
     fn awkward_passwords_survive_template_and_kickstart() {
-        let mut config = BuildConfig::default();
-        config.almalinux_root_password = r#"a#b'c"d\e f"#.to_string();
-        config.xcpng_password = r#"x"y\z"#.to_string();
+        let config = BuildConfig {
+            almalinux_root_password: r#"a#b'c"d\e f"#.to_string(),
+            xcpng_password: r#"x"y\z"#.to_string(),
+            ..Default::default()
+        };
         let json: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&config)).unwrap();
-        assert_eq!(json["builders"][0]["ssh_password"], config.almalinux_root_password.as_str());
-        assert_eq!(json["builders"][0]["remote_password"], config.xcpng_password.as_str());
+        assert_eq!(
+            json["builders"][0]["ssh_password"],
+            config.almalinux_root_password.as_str()
+        );
+        assert_eq!(
+            json["builders"][0]["remote_password"],
+            config.xcpng_password.as_str()
+        );
 
         let ks = generate_kickstart(&config).unwrap();
         let line = ks.lines().find(|l| l.starts_with("rootpw ")).unwrap();
@@ -2312,14 +2516,22 @@ VM_MEMORY_MB="4096"
     fn iso_vdi_name_changes_with_the_checksum() {
         let a = iso_vdi_name(ALMALINUX_ISO_URL, "sha256:7762a4b45a66235726db");
         assert_eq!(a, "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso");
-        assert_ne!(a, iso_vdi_name(ALMALINUX_ISO_URL, "sha256:0123456789abcdef"));
-        assert_eq!(iso_vdi_name("https://h/x/a.iso?checksum=x", "sha256:ab"), "a-ab.iso");
+        assert_ne!(
+            a,
+            iso_vdi_name(ALMALINUX_ISO_URL, "sha256:0123456789abcdef")
+        );
+        assert_eq!(
+            iso_vdi_name("https://h/x/a.iso?checksum=x", "sha256:ab"),
+            "a-ab.iso"
+        );
     }
 
     #[test]
     fn packer_template_names_the_iso_disk_only_when_reused() {
-        let mut config = BuildConfig::default();
-        config.almalinux_iso_checksum = "sha256:7762a4b45a66235726db".to_string();
+        let mut config = BuildConfig {
+            almalinux_iso_checksum: "sha256:7762a4b45a66235726db".to_string(),
+            ..Default::default()
+        };
         let upload: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&config)).unwrap();
         assert!(upload["builders"][0].get("iso_name").is_none());
@@ -2328,7 +2540,10 @@ VM_MEMORY_MB="4096"
         config.reuse_iso_vdi = true;
         let reuse: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&config)).unwrap();
-        assert_eq!(reuse["builders"][0]["iso_name"], "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso");
+        assert_eq!(
+            reuse["builders"][0]["iso_name"],
+            "AlmaLinux-9-latest-x86_64-minimal-7762a4b45a66.iso"
+        );
     }
 
     #[test]
@@ -2343,13 +2558,45 @@ VM_MEMORY_MB="4096"
             })
         };
         // Older checksum and the pre-checksum name, detached: stale.
-        assert!(is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal-0123456789ab.iso", true, &[]), stem, current));
-        assert!(is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal.iso", true, &[]), stem, current));
+        assert!(is_stale_iso_upload(
+            &rec(
+                "AlmaLinux-9-latest-x86_64-minimal-0123456789ab.iso",
+                true,
+                &[]
+            ),
+            stem,
+            current
+        ));
+        assert!(is_stale_iso_upload(
+            &rec("AlmaLinux-9-latest-x86_64-minimal.iso", true, &[]),
+            stem,
+            current
+        ));
         // Current ISO, a kept failed build's attached ISO, a user's own disk, another image: kept.
-        assert!(!is_stale_iso_upload(&rec(current, true, &[]), stem, current));
-        assert!(!is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal-0123456789ab.iso", true, &["OpaqueRef:1"]), stem, current));
-        assert!(!is_stale_iso_upload(&rec("AlmaLinux-9-latest-x86_64-minimal.iso", false, &[]), stem, current));
-        assert!(!is_stale_iso_upload(&rec("Rocky-9-minimal.iso", true, &[]), stem, current));
+        assert!(!is_stale_iso_upload(
+            &rec(current, true, &[]),
+            stem,
+            current
+        ));
+        assert!(!is_stale_iso_upload(
+            &rec(
+                "AlmaLinux-9-latest-x86_64-minimal-0123456789ab.iso",
+                true,
+                &["OpaqueRef:1"]
+            ),
+            stem,
+            current
+        ));
+        assert!(!is_stale_iso_upload(
+            &rec("AlmaLinux-9-latest-x86_64-minimal.iso", false, &[]),
+            stem,
+            current
+        ));
+        assert!(!is_stale_iso_upload(
+            &rec("Rocky-9-minimal.iso", true, &[]),
+            stem,
+            current
+        ));
     }
 
     #[test]
@@ -2359,8 +2606,14 @@ VM_MEMORY_MB="4096"
             parse_created_instance(line).as_deref(),
             Some("0b5c7d1e-2f3a-4b6c-8d9e-0f1a2b3c4d5e")
         );
-        assert_eq!(parse_created_instance("==> xenserver-iso: Destroying VM"), None);
-        assert_eq!(parse_created_instance("Created instance 'not-a-uuid'"), None);
+        assert_eq!(
+            parse_created_instance("==> xenserver-iso: Destroying VM"),
+            None
+        );
+        assert_eq!(
+            parse_created_instance("Created instance 'not-a-uuid'"),
+            None
+        );
     }
 
     #[test]

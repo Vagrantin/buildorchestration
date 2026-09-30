@@ -80,13 +80,20 @@ mod tests {
 
     #[test]
     fn env_credential_is_trimmed() {
-        assert_eq!(credential_from_env("GITHUB_TOKEN", Some(" ghp_x\n".into())).unwrap(), "ghp_x");
+        assert_eq!(
+            credential_from_env("GITHUB_TOKEN", Some(" ghp_x\n".into())).unwrap(),
+            "ghp_x"
+        );
     }
 
     #[test]
     fn missing_empty_or_unresolved_env_credential_is_an_error() {
         assert!(credential_from_env("GITHUB_TOKEN", None).is_err());
         assert!(credential_from_env("GITHUB_TOKEN", Some("  ".into())).is_err());
-        assert!(credential_from_env("GITHUB_TOKEN", Some("pass://xcp-hl-prod/github_token/password".into())).is_err());
+        assert!(credential_from_env(
+            "GITHUB_TOKEN",
+            Some("pass://xcp-hl-prod/github_token/password".into())
+        )
+        .is_err());
     }
 }

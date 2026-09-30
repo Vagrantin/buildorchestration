@@ -1,0 +1,6 @@
+# ci/check.sh runs the "ci" profile: every test, JUnit for Jenkins (xcp-hl#148).
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
