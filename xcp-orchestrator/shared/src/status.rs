@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Status of a workflow or phase
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub enum WorkflowStatus {
     /// Workflow was skipped (no changes detected)
+    #[default]
     Skipped,
     /// Workflow is currently in progress
     InProgress,
@@ -38,12 +39,6 @@ impl std::fmt::Display for WorkflowStatus {
             WorkflowStatus::CheckFailed => write!(f, "Check failed"),
             WorkflowStatus::Unknown(s) => write!(f, "{}", s),
         }
-    }
-}
-
-impl Default for WorkflowStatus {
-    fn default() -> Self {
-        WorkflowStatus::Skipped
     }
 }
 
@@ -127,4 +122,3 @@ impl AgentStatus {
         Ok(())
     }
 }
-
