@@ -2,6 +2,27 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-10-01 (xcp-orchestrator-v0.3.7)
+
+### Fixed
+
+- **iso-agent**: `main` of xcp-hl is protected by a ruleset (pull request and
+  a green `gitleaks` check), so the release matrix entry now goes through a
+  pull request on `release-matrix/<tag>`, merged by the agent once `gitleaks`
+  passes. Recording an ISO already in the matrix is a no-op
+  (Vagrantin/xcp-hl#157).
+- **xoa-vm-agent**: the image release is created as a draft and published
+  only after the XVA is uploaded, so a failed upload no longer leaves a
+  public release without its image. The upload is retried from scratch
+  after 1, 5 and 15 minutes, removing partial assets first
+  (Vagrantin/xcp-hl#157).
+
+### Added
+
+- **iso-agent**: `--record-matrix` records the last built ISO from the
+  version state in the release matrix, without building or tagging. It
+  backfills a matrix update that failed after a successful build.
+
 ## 2026-09-29 (xcp-orchestrator-v0.3.6)
 
 ### Fixed

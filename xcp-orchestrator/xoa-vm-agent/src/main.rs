@@ -884,7 +884,7 @@ async fn main() -> Result<()> {
     let image_tag = generate_image_tag(&image_source_sha);
     let image_name = format!("XOA HomeLab Edition - {}", image_tag);
 
-    let (upload_url, release_url, assets_url) = match create_github_release(
+    let release = match create_github_release(
         &client,
         &image_tag,
         &image_name,
@@ -893,7 +893,7 @@ async fn main() -> Result<()> {
     )
     .await
     {
-        Ok(u) => u,
+        Ok(r) => r,
         Err(e) => {
             status.status = WorkflowStatus::Failure;
             status.detail = format!("Release creation failed: {}", e);
@@ -902,17 +902,36 @@ async fn main() -> Result<()> {
             return Err(e);
         }
     };
+    let upload_url = release
+        .upload_url
+        .trim_end_matches("{?name,label}")
+        .to_string();
 
-    status.set_component("xoa-image", WorkflowStatus::InProgress, release_url.clone());
+    status.set_component(
+        "xoa-image",
+        WorkflowStatus::InProgress,
+        release.html_url.clone(),
+    );
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = upload_asset(&client, &upload_url, &assets_url, &xva_path).await {
-        status.status = WorkflowStatus::Failure;
-        status.detail = format!("Asset upload failed: {}", e);
-        status.set_component("xoa-image", WorkflowStatus::Failure, release_url.clone());
-        status.write_to_file(STATUS_FILE)?;
-        return Err(e);
-    }
+    let published = match upload_asset(&client, &upload_url, &release.assets_url, &xva_path).await {
+        Ok(()) => publish_release(&client, &release).await,
+        Err(e) => Err(e),
+    };
+    let release_url = match published {
+        Ok(url) => url,
+        Err(e) => {
+            status.status = WorkflowStatus::Failure;
+            status.detail = format!("Asset upload or publication failed: {:#}", e);
+            status.set_component(
+                "xoa-image",
+                WorkflowStatus::Failure,
+                release.html_url.clone(),
+            );
+            status.write_to_file(STATUS_FILE)?;
+            return Err(e);
+        }
+    };
 
     status.set_component("xoa-image", WorkflowStatus::Success, release_url.clone());
 
@@ -1963,7 +1982,8 @@ fn generate_image_tag(head_sha: &str) -> String {
 /// records the build-xoa-hl SHA it was built from (Vagrantin/xcp-hl#47), and
 /// the XVA asset must be present, a release whose upload failed doesn't count.
 fn is_image_release_for(release: &ReleaseInfo, short_sha: &str, build_xoa_hl_sha: &str) -> bool {
-    release.tag_name.starts_with(IMAGE_TAG_PREFIX)
+    !release.draft
+        && release.tag_name.starts_with(IMAGE_TAG_PREFIX)
         && release.tag_name.ends_with(&format!("-{}", short_sha))
         && release
             .body
@@ -1974,8 +1994,23 @@ fn is_image_release_for(release: &ReleaseInfo, short_sha: &str, build_xoa_hl_sha
             .any(|a| a.name.ends_with(".xva") || a.name.ends_with(".xva.gz"))
 }
 
-/// Create a GitHub Release on `build-xoa-hl`, or reuse the existing one
-/// (idempotent). Returns `(upload_url, html_url, assets_url)`.
+/// Upload and API URLs of one release on `build-xoa-hl`.
+#[derive(Debug, serde::Deserialize)]
+struct ReleaseHandle {
+    url: String,
+    upload_url: String,
+    html_url: String,
+    assets_url: String,
+    #[serde(default)]
+    draft: bool,
+    tag_name: String,
+}
+
+/// Create the image release as a draft, or reuse the one for this tag (idempotent).
+///
+/// A draft is invisible to anonymous readers (release-watch, Deploy XOA), so a
+/// failed upload never leaves a published release without its XVA;
+/// `publish_release` makes it public once the asset is in place.
 ///
 /// The tag is created by the GitHub API on that repo's default branch. It
 /// cannot be anchored to `target_sha`: that is an `xoa-hl` commit, which does
@@ -1988,33 +2023,30 @@ async fn create_github_release(
     name: &str,
     target_sha: &str,
     build_xoa_hl_sha: &str,
-) -> Result<(String, String, String)> {
-    #[derive(serde::Deserialize)]
-    struct ReleaseResp {
-        upload_url: String,
-        html_url: String,
-        assets_url: String,
-    }
-
-    // Check whether this exact tag already has a release (retry-safe)
-    let check_url = format!(
-        "https://api.github.com/repos/{}/releases/tags/{}",
-        BUILD_XOA_HL_REPO, tag
+) -> Result<ReleaseHandle> {
+    // releases/tags/{tag} hides drafts, so look in the authenticated list.
+    let list_url = format!(
+        "https://api.github.com/repos/{}/releases?per_page=100",
+        BUILD_XOA_HL_REPO
     );
-    if let Ok(res) = client.get(&check_url).send().await {
-        if res.status().is_success() {
-            if let Ok(r) = res.json::<ReleaseResp>().await {
-                info!("Release {} already exists, reusing: {}", tag, r.html_url);
-                return Ok((
-                    r.upload_url.trim_end_matches("{?name,label}").to_string(),
-                    r.html_url,
-                    r.assets_url,
-                ));
-            }
-        }
+    let releases: Vec<ReleaseHandle> = client
+        .get(&list_url)
+        .send()
+        .await
+        .context("Failed to list releases")?
+        .error_for_status()
+        .context("Failed to list releases")?
+        .json()
+        .await
+        .context("Failed to parse the release list")?;
+    if let Some(r) = releases.into_iter().find(|r| r.tag_name == tag) {
+        info!(
+            "Release {} already exists (draft: {}), reusing: {}",
+            tag, r.draft, r.html_url
+        );
+        return Ok(r);
     }
 
-    // Create a new release; the API creates the tag on the default branch
     let create_url = format!(
         "https://api.github.com/repos/{}/releases",
         BUILD_XOA_HL_REPO
@@ -2026,7 +2058,7 @@ async fn create_github_release(
             "XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}\nSource commit (build-xoa-hl): {}",
             target_sha, build_xoa_hl_sha
         ),
-        "draft":             false,
+        "draft":             true,
         "prerelease":        false,
     });
 
@@ -2043,26 +2075,91 @@ async fn create_github_release(
         bail!("GitHub Release creation failed ({}): {}", code, body);
     }
 
-    let release: ReleaseResp = res
+    let release: ReleaseHandle = res
         .json()
         .await
         .context("Failed to parse GitHub Release response")?;
 
-    info!("Created GitHub Release: {}", release.html_url);
-    Ok((
-        release
-            .upload_url
-            .trim_end_matches("{?name,label}")
-            .to_string(),
-        release.html_url,
-        release.assets_url,
-    ))
+    info!("Created draft GitHub Release: {}", release.html_url);
+    Ok(release)
 }
 
-/// Stream-upload `xva_path` to an existing GitHub Release upload URL.
-/// Uploads the XVA. If the release already holds one (a forced rebuild), the new file goes
-/// up under a temporary name, then replaces the old asset, so the download URL never breaks.
+/// Make a draft release public, once its XVA is uploaded. No-op if already public.
+async fn publish_release(client: &reqwest::Client, release: &ReleaseHandle) -> Result<String> {
+    if !release.draft {
+        return Ok(release.html_url.clone());
+    }
+    #[derive(serde::Deserialize)]
+    struct Published {
+        html_url: String,
+    }
+    let published: Published = client
+        .patch(&release.url)
+        .json(&serde_json::json!({ "draft": false }))
+        .send()
+        .await
+        .context("Failed to publish the release")?
+        .error_for_status()
+        .context("Failed to publish the release")?
+        .json()
+        .await
+        .context("Failed to parse the published release")?;
+    info!("Published GitHub Release: {}", published.html_url);
+    Ok(published.html_url)
+}
+
+/// Waits before each upload attempt: a dropped connection or DNS outage gets about 20 minutes to clear.
+const UPLOAD_RETRY_WAITS: [Duration; 4] = [
+    Duration::from_secs(0),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(900),
+];
+
+#[derive(serde::Deserialize)]
+struct Asset {
+    id: u64,
+    name: String,
+    url: String,
+    #[serde(default)]
+    state: String,
+}
+
+/// Uploads the XVA, retrying a failed attempt from scratch.
 async fn upload_asset(
+    client: &reqwest::Client,
+    upload_url: &str,
+    assets_url: &str,
+    xva_path: &Path,
+) -> Result<()> {
+    let mut last_err = None;
+    for (attempt, wait) in UPLOAD_RETRY_WAITS.iter().enumerate() {
+        if !wait.is_zero() {
+            warn!(
+                "Retrying the XVA upload in {}s (attempt {} of {})",
+                wait.as_secs(),
+                attempt + 1,
+                UPLOAD_RETRY_WAITS.len()
+            );
+            sleep(*wait).await;
+        }
+        match upload_asset_once(client, upload_url, assets_url, xva_path).await {
+            Ok(()) => {
+                info!("XVA uploaded successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("XVA upload attempt {} failed: {:#}", attempt + 1, e);
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt")).context("XVA upload failed after every retry")
+}
+
+/// One upload attempt. If the release already holds a complete XVA (a forced rebuild), the new file
+/// goes up under a temporary name, then replaces the old asset, so the download URL never breaks.
+async fn upload_asset_once(
     client: &reqwest::Client,
     upload_url: &str,
     assets_url: &str,
@@ -2085,18 +2182,6 @@ async fn upload_asset(
         file_size as f64 / (1024.0_f64.powi(3))
     );
 
-    let file = async_fs::File::open(xva_path)
-        .await
-        .with_context(|| format!("Cannot open {}", xva_path.display()))?;
-
-    let stream = tokio_util::io::ReaderStream::new(file);
-
-    #[derive(serde::Deserialize)]
-    struct Asset {
-        id: u64,
-        name: String,
-        url: String,
-    }
     let existing: Vec<Asset> = client
         .get(assets_url)
         .query(&[("per_page", "100")])
@@ -2109,9 +2194,11 @@ async fn upload_asset(
         .await
         .context("Failed to parse release assets")?;
     let temp_name = format!("{}.new", file_name);
-    let old = existing.iter().find(|a| a.name == file_name);
-    // A leftover from an interrupted replacement would block the temporary name.
-    if let Some(stale) = existing.iter().find(|a| a.name == temp_name) {
+    // A partial upload ("starter") or a leftover temporary blocks its name; neither is a previous image.
+    for stale in existing
+        .iter()
+        .filter(|a| a.name == temp_name || (a.name == file_name && a.state != "uploaded"))
+    {
         client
             .delete(&stale.url)
             .send()
@@ -2120,12 +2207,24 @@ async fn upload_asset(
             .with_context(|| {
                 format!("Failed to delete stale asset {} ({})", stale.name, stale.id)
             })?;
+        info!(
+            "Deleted stale asset {} ({}, state {})",
+            stale.name, stale.id, stale.state
+        );
     }
+    let old = existing
+        .iter()
+        .find(|a| a.name == file_name && a.state == "uploaded");
     let upload_name = if old.is_some() {
         temp_name.as_str()
     } else {
         file_name.as_str()
     };
+
+    let file = async_fs::File::open(xva_path)
+        .await
+        .with_context(|| format!("Cannot open {}", xva_path.display()))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
 
     let res = client
         .post(format!("{}?name={}", upload_url, upload_name))
@@ -2165,8 +2264,6 @@ async fn upload_asset(
             file_name, old.id, new.id
         );
     }
-
-    info!("XVA uploaded successfully");
     Ok(())
 }
 
@@ -2198,6 +2295,7 @@ mod tests {
                 })
                 .collect(),
             body: body.to_string(),
+            draft: false,
         }
     }
 
