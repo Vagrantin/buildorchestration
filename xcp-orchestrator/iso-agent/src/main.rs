@@ -117,6 +117,8 @@ struct ForceFlags {
     xolite: bool,
     xoa_proxy: bool,
     iso: bool,
+    /// Only record the last built ISO in the release matrix (backfill after a failed matrix update).
+    record_matrix: bool,
 }
 
 fn parse_force_flags() -> Result<ForceFlags, OrchestratorError> {
@@ -131,9 +133,10 @@ fn parse_force_flags() -> Result<ForceFlags, OrchestratorError> {
             "--force-xolite" => force.xolite = true,
             "--force-xoa-proxy" => force.xoa_proxy = true,
             "--force-iso" => force.iso = true,
+            "--record-matrix" => force.record_matrix = true,
             other => {
                 return Err(OrchestratorError::InvalidArgument(format!(
-                    "{} (usage: iso-agent [--force] [--force-xolite] [--force-xoa-proxy] [--force-iso])",
+                    "{} (usage: iso-agent [--force] [--force-xolite] [--force-xoa-proxy] [--force-iso] | --record-matrix)",
                     other
                 )));
             }
@@ -285,6 +288,36 @@ fn bump_check_failure_detail(checks: &[(&str, Option<OrchestratorError>)]) -> St
     )
 }
 
+/// Records the last built ISO in the release matrix, from the saved state; builds and tags nothing.
+async fn record_last_iso_in_matrix(
+    client: &reqwest::Client,
+    state: &IsoAgentVersionState,
+) -> Result<(), OrchestratorError> {
+    let iso = &state.iso;
+    if iso.last_tag.is_empty() {
+        return Err(OrchestratorError::InvalidArgument(
+            "--record-matrix: no ISO recorded in the version state".to_string(),
+        ));
+    }
+    info!(
+        "Recording {} in the release matrix (no build)",
+        iso.last_tag
+    );
+    let xolite_rpm = fetch_release_rpm_name(client, "xolite-ce", &iso.last_xolite_tag).await?;
+    let xoa_proxy_rpm =
+        fetch_release_rpm_name(client, "xoa-proxy", &iso.last_xoa_proxy_tag).await?;
+    append_release_matrix_entry(
+        client,
+        &iso.last_tag,
+        &iso.last_xolite_tag,
+        &state.xolite_ce.upstream_version,
+        &xolite_rpm,
+        &iso.last_xoa_proxy_tag,
+        &xoa_proxy_rpm,
+    )
+    .await
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -310,6 +343,9 @@ async fn main() -> Result<(), OrchestratorError> {
     status.write_to_file(STATUS_FILE)?;
 
     let mut version_state = IsoAgentVersionState::load()?;
+    if force.record_matrix {
+        return record_last_iso_in_matrix(&client, &version_state).await;
+    }
     let trigger_time = Utc::now();
 
     // ── PHASE 1: Evaluate component changes and dispatch builds ───────────────

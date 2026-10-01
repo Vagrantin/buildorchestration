@@ -370,6 +370,9 @@ pub struct ReleaseInfo {
     /// missing key, so an explicit null still fails the String deserialize.
     #[serde(default, deserialize_with = "null_as_empty_string")]
     pub body: String,
+    /// Drafts are listed only to the token's owner; a draft is never a published image.
+    #[serde(default)]
+    pub draft: bool,
 }
 
 /// Deserialize a nullable JSON string as `String`, mapping null to empty.
@@ -500,9 +503,9 @@ mod tests {
     }
 
     use super::{
-        next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag,
-        parse_upstream_xo, split_leading_comments, workflow_push_runs_url, ReleaseInfo,
-        UpstreamXoPin,
+        matrix_has_entry, next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag,
+        parse_plain_version_tag, parse_upstream_xo, split_leading_comments, workflow_push_runs_url,
+        ReleaseInfo, UpstreamXoPin,
     };
 
     /// GitHub sends `"body": null` for a release created without notes (every
@@ -653,6 +656,17 @@ mod tests {
         let (header, entries) = split_leading_comments(yaml);
         assert_eq!(header, "# head\n");
         assert_eq!(entries, "- a: 1\n# mid\n- b: 2\n");
+    }
+
+    #[test]
+    fn matrix_entry_is_found_by_exact_tag_only() {
+        let yaml = "# schema: iso_version: \"v8.3-ce41\"\n- iso_version: \"v8.3-ce41\"\n  build_date: \"2026-09-30\"\n";
+        assert!(matrix_has_entry(yaml, "v8.3-ce41"));
+        assert!(!matrix_has_entry(yaml, "v8.3-ce4"));
+        assert!(!matrix_has_entry(
+            "# iso_version: \"v8.3-ce41\"\n",
+            "v8.3-ce41"
+        ));
     }
 
     #[test]
@@ -1207,6 +1221,10 @@ pub async fn append_release_matrix_entry(
         .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
     let current_yaml =
         String::from_utf8(current_yaml_bytes).map_err(OrchestratorError::FromUtf8)?;
+    if matrix_has_entry(&current_yaml, iso_tag) {
+        tracing::info!("Release matrix already records {}", iso_tag);
+        return Ok(());
+    }
 
     let new_entry = format!(
         "- iso_version: \"{iso}\"\n  build_date: \"{date}\"\n  components:\n    xolite_ce:\n      version: \"{xv}\"\n      rpm: \"{xr}\"\n      upstream: \"{xu}\"\n      upstream_url: \"https://github.com/vatesfr/xen-orchestra/releases/tag/xo-lite-v{xu}\"\n    xoa_proxy:\n      version: \"{pv}\"\n      rpm: \"{pr}\"\n",
@@ -1223,31 +1241,207 @@ pub async fn append_release_matrix_entry(
     let (header, entries) = split_leading_comments(&current_yaml);
     let updated_yaml = format!("{}{}\n{}", header, new_entry.trim_end(), entries);
 
-    let payload = serde_json::json!({
-        "message": format!("docs: record release {} in matrix", iso_tag),
-        "content": general_purpose::STANDARD.encode(updated_yaml.as_bytes()),
-        "sha": existing.sha,
-        "branch": DEFAULT_BRANCH,
-    });
-
-    let res = client
-        .put(&url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| OrchestratorError::GitHubApi(iso_tag.to_string(), e.to_string()))?;
-
-    if !res.status().is_success() {
-        let body = res.text().await.unwrap_or_default();
-        return Err(OrchestratorError::GitHubApi(
-            iso_tag.to_string(),
-            format!("Failed to update release matrix: {}", body),
-        ));
-    }
-
+    // main is protected (PR plus a green gitleaks check), so the entry goes through a pull request.
+    let message = format!("docs: record release {} in matrix", iso_tag);
+    let branch = format!("release-matrix/{}", iso_tag);
+    let pr = open_matrix_pr(
+        client,
+        &url,
+        &branch,
+        &message,
+        &updated_yaml,
+        &existing.sha,
+    )
+    .await?;
+    let head_sha = pr["head"]["sha"].as_str().unwrap_or_default().to_string();
+    let number = pr["number"].as_u64().unwrap_or_default();
     tracing::info!(
-        "Release matrix updated with {} (push will trigger pages.yml)",
-        iso_tag
+        "Opened {}/{}#{} for the release matrix entry",
+        OWNER,
+        DOCS_REPO,
+        number
+    );
+
+    wait_for_check(
+        client,
+        DOCS_REPO,
+        &head_sha,
+        "gitleaks",
+        MATRIX_CHECK_TIMEOUT,
+    )
+    .await?;
+    merge_pr(client, DOCS_REPO, number, &message).await?;
+    // The branch is only a vehicle; a failed delete leaves a stale branch, not a broken release.
+    let _ = client
+        .delete(format!(
+            "https://api.github.com/repos/{}/{}/git/refs/heads/{}",
+            OWNER, DOCS_REPO, branch
+        ))
+        .send()
+        .await;
+    tracing::info!(
+        "Release matrix updated with {} via #{} (the merge triggers pages.yml)",
+        iso_tag,
+        number
     );
     Ok(())
+}
+
+/// How long the matrix PR may wait for its required check.
+const MATRIX_CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Does the matrix already record this ISO tag? Makes the PR path idempotent.
+pub fn matrix_has_entry(yaml: &str, iso_tag: &str) -> bool {
+    let needle = format!("iso_version: \"{}\"", iso_tag);
+    yaml.lines()
+        .any(|l| l.trim_start().trim_start_matches("- ") == needle)
+}
+
+async fn gh_json(
+    req: reqwest::RequestBuilder,
+    context: &str,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let res = req
+        .send()
+        .await
+        .map_err(|e| OrchestratorError::GitHubApi(context.to_string(), e.to_string()))?;
+    parse_github_response(res, context).await
+}
+
+/// Puts the new file on a fresh branch from main and opens (or reuses) its PR. Returns the PR JSON.
+async fn open_matrix_pr(
+    client: &Client,
+    contents_url: &str,
+    branch: &str,
+    message: &str,
+    yaml: &str,
+    file_sha: &str,
+) -> Result<serde_json::Value, OrchestratorError> {
+    use base64::{engine::general_purpose, Engine as _};
+    let api = format!("https://api.github.com/repos/{}/{}", OWNER, DOCS_REPO);
+
+    let pulls = gh_json(
+        client.get(format!("{}/pulls", api)).query(&[
+            ("head", format!("{}:{}", OWNER, branch)),
+            ("state", "open".to_string()),
+        ]),
+        "list matrix PRs",
+    )
+    .await?;
+    if let Some(pr) = pulls.as_array().and_then(|a| a.first()) {
+        tracing::info!("Reusing the open matrix PR #{}", pr["number"]);
+        return Ok(pr.clone());
+    }
+
+    let main = gh_json(
+        client.get(format!("{}/git/ref/heads/{}", api, DEFAULT_BRANCH)),
+        "read main ref",
+    )
+    .await?;
+    let main_sha = main["object"]["sha"].as_str().unwrap_or_default();
+    // A leftover branch from an earlier failed run is the agent's own; start it again from main.
+    let _ = client
+        .delete(format!("{}/git/refs/heads/{}", api, branch))
+        .send()
+        .await;
+    gh_json(
+        client
+            .post(format!("{}/git/refs", api))
+            .json(&serde_json::json!({
+                "ref": format!("refs/heads/{}", branch),
+                "sha": main_sha,
+            })),
+        "create matrix branch",
+    )
+    .await?;
+    gh_json(
+        client.put(contents_url).json(&serde_json::json!({
+            "message": message,
+            "content": general_purpose::STANDARD.encode(yaml.as_bytes()),
+            "sha": file_sha,
+            "branch": branch,
+        })),
+        "commit matrix entry",
+    )
+    .await?;
+    gh_json(
+        client.post(format!("{}/pulls", api)).json(&serde_json::json!({
+            "title": message,
+            "head": branch,
+            "base": DEFAULT_BRANCH,
+            "body": "Opened by iso-agent after a successful ISO build; merged once the required checks pass.",
+        })),
+        "open matrix PR",
+    )
+    .await
+}
+
+/// Waits for check run `name` on `sha` to complete; any conclusion but success is an error.
+pub async fn wait_for_check(
+    client: &Client,
+    repo: &str,
+    sha: &str,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/commits/{}/check-runs?check_name={}",
+        OWNER, repo, sha, name
+    );
+    let deadline = Instant::now() + timeout;
+    loop {
+        // A transient API error is retried like a pending check, until the deadline.
+        if let Ok(runs) = gh_json(client.get(&url), "check runs").await {
+            let runs = runs["check_runs"].as_array().cloned().unwrap_or_default();
+            if runs.iter().any(|r| r["conclusion"] == "success") {
+                return Ok(());
+            }
+            let done: Vec<_> = runs.iter().filter(|r| r["status"] == "completed").collect();
+            if !runs.is_empty() && done.len() == runs.len() {
+                return Err(OrchestratorError::GitHubApi(
+                    format!("{}@{}", repo, &sha[..7.min(sha.len())]),
+                    format!(
+                        "required check {} concluded {}",
+                        name, done[0]["conclusion"]
+                    ),
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(OrchestratorError::Timeout(format!(
+                "check {} on {}@{}",
+                name, repo, sha
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+}
+
+/// Merges a PR whose checks passed. Retries briefly: GitHub may not see the check as satisfied yet.
+pub async fn merge_pr(
+    client: &Client,
+    repo: &str,
+    number: u64,
+    title: &str,
+) -> Result<(), OrchestratorError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/pulls/{}/merge",
+        OWNER, repo, number
+    );
+    let mut last = None;
+    for _ in 0..6 {
+        match gh_json(
+            client
+                .put(&url)
+                .json(&serde_json::json!({ "merge_method": "squash", "commit_title": title })),
+            &format!("merge {}#{}", repo, number),
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+    Err(last.expect("at least one attempt"))
 }
