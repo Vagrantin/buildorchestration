@@ -2,6 +2,21 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-10-01 (xcp-orchestrator-v0.3.8)
+
+### Changed
+
+- **iso-agent**: "what was built last" (the self-healing cross-check, and the
+  ISO state seed) is the newest non-draft release, **pre-releases included**.
+  Builds are published as candidates (pre-releases) since the promotion gate
+  (Vagrantin/xcp-hl#154), and `releases/latest` skips them.
+
+### Fixed
+
+- **iso-agent**: the release matrix entry's `build_date` is the ISO release's
+  publication day, so a `--record-matrix` backfill no longer records the day
+  it ran.
+
 ## 2026-10-01 (xcp-orchestrator-v0.3.7)
 
 ### Fixed

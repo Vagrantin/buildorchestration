@@ -271,8 +271,28 @@ pub async fn create_and_push_tag(
     }
 }
 
-/// Fetch the latest published release of a repo and resolve its tag to a
-/// commit SHA. Returns `Ok(None)` when the repo has no releases yet.
+/// One entry of a repo's release list, as far as "what was built last" needs.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReleaseListItem {
+    pub tag_name: String,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// The newest non-draft release, candidates (pre-releases) included: what was built last.
+/// `releases/latest` would skip candidates, which are every build since the promotion gate (xcp-hl#154).
+pub fn newest_built_release(releases: &[ReleaseListItem]) -> Option<&str> {
+    releases
+        .iter()
+        .filter(|r| !r.draft)
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+        .map(|r| r.tag_name.as_str())
+}
+
+/// Fetch the newest built release of a repo (see `newest_built_release`) and
+/// resolve its tag to a commit SHA. Returns `Ok(None)` when the repo has no releases yet.
 ///
 /// This is the ground truth for "what did we last build successfully" — unlike
 /// the local version-state files it survives state loss and failed runs.
@@ -281,21 +301,19 @@ pub async fn fetch_latest_release_ref(
     repo: &str,
 ) -> Result<Option<(String, String)>, OrchestratorError> {
     let url = format!(
-        "https://api.github.com/repos/{}/{}/releases/latest",
+        "https://api.github.com/repos/{}/{}/releases?per_page=30",
         OWNER, repo
     );
     let res = client.get(&url).send().await.map_err(|e| {
         OrchestratorError::GitHubApi(format!("latest release for {}", repo), e.to_string())
     })?;
-
-    if res.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-
-    let release: GHRelease =
+    let releases: Vec<ReleaseListItem> =
         parse_github_response(res, &format!("fetch_latest_release_ref for {}", repo)).await?;
-    let sha = fetch_tag_commit_sha(client, repo, &release.tag_name).await?;
-    Ok(Some((release.tag_name, sha)))
+    let Some(tag) = newest_built_release(&releases) else {
+        return Ok(None);
+    };
+    let sha = fetch_tag_commit_sha(client, repo, tag).await?;
+    Ok(Some((tag.to_string(), sha)))
 }
 
 /// Resolve a tag name to the commit SHA it points at, dereferencing annotated
@@ -503,9 +521,10 @@ mod tests {
     }
 
     use super::{
-        matrix_has_entry, next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag,
-        parse_plain_version_tag, parse_upstream_xo, split_leading_comments, workflow_push_runs_url,
-        ReleaseInfo, UpstreamXoPin,
+        matrix_has_entry, newest_built_release, next_tag_candidate, parse_ce_tag,
+        parse_pinned_xolite_tag, parse_plain_version_tag, parse_upstream_xo,
+        split_leading_comments, workflow_push_runs_url, ReleaseInfo, ReleaseListItem,
+        UpstreamXoPin,
     };
 
     /// GitHub sends `"body": null` for a release created without notes (every
@@ -656,6 +675,22 @@ mod tests {
         let (header, entries) = split_leading_comments(yaml);
         assert_eq!(header, "# head\n");
         assert_eq!(entries, "- a: 1\n# mid\n- b: 2\n");
+    }
+
+    #[test]
+    fn newest_built_release_counts_candidates_but_not_drafts() {
+        let r = |t: &str, draft: bool, at: &str| ReleaseListItem {
+            tag_name: t.to_string(),
+            draft,
+            created_at: at.to_string(),
+        };
+        let list = [
+            r("v0.1.2", false, "2026-09-29T19:00:00Z"),
+            r("v0.1.3", false, "2026-10-01T19:00:00Z"),
+            r("v0.1.4", true, "2026-10-02T19:00:00Z"),
+        ];
+        assert_eq!(newest_built_release(&list), Some("v0.1.3"));
+        assert_eq!(newest_built_release(&[]), None);
     }
 
     #[test]
@@ -1226,10 +1261,14 @@ pub async fn append_release_matrix_entry(
         return Ok(());
     }
 
+    // The ISO release's own date, so a later backfill (--record-matrix) records when it was built.
+    let date = iso_release_date(client, iso_tag)
+        .await
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
     let new_entry = format!(
         "- iso_version: \"{iso}\"\n  build_date: \"{date}\"\n  components:\n    xolite_ce:\n      version: \"{xv}\"\n      rpm: \"{xr}\"\n      upstream: \"{xu}\"\n      upstream_url: \"https://github.com/vatesfr/xen-orchestra/releases/tag/xo-lite-v{xu}\"\n    xoa_proxy:\n      version: \"{pv}\"\n      rpm: \"{pr}\"\n",
         iso = iso_tag,
-        date = Utc::now().format("%Y-%m-%d"),
+        date = date,
         xv = xolite_version,
         xr = xolite_rpm,
         xu = xolite_upstream,
@@ -1285,6 +1324,20 @@ pub async fn append_release_matrix_entry(
         number
     );
     Ok(())
+}
+
+/// Publication day (YYYY-MM-DD) of an xcp-ng-ce-iso release, if GitHub answers.
+async fn iso_release_date(client: &Client, tag: &str) -> Option<String> {
+    let url = format!(
+        "https://api.github.com/repos/{}/xcp-ng-ce-iso/releases/tags/{}",
+        OWNER, tag
+    );
+    let v = gh_json(client.get(&url), "iso release date").await.ok()?;
+    v["published_at"]
+        .as_str()
+        .or(v["created_at"].as_str())
+        .and_then(|d| d.get(..10))
+        .map(str::to_string)
 }
 
 /// How long the matrix PR may wait for its required check.
