@@ -2,6 +2,17 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- **xoa-vm-agent**: the image now carries `/etc/xoa-hl-vm-release`
+  (`built <date>, commit <sha>, release <xoa-hl tag>`), written right after
+  the xoa-hl RPM install. The stamp from Vagrantin/xcp-hl#186 had only been
+  added to build-xoa-hl's `setup-xoa-builder.sh`, which Jenkins does not run,
+  so the XOA-HL About page showed the VM version as Unknown
+  (Vagrantin/xcp-hl#220).
+
 ## 2026-10-01 (xcp-orchestrator-v0.3.8)
 
 ### Changed
