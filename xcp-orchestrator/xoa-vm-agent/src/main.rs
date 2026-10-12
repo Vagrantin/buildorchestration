@@ -83,6 +83,30 @@ const PACKER_TIMEOUT: Duration = Duration::from_secs(3600);
 /// Grace period between SIGTERM and SIGKILL when Packer times out.
 const PACKER_SIGTERM_GRACE: Duration = Duration::from_secs(30);
 
+/// Packer builds tried when the VNC console was not ready yet; other failures are not retried.
+const PACKER_ATTEMPTS: u32 = 2;
+
+/// Packer's line when it reached the VM console before the VNC server was up.
+const PACKER_VNC_RACE: &str = "Error establishing VNC session";
+
+/// A Packer build lost the race to the VM's VNC console: retried once its VM is removed.
+#[derive(Debug)]
+struct PackerVncRace {
+    vm: Option<String>,
+}
+
+impl std::fmt::Display for PackerVncRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Packer build failed: VNC console not ready ({})",
+            PACKER_VNC_RACE
+        )
+    }
+}
+
+impl std::error::Error for PackerVncRace {}
+
 /// Hard timeout waiting for the xoa-hl GA workflow to complete.
 const WORKFLOW_TIMEOUT: Duration = Duration::from_secs(3600);
 
@@ -834,15 +858,33 @@ async fn main() -> Result<()> {
     status.detail = "Running packer validate + build".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    let build_vm = match run_packer(&build_dir).await {
-        Ok(vm) => vm,
-        Err(e) => {
-            error!("Packer build failed: {}", e);
-            status.status = WorkflowStatus::Failure;
-            status.detail = format!("Packer error: {}", e);
-            status.write_to_file(STATUS_FILE)?;
-            return Err(e);
+    let mut attempt = 1;
+    let build_vm = loop {
+        let e = match run_packer(&build_dir).await {
+            Ok(vm) => break vm,
+            Err(e) => e,
+        };
+        if let Some(race) = e.downcast_ref::<PackerVncRace>() {
+            if attempt < PACKER_ATTEMPTS {
+                warn!(
+                    "Packer attempt {}/{}: {}; retrying",
+                    attempt, PACKER_ATTEMPTS, race
+                );
+                // The failed VM would stay next to the retry's: remove it, keep the cached ISO.
+                if let Some(uuid) = &race.vm {
+                    if let Err(e) = destroy_build_vm(&config, uuid).await {
+                        warn!("Could not remove failed build VM {}: {:#}", uuid, e);
+                    }
+                }
+                attempt += 1;
+                continue;
+            }
         }
+        error!("Packer build failed: {}", e);
+        status.status = WorkflowStatus::Failure;
+        status.detail = format!("Packer error: {}", e);
+        status.write_to_file(STATUS_FILE)?;
+        return Err(e);
     };
 
     // Success: the XVA is exported, so the build VM and its disks can go. Failures keep them.
@@ -1509,7 +1551,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
       "<wait5><esc><wait>",
       "linux inst.ks=http://{{{{ .HTTPIP }}}}:{{{{ .HTTPPort }}}}/inst.ks inst.text<enter>"
     ],
-    "boot_wait": "5s",
+    "boot_wait": "15s",
     "ssh_username": "root",
     "ssh_password": {rootpw},
     "ssh_timeout": "30m",
@@ -1640,6 +1682,8 @@ async fn run_packer(build_dir: &Path) -> Result<Option<String>> {
     let stderr = child.stderr.take().expect("stderr was piped");
     let instance = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let instance_seen = instance.clone();
+    let vnc_race = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let vnc_race_seen = vnc_race.clone();
 
     // Stream packer output to the agent log without blocking the wait
     let stdout_task = tokio::spawn(async move {
@@ -1653,6 +1697,9 @@ async fn run_packer(build_dir: &Path) -> Result<Option<String>> {
                     info!("[packer] {}", line.trim_end());
                     if let Some(uuid) = parse_created_instance(&line) {
                         *instance_seen.lock().unwrap() = Some(uuid);
+                    }
+                    if line.contains(PACKER_VNC_RACE) {
+                        vnc_race_seen.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
@@ -1681,6 +1728,9 @@ async fn run_packer(build_dir: &Path) -> Result<Option<String>> {
 
     let build_result = tokio::time::timeout(PACKER_TIMEOUT, child.wait()).await;
 
+    // Drain the output before reading what it reported; a failed build exits within seconds.
+    let mut stdout_task = stdout_task;
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut stdout_task).await;
     stdout_task.abort();
     stderr_task.abort();
 
@@ -1689,6 +1739,10 @@ async fn run_packer(build_dir: &Path) -> Result<Option<String>> {
             info!("Packer build finished in {:?}", start.elapsed());
             Ok(instance.lock().unwrap().clone())
         }
+        Ok(Ok(_)) if vnc_race.load(std::sync::atomic::Ordering::Relaxed) => Err(PackerVncRace {
+            vm: instance.lock().unwrap().clone(),
+        }
+        .into()),
         Ok(Ok(exit)) => {
             bail!("Packer build failed (exit code: {:?})", exit.code());
         }
@@ -2774,6 +2828,25 @@ VM_MEMORY_MB="4096"
             parse_created_instance("Created instance 'not-a-uuid'"),
             None
         );
+    }
+
+    #[test]
+    fn vnc_race_is_recognised_and_survives_anyhow() {
+        // The line from build/xoa-vm-agent #35 (2026-10-12).
+        let line = "\x1b[1;31m==> xenserver-iso: Error establishing VNC session: error parsing ProtocolVersion.\x1b[0m\n";
+        assert!(line.contains(PACKER_VNC_RACE));
+        let e: anyhow::Error = PackerVncRace {
+            vm: Some("77aed780-6354-75f1-6a02-9d15086da443".into()),
+        }
+        .into();
+        let race = e.downcast_ref::<PackerVncRace>().expect("typed error kept");
+        assert_eq!(
+            race.vm.as_deref(),
+            Some("77aed780-6354-75f1-6a02-9d15086da443")
+        );
+        assert!(anyhow::anyhow!("Packer build failed (exit code: Some(1))")
+            .downcast_ref::<PackerVncRace>()
+            .is_none());
     }
 
     #[test]
