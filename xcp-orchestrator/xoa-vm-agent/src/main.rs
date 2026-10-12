@@ -189,6 +189,8 @@ struct BuildConfig {
     /// The checksum-named ISO disk is already on the build host: Packer attaches it, no upload.
     reuse_iso_vdi: bool,
     xoa_hl_rpm_url: String,
+    /// xoa-hl release tag the RPM comes from, written into /etc/xoa-hl-vm-release.
+    xoa_hl_tag: String,
     xe_guest_utilities_url: String,
     xe_guest_utilities_xenstore_url: String,
     min_free_disk_gb: u64,
@@ -210,6 +212,7 @@ impl Default for BuildConfig {
             almalinux_iso_checksum: String::new(),
             reuse_iso_vdi: false,
             xoa_hl_rpm_url: String::new(),
+            xoa_hl_tag: String::new(),
             xe_guest_utilities_url:
                 "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-10.0.0-1.x86_64.rpm"
                     .to_string(),
@@ -1344,6 +1347,7 @@ async fn resolve_dynamic_values(
         .await
         .context("Failed to resolve xoa-hl RPM URL")?;
     info!("RPM URL: {}", config.xoa_hl_rpm_url);
+    config.xoa_hl_tag = rpm_tag.to_string();
 
     Ok(())
 }
@@ -1517,6 +1521,14 @@ usermod -aG wheel xo
     ))
 }
 
+/// Same line as build-xoa-hl's setup-xoa-builder.sh; the XOA-HL About page shows it (xcp-hl#220).
+fn release_stamp_command(xoa_hl_tag: &str) -> String {
+    format!(
+        "rel=$(rpm -q --qf '%{{RELEASE}}' xoa-hl); sha=$(echo $rel | cut -d. -f2); \
+         echo \"built $(date -u +%F), commit ${{sha#g}}, release {xoa_hl_tag}\" > /etc/xoa-hl-vm-release"
+    )
+}
+
 /// keep_vm "always": the plugin ignores -on-error, so the agent destroys the VM itself on success.
 fn generate_packer_template(config: &BuildConfig) -> String {
     format!(
@@ -1564,6 +1576,10 @@ fn generate_packer_template(config: &BuildConfig) -> String {
       "curl -fsSL '{rpm_url}' -o /tmp/xoa-hl.rpm",
       "dnf install -y /tmp/xoa-hl.rpm",
       "rm -f /tmp/xoa-hl.rpm"
+    ]}},
+    {{"type":"shell","inline":[
+      {stamp},
+      "cat /etc/xoa-hl-vm-release"
     ]}},
     {{"type":"file","source":"scripts/xoa-first-boot.sh","destination":"/root/xoa-first-boot.sh"}},
     {{"type":"file","source":"scripts/xoa-credentials.sh","destination":"/root/xoa-credentials.sh"}},
@@ -1615,6 +1631,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         xe_xenstore_url = config.xe_guest_utilities_xenstore_url,
         xe_url = config.xe_guest_utilities_url,
         rpm_url = config.xoa_hl_rpm_url,
+        stamp = serde_json::Value::from(release_stamp_command(&config.xoa_hl_tag)),
         output_dir = OUTPUT_DIR,
     )
 }
@@ -2636,6 +2653,51 @@ VM_MEMORY_MB="4096"
         let json: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
         assert_eq!(json["builders"][0]["keep_vm"], "always");
+    }
+
+    #[test]
+    fn packer_template_stamps_the_release_after_the_rpm() {
+        let config = BuildConfig {
+            xoa_hl_tag: "v5.113.2_e281c536-ce38".to_string(),
+            ..Default::default()
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&config)).unwrap();
+        let steps = json["provisioners"].as_array().unwrap();
+        let inline = |s: &serde_json::Value| s["inline"].to_string();
+        let rpm = steps
+            .iter()
+            .position(|s| inline(s).contains("xoa-hl.rpm"))
+            .unwrap();
+        let stamp = inline(&steps[rpm + 1]);
+        assert!(stamp.contains("> /etc/xoa-hl-vm-release"));
+        assert!(stamp.contains("release v5.113.2_e281c536-ce38"));
+    }
+
+    #[test]
+    fn release_stamp_command_writes_the_about_page_line() {
+        // A fake rpm stands in for the image's; the file goes to a temp dir.
+        let dir = std::env::temp_dir().join(format!("stamp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = release_stamp_command("v5.113.2_e281c536-ce38").replace(
+            "/etc/xoa-hl-vm-release",
+            &dir.join("out").display().to_string(),
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "rpm() {{ echo 38.g5f33c81.xcpng8.3.el9; }}; {script}"
+            ))
+            .status()
+            .unwrap();
+        assert!(out.success());
+        let line = std::fs::read_to_string(dir.join("out")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(line.starts_with("built 20"), "{line}");
+        assert!(
+            line.ends_with(", commit 5f33c81, release v5.113.2_e281c536-ce38\n"),
+            "{line}"
+        );
     }
 
     #[test]
