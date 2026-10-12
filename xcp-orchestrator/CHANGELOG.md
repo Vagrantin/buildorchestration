@@ -2,6 +2,15 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- **xoa-vm-agent**: Packer waits 15 s, not 5 s, before opening the build VM's
+  VNC console, and a build that fails with `Error establishing VNC session`
+  is retried once after its VM is removed (the cached ISO is kept). Other
+  Packer failures are not retried. Seen on Jenkins build/xoa-vm-agent #35.
+
 ## 2026-10-01 (xcp-orchestrator-v0.3.8)
 
 ### Changed
