@@ -1521,7 +1521,6 @@ usermod -aG wheel xo
     ))
 }
 
-/// keep_vm "always": the plugin ignores -on-error, so the agent destroys the VM itself on success.
 /// Same line as build-xoa-hl's setup-xoa-builder.sh; the XOA-HL About page shows it (xcp-hl#220).
 fn release_stamp_command(xoa_hl_tag: &str) -> String {
     format!(
@@ -1530,6 +1529,7 @@ fn release_stamp_command(xoa_hl_tag: &str) -> String {
     )
 }
 
+/// keep_vm "always": the plugin ignores -on-error, so the agent destroys the VM itself on success.
 fn generate_packer_template(config: &BuildConfig) -> String {
     format!(
         r#"{{
