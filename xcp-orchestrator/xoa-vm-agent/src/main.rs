@@ -2196,6 +2196,27 @@ struct Asset {
     state: String,
 }
 
+/// Release asset name of the image, fixed so a rebuild replaces it (Vagrantin/xcp-hl#261).
+fn image_asset_name(local_name: &str) -> &'static str {
+    if local_name.ends_with(".xva.gz") {
+        "XOA-hl.xva.gz"
+    } else {
+        "XOA-hl.xva"
+    }
+}
+
+fn is_image_asset(name: &str) -> bool {
+    name.ends_with(".xva") || name.ends_with(".xva.gz")
+}
+
+/// Uploaded images other than `keep`: earlier builds under another name, removed once `keep` is in place.
+fn superseded_images<'a>(assets: &'a [Asset], keep: &str) -> Vec<&'a Asset> {
+    assets
+        .iter()
+        .filter(|a| a.state == "uploaded" && a.name != keep && is_image_asset(&a.name))
+        .collect()
+}
+
 /// Uploads the XVA, retrying a failed attempt from scratch.
 async fn upload_asset(
     client: &reqwest::Client,
@@ -2241,14 +2262,17 @@ async fn upload_asset_once(
         .with_context(|| format!("Cannot stat {}", xva_path.display()))?
         .len();
 
-    let file_name = xva_path
+    let local_name = xva_path
         .file_name()
         .context("XVA path has no filename")?
         .to_string_lossy()
         .to_string();
+    // The local file is named after the per-build VM; the release asset keeps one name.
+    let file_name = image_asset_name(&local_name).to_string();
 
     info!(
-        "Uploading {} ({:.2} GB)...",
+        "Uploading {} as {} ({:.2} GB)...",
+        local_name,
         file_name,
         file_size as f64 / (1024.0_f64.powi(3))
     );
@@ -2335,6 +2359,20 @@ async fn upload_asset_once(
             file_name, old.id, new.id
         );
     }
+    for stale in superseded_images(&existing, &file_name) {
+        client
+            .delete(&stale.url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| {
+                format!(
+                    "Failed to delete superseded image {} ({})",
+                    stale.name, stale.id
+                )
+            })?;
+        info!("Deleted superseded image {} ({})", stale.name, stale.id);
+    }
     Ok(())
 }
 
@@ -2415,6 +2453,36 @@ mod tests {
             sha,
             "newsha"
         ));
+    }
+
+    #[test]
+    fn image_asset_name_is_fixed_whatever_the_build_vm() {
+        assert_eq!(image_asset_name("qa-xoa-build-48.xva"), "XOA-hl.xva");
+        assert_eq!(image_asset_name("XOA-hl.xva"), "XOA-hl.xva");
+        assert_eq!(image_asset_name("qa-xoa-build-7.xva.gz"), "XOA-hl.xva.gz");
+    }
+
+    #[test]
+    fn superseded_images_are_other_uploaded_images_only() {
+        let asset = |id, name: &str, state: &str| Asset {
+            id,
+            name: name.to_string(),
+            url: format!("https://api.example/assets/{}", id),
+            state: state.to_string(),
+        };
+        let assets = vec![
+            asset(1, "qa-xoa-build-36.xva", "uploaded"),
+            asset(2, "qa-xoa-build-37.xva", "uploaded"),
+            asset(3, "XOA-hl.xva", "uploaded"),
+            asset(4, "XOA-hl.xva.new", "uploaded"),
+            asset(5, "qa-xoa-build-38.xva", "starter"),
+            asset(6, "SHA256SUMS", "uploaded"),
+        ];
+        let ids: Vec<u64> = superseded_images(&assets, "XOA-hl.xva")
+            .iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
     }
 
     #[test]

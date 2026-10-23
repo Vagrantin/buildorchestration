@@ -2,6 +2,18 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 2026-10-23 (xcp-orchestrator-v0.3.10)
+
+### Fixed
+
+- **xoa-vm-agent**: the image is uploaded as `XOA-hl.xva` (`XOA-hl.xva.gz`
+  when compressed), whatever the local Packer file is called. Since the build
+  VM is named `qa-xoa-build-<N>` (Vagrantin/jenkins-infra#96), each rebuild
+  added a second image to the same `xoa-image-*` release. Other uploaded
+  images on that release are now deleted once the new one is in place, so
+  Deploy XOA, which takes the first `.xva`, cannot pick an older build
+  (Vagrantin/xcp-hl#261).
+
 ## 2026-10-12 (xcp-orchestrator-v0.3.9)
 
 ### Fixed
