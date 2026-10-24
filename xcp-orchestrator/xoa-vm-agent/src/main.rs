@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 
 use chrono::{DateTime, Utc};
 use shared::{
-    append_xoa_release_matrix_entry, create_and_push_tag, create_github_client,
+    append_changelog_entry, append_xoa_release_matrix_entry, create_and_push_tag, create_github_client,
     fetch_release_by_tag, fetch_releases,
     fetch_repo_head_sha, fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, list_active_runs,
     load_credential, load_github_token, locate_tag_triggered_run, only_non_build_changes,
@@ -1050,6 +1050,9 @@ async fn record_image_matrix(client: &reqwest::Client, image_tag: &str, rpm_tag:
         bail!("image {} has {} XVA assets; resolve #261 before recording it", image_tag, images.len());
     }
     append_xoa_release_matrix_entry(client, image_tag, rpm_tag, &images[0].name).await?;
+    append_changelog_entry(client, "build-xoa-hl", image_tag, &[
+        ("build-xoa-hl", image_tag), ("xoa-hl", rpm_tag),
+    ]).await?;
     Ok(())
 }
 
