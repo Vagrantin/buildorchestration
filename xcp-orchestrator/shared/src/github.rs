@@ -521,11 +521,36 @@ mod tests {
     }
 
     use super::{
-        matrix_has_entry, newest_built_release, next_tag_candidate, parse_ce_tag,
+        format_xoa_matrix_entry, matrix_has_entry, matrix_has_image_entry,
+        newest_built_release, next_tag_candidate, parse_ce_tag,
         parse_pinned_xolite_tag, parse_plain_version_tag, parse_upstream_xo,
         split_leading_comments, workflow_push_runs_url, ReleaseInfo, ReleaseListItem,
         UpstreamXoPin,
     };
+
+    #[test]
+    fn xoa_matrix_entry_records_the_published_asset_and_pin() {
+        let row = format_xoa_matrix_entry(
+            "xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40",
+            "XOA-hl.xva", "2026-10-22",
+        ).unwrap();
+        assert!(row.contains("asset: \"XOA-hl.xva\""));
+        assert!(row.contains("xoa_hl_version: \"v5.113.2_e281c536\""));
+        assert!(row.contains("upstream_xo: \"5.113.2\""));
+        assert!(matrix_has_image_entry(&row, "xoa-image-20261022-a280852"));
+        assert!(!matrix_has_image_entry(&row, "xoa-image-20261022-a28085"));
+    }
+
+    #[test]
+    fn xoa_matrix_entry_rejects_unsafe_or_unpinned_values() {
+        for (tag, rpm, asset) in [
+            ("xoa-image-20261022-a280852", "v5.113.2-ce40", "XOA-hl.xva"),
+            ("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "bad\".xva"),
+            ("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "notes.txt"),
+        ] {
+            assert!(format_xoa_matrix_entry(tag, rpm, asset, "2026-10-22").is_err());
+        }
+    }
 
     /// GitHub sends `"body": null` for a release created without notes (every
     /// xoa-hl ce release is one), which used to abort the whole release list.
@@ -1326,6 +1351,108 @@ pub async fn append_release_matrix_entry(
     Ok(())
 }
 
+/// Record a published XOA image in the independent image-release matrix.
+/// The asset is the actual release asset name, not the temporary build VM name.
+pub async fn append_xoa_release_matrix_entry(
+    client: &Client,
+    image_tag: &str,
+    rpm_tag: &str,
+    asset: &str,
+) -> Result<(), OrchestratorError> {
+    use base64::{engine::general_purpose, Engine as _};
+
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/contents/{}",
+        OWNER, DOCS_REPO, XOA_RELEASES_DATA_PATH
+    );
+    let existing: GHFileContent = parse_github_response(
+        client.get(&url).send().await.map_err(|e| {
+            OrchestratorError::GitHubApi("xoa release matrix GET".into(), e.to_string())
+        })?,
+        "xoa release matrix GET",
+    )
+    .await?;
+    let cleaned: String = existing.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let content = String::from_utf8(
+        general_purpose::STANDARD
+            .decode(cleaned)
+            .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?,
+    )
+    .map_err(OrchestratorError::FromUtf8)?;
+    if matrix_has_image_entry(&content, image_tag) {
+        tracing::info!("XOA release matrix already records {}", image_tag);
+        return Ok(());
+    }
+
+    let date = image_release_date(client, image_tag).await.ok_or_else(|| {
+        OrchestratorError::VersionFormat(format!("no publication date for image {}", image_tag))
+    })?;
+    let row = format_xoa_matrix_entry(image_tag, rpm_tag, asset, &date)?;
+    let (header, entries) = split_leading_comments(&content);
+    let updated = format!("{}{}\n{}", header, row.trim_end(), entries);
+    let message = format!("docs: record XOA image {} in matrix", image_tag);
+    let branch = format!("xoa-release-matrix/{}", image_tag);
+    let pr = open_matrix_pr(client, &url, &branch, &message, &updated, &existing.sha).await?;
+    let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
+    let number = pr["number"].as_u64().unwrap_or_default();
+    wait_for_check(client, DOCS_REPO, head_sha, "gitleaks", MATRIX_CHECK_TIMEOUT).await?;
+    merge_pr(client, DOCS_REPO, number, &message).await?;
+    let _ = client
+        .delete(format!(
+            "https://api.github.com/repos/{}/{}/git/refs/heads/{}",
+            OWNER, DOCS_REPO, branch
+        ))
+        .send()
+        .await;
+    Ok(())
+}
+
+pub fn matrix_has_image_entry(yaml: &str, tag: &str) -> bool {
+    let needle = format!("image_tag: \"{}\"", tag);
+    yaml.lines()
+        .any(|line| line.trim_start().trim_start_matches("- ") == needle)
+}
+
+pub fn format_xoa_matrix_entry(
+    image_tag: &str,
+    rpm_tag: &str,
+    asset: &str,
+    date: &str,
+) -> Result<String, OrchestratorError> {
+    // These values are written into YAML and URLs: refuse unexpected syntax.
+    let safe = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    let version = rpm_tag
+        .strip_prefix('v')
+        .and_then(|s| s.rsplit_once("-ce"))
+        .filter(|(_, counter)| !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(version, _)| version)
+        .ok_or_else(|| OrchestratorError::VersionFormat(format!("invalid xoa-hl RPM tag: {}", rpm_tag)))?;
+    let (upstream, commit) = version.split_once('_').ok_or_else(|| {
+        OrchestratorError::VersionFormat(format!("missing XO pin in RPM tag: {}", rpm_tag))
+    })?;
+    if !image_tag.starts_with("xoa-image-") || !safe(image_tag) || !safe(asset)
+        || !asset.ends_with(".xva") && !asset.ends_with(".xva.gz")
+        || !safe(version) || !safe(upstream) || commit.len() != XO_SHORT_SHA_LEN
+        || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+        || date.len() != 10 || !date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() })
+    {
+        return Err(OrchestratorError::VersionFormat("invalid XOA matrix entry".into()));
+    }
+    Ok(format!(
+        "- image_tag: \"{image_tag}\"\n  build_date: \"{date}\"\n  asset: \"{asset}\"\n  xoa_hl_version: \"v{version}\"\n  upstream_xo: \"{upstream}\"\n  upstream_url: \"https://github.com/vatesfr/xen-orchestra/commit/{commit}\"\n"
+    ))
+}
+
+async fn image_release_date(client: &Client, tag: &str) -> Option<String> {
+    let url = format!("https://api.github.com/repos/{}/build-xoa-hl/releases/tags/{}", OWNER, tag);
+    let release = gh_json(client.get(&url), "XOA image release date").await.ok()?;
+    release["published_at"]
+        .as_str()
+        .or(release["created_at"].as_str())
+        .and_then(|date| date.get(..10))
+        .map(str::to_string)
+}
+
 /// Publication day (YYYY-MM-DD) of an xcp-ng-ce-iso release, if GitHub answers.
 async fn iso_release_date(client: &Client, tag: &str) -> Option<String> {
     let url = format!(
@@ -1422,7 +1549,7 @@ async fn open_matrix_pr(
             "title": message,
             "head": branch,
             "base": DEFAULT_BRANCH,
-            "body": "Opened by iso-agent after a successful ISO build; merged once the required checks pass.",
+            "body": "Opened by a release agent after successful publication; merged once the required checks pass.",
         })),
         "open matrix PR",
     )

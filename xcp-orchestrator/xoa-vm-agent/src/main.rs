@@ -19,7 +19,8 @@ use anyhow::{bail, Context, Result};
 
 use chrono::{DateTime, Utc};
 use shared::{
-    create_and_push_tag, create_github_client, fetch_release_by_tag, fetch_releases,
+    append_xoa_release_matrix_entry, create_and_push_tag, create_github_client,
+    fetch_release_by_tag, fetch_releases,
     fetch_repo_head_sha, fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, list_active_runs,
     load_credential, load_github_token, locate_tag_triggered_run, only_non_build_changes,
     parse_ce_tag, query_run_conclusion, AgentStatus, ComponentVersionState, ReleaseInfo,
@@ -472,14 +473,19 @@ async fn main() -> Result<()> {
     info!("Starting XOA VM Agent...");
 
     let mut force = false;
+    let mut record_matrix = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--force" => force = true,
+            "--record-matrix" => record_matrix = true,
             other => bail!(
-                "Invalid argument: {} (usage: xoa-vm-agent [--force])",
+                "Invalid argument: {} (usage: xoa-vm-agent [--force | --record-matrix])",
                 other
             ),
         }
+    }
+    if force && record_matrix {
+        bail!("--force and --record-matrix cannot be combined");
     }
     if force {
         info!("FORCE MODE: image-build skip rules will be bypassed.");
@@ -502,6 +508,17 @@ async fn main() -> Result<()> {
     let mut version_state = XoaHlVersionState::load()?;
     let token = load_github_token().context("Failed to load GitHub token")?;
     let client = create_github_client(&token)?;
+
+    if record_matrix {
+        if version_state.image_tag.is_empty() || version_state.rpm.last_tag.is_empty() {
+            bail!("--record-matrix needs a saved image and xoa-hl RPM tag");
+        }
+        record_image_matrix(&client, &version_state.image_tag, &version_state.rpm.last_tag).await?;
+        status.status = WorkflowStatus::Success;
+        status.detail = format!("Recorded image {} in release matrix", version_state.image_tag);
+        status.write_to_file(STATUS_FILE)?;
+        return Ok(());
+    }
 
     // ── PHASE 1: Determine if rebuild is needed ──────────────────────────────
     info!("PHASE 1: Checking if rebuild is needed...");
@@ -550,6 +567,9 @@ async fn main() -> Result<()> {
             &repo_head_sha[..7],
             &build_xoa_hl_head_sha[..7]
         );
+        if !version_state.rpm.last_tag.is_empty() {
+            record_image_matrix(&client, &version_state.image_tag, &version_state.rpm.last_tag).await?;
+        }
         status.status = WorkflowStatus::Skipped;
         status.detail = format!("No changes (SHA: {})", &repo_head_sha[..7]);
         status.write_to_file(STATUS_FILE)?;
@@ -578,6 +598,9 @@ async fn main() -> Result<()> {
                         "Image {} already published for HEAD (SHA: {}), skipping.",
                         image.tag_name, short_sha
                     );
+                    if !version_state.rpm.last_tag.is_empty() {
+                        record_image_matrix(&client, &image.tag_name, &version_state.rpm.last_tag).await?;
+                    }
                     version_state.image_xoa_hl_sha = repo_head_sha.clone();
                     version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
                     version_state.image_tag = image.tag_name.clone();
@@ -993,6 +1016,10 @@ async fn main() -> Result<()> {
         .save()
         .context("Failed to persist version state")?;
 
+    // State is saved before the docs PR. If GitHub/CI fails, the next normal
+    // no-change run (or --record-matrix) retries without rebuilding the XVA.
+    record_image_matrix(&client, &image_tag, &rpm_tag).await?;
+
     // ── PHASE 11: Write final status ──────────────────────────────────────────
     info!("PHASE 11: Finalizing...");
     status.phase = "phase_11_finalize".to_string();
@@ -1006,6 +1033,23 @@ async fn main() -> Result<()> {
     status.write_to_file(STATUS_FILE)?;
 
     info!("XOA VM Agent completed successfully! Tag: {}", image_tag);
+    Ok(())
+}
+
+async fn record_image_matrix(client: &reqwest::Client, image_tag: &str, rpm_tag: &str) -> Result<()> {
+    let release = fetch_release_by_tag(client, "build-xoa-hl", image_tag)
+        .await?
+        .with_context(|| format!("published image {} not found", image_tag))?;
+    if release.draft {
+        bail!("image {} is still a draft", image_tag);
+    }
+    let images: Vec<_> = release.assets.iter()
+        .filter(|asset| asset.name.ends_with(".xva") || asset.name.ends_with(".xva.gz"))
+        .collect();
+    if images.len() != 1 {
+        bail!("image {} has {} XVA assets; resolve #261 before recording it", image_tag, images.len());
+    }
+    append_xoa_release_matrix_entry(client, image_tag, rpm_tag, &images[0].name).await?;
     Ok(())
 }
 

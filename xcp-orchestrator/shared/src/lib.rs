@@ -27,6 +27,7 @@ pub const DOCS_REPO: &str = "xcp-hl";
 
 /// Path to releases data file in docs repo
 pub const RELEASES_DATA_PATH: &str = "docs/_data/releases.yml";
+pub const XOA_RELEASES_DATA_PATH: &str = "docs/_data/xoa_releases.yml";
 
 /// Target XCP-ng base release version
 pub const XCPNG_TARGET_VERSION: &str = "8.3";
