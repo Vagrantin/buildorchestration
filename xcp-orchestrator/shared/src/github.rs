@@ -538,10 +538,13 @@ mod tests {
     fn xoa_matrix_entry_records_the_published_asset_and_pin() {
         let row = format_xoa_matrix_entry(
             "xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40",
+            "xoa-hl-5.113.2_e281c536-40.ga280852.xcpng8.3.el9.x86_64",
             "XOA-hl.xva", "2026-10-22",
         ).unwrap();
         assert!(row.contains("asset: \"XOA-hl.xva\""));
         assert!(row.contains("xoa_hl_version: \"v5.113.2_e281c536\""));
+        assert!(row.contains("rpm_tag: \"v5.113.2_e281c536-ce40\""));
+        assert!(row.contains("rpm: \"xoa-hl-5.113.2_e281c536-40.ga280852.xcpng8.3.el9.x86_64\""));
         assert!(row.contains("upstream_xo: \"5.113.2\""));
         assert!(matrix_has_image_entry(&row, "xoa-image-20261022-a280852"));
         assert!(!matrix_has_image_entry(&row, "xoa-image-20261022-a28085"));
@@ -554,8 +557,9 @@ mod tests {
             ("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "bad\".xva"),
             ("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "notes.txt"),
         ] {
-            assert!(format_xoa_matrix_entry(tag, rpm, asset, "2026-10-22").is_err());
+            assert!(format_xoa_matrix_entry(tag, rpm, "xoa-hl-5.113.2_e281c536-40.gsha.x86_64", asset, "2026-10-22").is_err());
         }
+        assert!(format_xoa_matrix_entry("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "bad\"rpm", "XOA-hl.xva", "2026-10-22").is_err());
     }
 
     /// GitHub sends `"body": null` for a release created without notes (every
@@ -1404,7 +1408,8 @@ pub async fn append_xoa_release_matrix_entry(
     let date = image_release_date(client, image_tag).await.ok_or_else(|| {
         OrchestratorError::VersionFormat(format!("no publication date for image {}", image_tag))
     })?;
-    let row = format_xoa_matrix_entry(image_tag, rpm_tag, asset, &date)?;
+    let rpm = fetch_release_rpm_name(client, "xoa-hl", rpm_tag).await?;
+    let row = format_xoa_matrix_entry(image_tag, rpm_tag, &rpm, asset, &date)?;
     let (header, entries) = split_leading_comments(&content);
     let updated = format!("{}{}\n{}", header, row.trim_end(), entries);
     let message = format!("docs: record XOA image {} in matrix", image_tag);
@@ -1433,6 +1438,7 @@ pub fn matrix_has_image_entry(yaml: &str, tag: &str) -> bool {
 pub fn format_xoa_matrix_entry(
     image_tag: &str,
     rpm_tag: &str,
+    rpm: &str,
     asset: &str,
     date: &str,
 ) -> Result<String, OrchestratorError> {
@@ -1448,6 +1454,7 @@ pub fn format_xoa_matrix_entry(
         OrchestratorError::VersionFormat(format!("missing XO pin in RPM tag: {}", rpm_tag))
     })?;
     if !image_tag.starts_with("xoa-image-") || !safe(image_tag) || !safe(asset)
+        || !safe(rpm) || !rpm.starts_with(&format!("xoa-hl-{}-", version))
         || !asset.ends_with(".xva") && !asset.ends_with(".xva.gz")
         || !safe(version) || !safe(upstream) || commit.len() != XO_SHORT_SHA_LEN
         || !commit.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1456,7 +1463,7 @@ pub fn format_xoa_matrix_entry(
         return Err(OrchestratorError::VersionFormat("invalid XOA matrix entry".into()));
     }
     Ok(format!(
-        "- image_tag: \"{image_tag}\"\n  build_date: \"{date}\"\n  asset: \"{asset}\"\n  xoa_hl_version: \"v{version}\"\n  upstream_xo: \"{upstream}\"\n  upstream_url: \"https://github.com/vatesfr/xen-orchestra/commit/{commit}\"\n"
+        "- image_tag: \"{image_tag}\"\n  build_date: \"{date}\"\n  asset: \"{asset}\"\n  xoa_hl_version: \"v{version}\"\n  rpm_tag: \"{rpm_tag}\"\n  rpm: \"{rpm}\"\n  upstream_xo: \"{upstream}\"\n  upstream_url: \"https://github.com/vatesfr/xen-orchestra/commit/{commit}\"\n"
     ))
 }
 
