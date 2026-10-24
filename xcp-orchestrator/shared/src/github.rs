@@ -1467,6 +1467,168 @@ async fn iso_release_date(client: &Client, tag: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+const CHANGELOG_REPOS: [&str; 6] = [
+    "xcp-hl", "xoa-hl", "xolite-ce", "xoa-proxy", "xcp-ng-ce-iso", "build-xoa-hl",
+];
+
+/// Record release notes once the published release and its matrix row exist.
+/// The release publication timestamps delimit the PR merge window, so the
+/// publisher does not need a checkout or an appliance to produce the entry.
+pub async fn append_changelog_entry(
+    client: &Client,
+    release_repo: &str,
+    tag: &str,
+    components: &[(&str, &str)],
+) -> Result<(), OrchestratorError> {
+    use base64::{engine::general_purpose, Engine as _};
+    if !["xcp-ng-ce-iso", "build-xoa-hl"].contains(&release_repo)
+        || tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        || components.is_empty()
+        || components.iter().any(|(repo, version)| !CHANGELOG_REPOS.contains(repo) || version.is_empty())
+    {
+        return Err(OrchestratorError::InvalidArgument("invalid changelog release identity".into()));
+    }
+
+    let url = format!("https://api.github.com/repos/{}/{}/contents/{}", OWNER, DOCS_REPO, CHANGELOG_DATA_PATH);
+    let existing: GHFileContent = parse_github_response(
+        client.get(&url).send().await.map_err(|e|
+            OrchestratorError::GitHubApi("read changelog data".into(), e.to_string())
+        )?, "read changelog data"
+    ).await?;
+    let content = String::from_utf8(general_purpose::STANDARD.decode(
+        existing.content.chars().filter(|c| !c.is_whitespace()).collect::<String>()
+    ).map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?)?;
+    let mut entries: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+    if entries.iter().any(|entry| entry["repository"] == release_repo && entry["tag"] == tag) {
+        tracing::info!("Changelog already records {}@{}", release_repo, tag);
+        return Ok(());
+    }
+
+    let release_url = format!("https://api.github.com/repos/{}/{}/releases/tags/{}", OWNER, release_repo, tag);
+    let release = gh_json(client.get(release_url), "read published release").await?;
+    if release["draft"] != false {
+        return Err(OrchestratorError::VersionFormat(format!("{}@{} is not published", release_repo, tag)));
+    }
+    let published = release["published_at"].as_str().ok_or_else(||
+        OrchestratorError::VersionFormat(format!("{}@{} has no publication time", release_repo, tag))
+    )?;
+    let date = published.get(..10).ok_or_else(||
+        OrchestratorError::VersionFormat(format!("{}@{} has an invalid publication time", release_repo, tag))
+    )?;
+    let previous = previous_release_time(client, release_repo, tag, published).await?;
+    let changes = if let Some(start) = previous {
+        merged_changelog_prs(client, &start, published).await?
+    } else {
+        Vec::new()
+    };
+    let entry = serde_json::json!({
+        "repository": release_repo,
+        "tag": tag,
+        "date": date,
+        "channel": if release["prerelease"] == true { "candidate" } else { "stable" },
+        "components": components.iter().map(|(repository, version)| serde_json::json!({
+            "repository": repository, "version": version
+        })).collect::<Vec<_>>(),
+        "changes": changes,
+    });
+    entries.insert(0, entry);
+    let updated = format!("{}\n", serde_json::to_string_pretty(&entries)?);
+    let message = format!("docs: record {} {} in changelog", release_repo, tag);
+    let branch = format!("release-changelog/{}", tag);
+    let pr = open_matrix_pr(client, &url, &branch, &message, &updated, &existing.sha).await?;
+    let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
+    let number = pr["number"].as_u64().unwrap_or_default();
+    wait_for_check(client, DOCS_REPO, head_sha, "gitleaks", MATRIX_CHECK_TIMEOUT).await?;
+    merge_pr(client, DOCS_REPO, number, &message).await?;
+    let _ = client.delete(format!(
+        "https://api.github.com/repos/{}/{}/git/refs/heads/{}", OWNER, DOCS_REPO, branch
+    )).send().await;
+    tracing::info!("Changelog updated with {}@{} via #{}", release_repo, tag, number);
+    Ok(())
+}
+
+async fn previous_release_time(
+    client: &Client, repo: &str, tag: &str, published: &str,
+) -> Result<Option<String>, OrchestratorError> {
+    let mut previous: Option<String> = None;
+    // Fetch enough pages for older releases, including delayed backfills.
+    for page in 1..=10 {
+        let url = format!("https://api.github.com/repos/{}/{}/releases", OWNER, repo);
+        let releases = gh_json(client.get(&url).query(&[("per_page", "100"), ("page", &page.to_string())]), "list releases for changelog").await?;
+        let releases = releases.as_array().ok_or_else(|| OrchestratorError::VersionFormat("invalid releases response".into()))?;
+        for item in releases {
+            if item["draft"] == true || item["tag_name"] == tag { continue; }
+            if let Some(time) = item["published_at"].as_str() {
+                if time < published && previous.as_deref().map_or(true, |old| time > old) {
+                    previous = Some(time.to_string());
+                }
+            }
+        }
+        if releases.len() < 100 { return Ok(previous); }
+    }
+    Err(OrchestratorError::VersionFormat("release history exceeds changelog pagination limit".into()))
+}
+
+fn changelog_changes(repo: &str, items: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut changes = Vec::new();
+    for item in items {
+        if item["labels"].as_array().map_or(false, |labels| labels.iter().any(|label|
+            label["name"].as_str().map_or(false, |name| name.eq_ignore_ascii_case("skip-changelog"))
+        )) { continue; }
+        let (Some(title), Some(url)) = (item["title"].as_str(), item["html_url"].as_str()) else { continue; };
+        let prefix = format!("https://github.com/{}/{}/pull/", OWNER, repo);
+        if !title.trim().is_empty() && url.strip_prefix(&prefix).map_or(false, |number|
+            !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) && !number.starts_with('0')
+        ) {
+            changes.push(serde_json::json!({"repository": repo, "title": title, "url": url}));
+        }
+    }
+    changes
+}
+
+async fn merged_changelog_prs(
+    client: &Client, start: &str, end: &str,
+) -> Result<Vec<serde_json::Value>, OrchestratorError> {
+    let mut changes = Vec::new();
+    for repo in CHANGELOG_REPOS {
+        let query = format!("repo:{}/{} is:pr is:merged merged:>{} merged:<={}", OWNER, repo, start, end);
+        for page in 1..=10 {
+            let search = gh_json(client.get("https://api.github.com/search/issues").query(&[
+                ("q", query.as_str()), ("per_page", "100"), ("page", &page.to_string())
+            ]), "search merged changelog PRs").await?;
+            if search["incomplete_results"] == true {
+                return Err(OrchestratorError::VersionFormat(format!("incomplete merged PR search for {}", repo)));
+            }
+            if search["total_count"].as_u64().unwrap_or(1001) > 1000 {
+                return Err(OrchestratorError::VersionFormat(format!("too many merged PRs for {}", repo)));
+            }
+            let items = search["items"].as_array().ok_or_else(|| OrchestratorError::VersionFormat("invalid PR search response".into()))?;
+            changes.extend(changelog_changes(repo, items));
+            if items.len() < 100 { break; }
+        }
+    }
+    changes.sort_by(|a, b| a["url"].as_str().cmp(&b["url"].as_str()));
+    changes.dedup_by(|a, b| a["url"] == b["url"]);
+    Ok(changes)
+}
+
+#[cfg(test)]
+mod changelog_tests {
+    use super::*;
+
+    #[test]
+    fn filters_housekeeping_and_mismatched_pr_links() {
+        let items = vec![
+            serde_json::json!({"title":"A fix", "html_url":"https://github.com/Vagrantin/xoa-hl/pull/12", "labels":[]}),
+            serde_json::json!({"title":"CI", "html_url":"https://github.com/Vagrantin/xoa-hl/pull/13", "labels":[{"name":"skip-changelog"}]}),
+            serde_json::json!({"title":"Other", "html_url":"https://github.com/Vagrantin/xcp-hl/pull/14", "labels":[]}),
+        ];
+        let changes = changelog_changes("xoa-hl", &items);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["title"], "A fix");
+    }
+}
+
 /// How long the matrix PR may wait for its required check.
 const MATRIX_CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 

@@ -9,7 +9,7 @@
 
 use chrono::Utc;
 use shared::{
-    append_release_matrix_entry, create_and_push_tag, create_github_client, delete_tag,
+    append_changelog_entry, append_release_matrix_entry, create_and_push_tag, create_github_client, delete_tag,
     dispatch_workflow, fetch_latest_release_ref, fetch_latest_upstream_xolite_tag,
     fetch_pinned_xolite_tag, fetch_release_rpm_name, fetch_repo_head_sha,
     fetch_upstream_xolite_version, fetch_xoa_proxy_version, load_github_token,
@@ -315,7 +315,12 @@ async fn record_last_iso_in_matrix(
         &iso.last_xoa_proxy_tag,
         &xoa_proxy_rpm,
     )
-    .await
+    .await?;
+    append_changelog_entry(client, "xcp-ng-ce-iso", &iso.last_tag, &[
+        ("xcp-ng-ce-iso", &iso.last_tag),
+        ("xolite-ce", &iso.last_xolite_tag),
+        ("xoa-proxy", &iso.last_xoa_proxy_tag),
+    ]).await
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -882,6 +887,11 @@ async fn main() -> Result<(), OrchestratorError> {
                     &xoa_proxy_rpm,
                 )
                 .await?;
+                append_changelog_entry(&client, "xcp-ng-ce-iso", &actual_iso_tag, &[
+                    ("xcp-ng-ce-iso", &actual_iso_tag),
+                    ("xolite-ce", &xolite_version),
+                    ("xoa-proxy", &xoa_proxy_version),
+                ]).await?;
 
                 status.phase = "completed".to_string();
                 status.detail = format!("ISO build successful: {}", actual_iso_tag);
