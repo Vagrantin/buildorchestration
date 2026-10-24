@@ -278,16 +278,17 @@ pub struct ReleaseListItem {
     #[serde(default)]
     pub draft: bool,
     #[serde(default)]
-    pub created_at: String,
+    pub published_at: Option<String>,
 }
 
 /// The newest non-draft release, candidates (pre-releases) included: what was built last.
 /// `releases/latest` would skip candidates, which are every build since the promotion gate (xcp-hl#154).
+/// GitHub's created_at can be the tagged commit's timestamp, not publication time (xcp-hl#41).
 pub fn newest_built_release(releases: &[ReleaseListItem]) -> Option<&str> {
     releases
         .iter()
-        .filter(|r| !r.draft)
-        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+        .filter(|r| !r.draft && r.published_at.is_some())
+        .max_by(|a, b| a.published_at.cmp(&b.published_at))
         .map(|r| r.tag_name.as_str())
 }
 
@@ -309,6 +310,11 @@ pub async fn fetch_latest_release_ref(
     })?;
     let releases: Vec<ReleaseListItem> =
         parse_github_response(res, &format!("fetch_latest_release_ref for {}", repo)).await?;
+    if releases.iter().any(|r| !r.draft && r.published_at.is_none()) {
+        return Err(OrchestratorError::VersionFormat(format!(
+            "published release of {} has no published_at timestamp", repo
+        )));
+    }
     let Some(tag) = newest_built_release(&releases) else {
         return Ok(None);
     };
@@ -707,7 +713,7 @@ mod tests {
         let r = |t: &str, draft: bool, at: &str| ReleaseListItem {
             tag_name: t.to_string(),
             draft,
-            created_at: at.to_string(),
+            published_at: Some(at.to_string()),
         };
         let list = [
             r("v0.1.2", false, "2026-09-29T19:00:00Z"),
@@ -716,6 +722,17 @@ mod tests {
         ];
         assert_eq!(newest_built_release(&list), Some("v0.1.3"));
         assert_eq!(newest_built_release(&[]), None);
+    }
+
+    #[test]
+    fn newest_built_release_uses_publication_order_even_when_list_order_is_wrong() {
+        let list = [
+            ReleaseListItem { tag_name: "early".into(), draft: false, published_at: Some("2026-08-19T11:34:29Z".into()) },
+            ReleaseListItem { tag_name: "newest".into(), draft: false, published_at: Some("2026-08-19T13:52:52Z".into()) },
+            ReleaseListItem { tag_name: "middle".into(), draft: false, published_at: Some("2026-08-19T09:45:46Z".into()) },
+            ReleaseListItem { tag_name: "unpublished".into(), draft: true, published_at: None },
+        ];
+        assert_eq!(newest_built_release(&list), Some("newest"));
     }
 
     #[test]
@@ -1286,10 +1303,10 @@ pub async fn append_release_matrix_entry(
         return Ok(());
     }
 
-    // The ISO release's own date, so a later backfill (--record-matrix) records when it was built.
-    let date = iso_release_date(client, iso_tag)
-        .await
-        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+    // Publication date, so a later backfill (--record-matrix) does not use the tag commit date.
+    let date = iso_release_date(client, iso_tag).await.ok_or_else(|| {
+        OrchestratorError::VersionFormat(format!("no publication date for ISO {}", iso_tag))
+    })?;
     let new_entry = format!(
         "- iso_version: \"{iso}\"\n  build_date: \"{date}\"\n  components:\n    xolite_ce:\n      version: \"{xv}\"\n      rpm: \"{xr}\"\n      upstream: \"{xu}\"\n      upstream_url: \"https://github.com/vatesfr/xen-orchestra/releases/tag/xo-lite-v{xu}\"\n    xoa_proxy:\n      version: \"{pv}\"\n      rpm: \"{pr}\"\n",
         iso = iso_tag,
@@ -1448,7 +1465,6 @@ async fn image_release_date(client: &Client, tag: &str) -> Option<String> {
     let release = gh_json(client.get(&url), "XOA image release date").await.ok()?;
     release["published_at"]
         .as_str()
-        .or(release["created_at"].as_str())
         .and_then(|date| date.get(..10))
         .map(str::to_string)
 }
@@ -1462,7 +1478,6 @@ async fn iso_release_date(client: &Client, tag: &str) -> Option<String> {
     let v = gh_json(client.get(&url), "iso release date").await.ok()?;
     v["published_at"]
         .as_str()
-        .or(v["created_at"].as_str())
         .and_then(|d| d.get(..10))
         .map(str::to_string)
 }
