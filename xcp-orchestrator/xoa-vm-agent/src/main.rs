@@ -2240,6 +2240,22 @@ struct Asset {
     state: String,
 }
 
+/// The published URL must be independent of Packer's per-job VM/XVA name.
+fn canonical_image_asset_name(path: &Path) -> Result<&'static str> {
+    let name = path.file_name().context("XVA path has no filename")?.to_string_lossy();
+    if name.ends_with(".xva.gz") {
+        Ok("XOA-hl.xva.gz")
+    } else if name.ends_with(".xva") {
+        Ok("XOA-hl.xva")
+    } else {
+        bail!("Unsupported XVA asset extension: {}", name)
+    }
+}
+
+fn is_image_asset(name: &str) -> bool {
+    name.ends_with(".xva") || name.ends_with(".xva.gz")
+}
+
 /// Uploads the XVA, retrying a failed attempt from scratch.
 async fn upload_asset(
     client: &reqwest::Client,
@@ -2285,11 +2301,7 @@ async fn upload_asset_once(
         .with_context(|| format!("Cannot stat {}", xva_path.display()))?
         .len();
 
-    let file_name = xva_path
-        .file_name()
-        .context("XVA path has no filename")?
-        .to_string_lossy()
-        .to_string();
+    let file_name = canonical_image_asset_name(xva_path)?;
 
     info!(
         "Uploading {} ({:.2} GB)...",
@@ -2356,11 +2368,11 @@ async fn upload_asset_once(
         bail!("GitHub asset upload failed ({}): {}", code, body);
     }
 
+    let new: Asset = res
+        .json()
+        .await
+        .context("Failed to parse the uploaded asset")?;
     if let Some(old) = old {
-        let new: Asset = res
-            .json()
-            .await
-            .context("Failed to parse the uploaded asset")?;
         client
             .delete(&old.url)
             .send()
@@ -2379,6 +2391,18 @@ async fn upload_asset_once(
             file_name, old.id, new.id
         );
     }
+    // A previous build may have uploaded qa-xoa-build-N.xva or xoa-almalinux.xva.
+    // Once the canonical asset is complete, remove every other image so XO Lite's
+    // first-XVA selection cannot resolve an older build (#261).
+    for stale in existing.iter().filter(|a| a.state == "uploaded" && is_image_asset(&a.name) && a.id != new.id && old.map(|o| o.id) != Some(a.id)) {
+        client
+            .delete(&stale.url)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("Failed to remove superseded XVA {} ({})", stale.name, stale.id))?;
+        info!("Removed superseded XVA {} ({})", stale.name, stale.id);
+    }
     Ok(())
 }
 
@@ -2390,6 +2414,14 @@ async fn upload_asset_once(
 mod tests {
     use super::*;
     use shared::ReleaseAsset;
+
+    #[test]
+    fn published_asset_name_is_stable_across_build_vm_names() {
+        assert_eq!(canonical_image_asset_name(Path::new("qa-xoa-build-36.xva")).unwrap(), "XOA-hl.xva");
+        assert_eq!(canonical_image_asset_name(Path::new("qa-xoa-build-37.xva")).unwrap(), "XOA-hl.xva");
+        assert_eq!(canonical_image_asset_name(Path::new("qa-xoa-build-38.xva.gz")).unwrap(), "XOA-hl.xva.gz");
+        assert!(canonical_image_asset_name(Path::new("qa-xoa-build-39.txt")).is_err());
+    }
 
     fn release(tag: &str, asset_names: &[&str]) -> ReleaseInfo {
         release_with_body(tag, asset_names, "")
