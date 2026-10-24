@@ -2213,7 +2213,7 @@ async fn publish_release(client: &reqwest::Client, release: &ReleaseHandle) -> R
     }
     let published: Published = client
         .patch(&release.url)
-        .json(&serde_json::json!({ "draft": false }))
+        .json(&serde_json::json!({ "draft": false, "make_latest": "true" }))
         .send()
         .await
         .context("Failed to publish the release")?
