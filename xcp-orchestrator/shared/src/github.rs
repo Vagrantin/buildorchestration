@@ -1265,6 +1265,65 @@ pub async fn fetch_release_rpm_name(
         })
 }
 
+/// The ISO release body records the exact xcp-hl-release asset selected by
+/// build-iso.yml. Older ISO releases have no such provenance; never infer it
+/// from today's `/releases/latest`, which may point to a different RPM.
+pub fn parse_iso_release_rpm_provenance(body: &str) -> Result<Option<(String, String)>, OrchestratorError> {
+    fn field<'a>(body: &'a str, label: &str) -> Option<&'a str> {
+        body.lines()
+            .find_map(|line| line.strip_prefix(label))
+            .and_then(|value| value.trim().strip_prefix('`'))
+            .and_then(|value| value.strip_suffix('`'))
+            .filter(|value| !value.is_empty() && !value.contains('`'))
+    }
+    let tag = field(body, "xcp-hl-release tag: ");
+    let rpm = field(body, "xcp-hl-release RPM: ");
+    match (tag, rpm) {
+        (None, None) => Ok(None),
+        (Some(tag), Some(rpm)) if rpm.starts_with("xcp-hl-release-") && rpm.ends_with(".rpm") => {
+            Ok(Some((tag.to_string(), rpm.trim_end_matches(".rpm").to_string())))
+        }
+        _ => Err(OrchestratorError::VersionFormat(
+            "ISO release has incomplete or invalid xcp-hl-release RPM provenance".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod iso_rpm_provenance_tests {
+    use super::parse_iso_release_rpm_provenance;
+
+    #[test]
+    fn records_exact_asset_and_omits_legacy_releases() {
+        assert_eq!(parse_iso_release_rpm_provenance("Old release").unwrap(), None);
+        assert_eq!(
+            parse_iso_release_rpm_provenance("xcp-hl-release tag: `v8.3-ce3`\nxcp-hl-release RPM: `xcp-hl-release-8.3-3.noarch.rpm`\n").unwrap(),
+            Some(("v8.3-ce3".into(), "xcp-hl-release-8.3-3.noarch".into()))
+        );
+        assert!(parse_iso_release_rpm_provenance("xcp-hl-release tag: `v8.3-ce3`").is_err());
+    }
+}
+
+pub async fn fetch_iso_release_rpm_provenance(
+    client: &Client,
+    iso_tag: &str,
+) -> Result<Option<(String, String)>, OrchestratorError> {
+    let release = fetch_release_by_tag(client, "xcp-ng-ce-iso", iso_tag)
+        .await?
+        .ok_or_else(|| OrchestratorError::VersionFormat(format!("ISO release {} not published", iso_tag)))?;
+    let provenance = parse_iso_release_rpm_provenance(&release.body)?;
+    if let Some((ref tag, ref rpm)) = provenance {
+        let actual = fetch_release_rpm_name(client, "xcp-hl", tag).await?;
+        if actual != *rpm {
+            return Err(OrchestratorError::VersionFormat(format!(
+                "ISO {} records xcp-hl-release {} but release {} has {}",
+                iso_tag, rpm, tag, actual
+            )));
+        }
+    }
+    Ok(provenance)
+}
+
 /// Append an entry to the release matrix
 pub async fn append_release_matrix_entry(
     client: &Client,
@@ -1274,6 +1333,7 @@ pub async fn append_release_matrix_entry(
     xolite_rpm: &str,
     xoa_proxy_version: &str,
     xoa_proxy_rpm: &str,
+    xcp_hl_release: Option<(&str, &str)>,
 ) -> Result<(), OrchestratorError> {
     use base64::{engine::general_purpose, Engine as _};
 
@@ -1311,7 +1371,7 @@ pub async fn append_release_matrix_entry(
     let date = iso_release_date(client, iso_tag).await.ok_or_else(|| {
         OrchestratorError::VersionFormat(format!("no publication date for ISO {}", iso_tag))
     })?;
-    let new_entry = format!(
+    let mut new_entry = format!(
         "- iso_version: \"{iso}\"\n  build_date: \"{date}\"\n  components:\n    xolite_ce:\n      version: \"{xv}\"\n      rpm: \"{xr}\"\n      upstream: \"{xu}\"\n      upstream_url: \"https://github.com/vatesfr/xen-orchestra/releases/tag/xo-lite-v{xu}\"\n    xoa_proxy:\n      version: \"{pv}\"\n      rpm: \"{pr}\"\n",
         iso = iso_tag,
         date = date,
@@ -1321,6 +1381,12 @@ pub async fn append_release_matrix_entry(
         pv = xoa_proxy_version,
         pr = xoa_proxy_rpm,
     );
+    if let Some((tag, rpm)) = xcp_hl_release {
+        new_entry.push_str(&format!(
+            "    xcp_hl_release:\n      version: \"{}\"\n      rpm: \"{}\"\n",
+            tag, rpm
+        ));
+    }
     // The file opens with a comment block documenting the schema; entries go
     // below it, newest first.
     let (header, entries) = split_leading_comments(&current_yaml);
