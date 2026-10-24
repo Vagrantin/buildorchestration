@@ -2345,7 +2345,7 @@ async fn upload_asset_once(
     let upload_name = if old.is_some() {
         temp_name.as_str()
     } else {
-        file_name.as_str()
+        file_name
     };
 
     let file = async_fs::File::open(xva_path)
