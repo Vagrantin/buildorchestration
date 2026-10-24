@@ -1490,7 +1490,11 @@ pub async fn append_changelog_entry(
     }
 
     let url = format!("https://api.github.com/repos/{}/{}/contents/{}", OWNER, DOCS_REPO, CHANGELOG_DATA_PATH);
-    let existing: GHFileContent = gh_json(client.get(&url), "read changelog data").await?;
+    let existing: GHFileContent = parse_github_response(
+        client.get(&url).send().await.map_err(|e|
+            OrchestratorError::GitHubApi("read changelog data".into(), e.to_string())
+        )?, "read changelog data"
+    ).await?;
     let content = String::from_utf8(general_purpose::STANDARD.decode(
         existing.content.chars().filter(|c| !c.is_whitespace()).collect::<String>()
     ).map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?)?;
