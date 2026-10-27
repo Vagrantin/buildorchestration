@@ -1574,29 +1574,30 @@ async fn generate_build_files(build_dir: &Path, config: &BuildConfig) -> Result<
     )
     .await?;
 
-    // Copy helper scripts from the synced repo (non-fatal if missing)
-    let scripts = [
-        "scripts/xoa-first-boot.sh",
-        "scripts/xoa-credentials.sh",
-        "systemd/xoa-first-boot.service",
-        "systemd/xoa-credentials.service",
-    ];
-    let repo = Path::new(REPO_DIR);
-    for script in &scripts {
-        let src = repo.join(script);
-        let dst = build_dir.join(script);
-        if src.exists() {
-            async_fs::create_dir_all(dst.parent().unwrap()).await?;
-            async_fs::copy(&src, &dst)
-                .await
-                .with_context(|| format!("Failed to copy {}", script))?;
-            info!("Copied {}", script);
-        } else {
-            warn!("Script not found in repo, skipping: {}", script);
-        }
-    }
+    // Required image security helpers must never be silently skipped.
+    copy_provisioning_files(Path::new(REPO_DIR), build_dir).await?;
 
     info!("Build files generated");
+    Ok(())
+}
+
+async fn copy_provisioning_files(repo: &Path, build_dir: &Path) -> Result<()> {
+    for script in [
+        "scripts/xoa-first-boot.sh",
+        "scripts/xoa-credentials.sh",
+        "scripts/xoa-apply-credentials.mjs",
+        "scripts/xoa-finalize-state.sh",
+        "systemd/xoa-first-boot.service",
+        "systemd/xoa-credentials.service",
+    ] {
+        let src = repo.join(script);
+        let dst = build_dir.join(script);
+        async_fs::create_dir_all(dst.parent().unwrap()).await?;
+        async_fs::copy(&src, &dst)
+            .await
+            .with_context(|| format!("Required provisioning file missing or unreadable: {}", script))?;
+        info!("Copied {}", script);
+    }
     Ok(())
 }
 
@@ -1728,6 +1729,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     ]}},
     {{"type":"file","source":"scripts/xoa-first-boot.sh","destination":"/root/xoa-first-boot.sh"}},
     {{"type":"file","source":"scripts/xoa-credentials.sh","destination":"/root/xoa-credentials.sh"}},
+    {{"type":"file","source":"scripts/xoa-apply-credentials.mjs","destination":"/root/xoa-apply-credentials.mjs"}},
+    {{"type":"file","source":"scripts/xoa-finalize-state.sh","destination":"/root/xoa-finalize-state.sh"}},
     {{"type":"file","source":"systemd/xoa-first-boot.service","destination":"/etc/systemd/system/xoa-first-boot.service"}},
     {{"type":"file","source":"systemd/xoa-credentials.service","destination":"/etc/systemd/system/xoa-credentials.service"}},
     {{"type":"shell","inline":[
@@ -1745,7 +1748,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
       "rm -rf /var/cache/dnf/ /var/log/*.log /var/log/journal/* /var/lib/dnf/history* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/licenses/*",
       "rm -f /boot/*rescue*",
       "echo -n > /etc/machine-id"
-    ]}}
+    ]}},
+    {{"type":"shell","inline":["bash /root/xoa-finalize-state.sh"]}}
   ]
 }}"#,
         xcpng_ip = config.xcpng_ip,
@@ -2882,6 +2886,34 @@ VM_MEMORY_MB="4096"
         let json: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
         assert_eq!(json["builders"][0]["keep_vm"], "always");
+    }
+
+    #[tokio::test]
+    async fn provisioning_files_are_required_and_finalization_is_last() {
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
+        let steps = json["provisioners"].as_array().unwrap();
+        assert_eq!(
+            steps.last().unwrap()["inline"][0],
+            "bash /root/xoa-finalize-state.sh"
+        );
+        let root = std::env::temp_dir().join(format!("provisioning-test-{}", std::process::id()));
+        let repo = root.join("repo");
+        let output = root.join("build");
+        for step in steps.iter().filter(|s| s["type"] == "file") {
+            let path = repo.join(step["source"].as_str().unwrap());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fixture").unwrap();
+        }
+        copy_provisioning_files(&repo, &output).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output.join("scripts/xoa-apply-credentials.mjs")).unwrap(),
+            "fixture"
+        );
+        std::fs::remove_file(repo.join("scripts/xoa-apply-credentials.mjs")).unwrap();
+        let error = copy_provisioning_files(&repo, &output).await.unwrap_err();
+        assert!(error.to_string().contains("xoa-apply-credentials.mjs"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
