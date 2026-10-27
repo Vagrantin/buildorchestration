@@ -975,7 +975,6 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-
     // ── PHASE 9: Create release and upload XVA ────────────────────────────────
     // FIX #11: was calling upload_to_github_release() which assumed a release
     //          already existed. Now we explicitly create (or reuse) one first.
@@ -1801,7 +1800,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         rpm_url = config.xoa_hl_rpm_url,
         stamp = serde_json::Value::from(release_stamp_command(&config.xoa_hl_tag)),
         image_stamp = serde_json::Value::from(format!(
-            "printf '%s\\n' '{}' > /etc/xoa-hl-image-tag", config.image_tag
+            "printf '%s\\n' '{}' > /etc/xoa-hl-image-tag",
+            config.image_tag
         )),
         output_dir = OUTPUT_DIR,
     )
@@ -2303,17 +2303,29 @@ async fn create_github_release(
         .await
         .context("Failed to parse the release list")?;
     if releases.iter().any(|r| r.tag_name == tag) {
-        bail!("Image build tag {} already exists; refusing to replace its release", tag);
+        bail!(
+            "Image build tag {} already exists; refusing to replace its release",
+            tag
+        );
     }
-    let rpm_asset = Path::new(rpm_url).file_name().context("RPM URL has no filename")?.to_string_lossy();
+    let rpm_asset = Path::new(rpm_url)
+        .file_name()
+        .context("RPM URL has no filename")?
+        .to_string_lossy();
     let build = image_publication::manifest(tag, target_sha, build_xoa_hl_sha, rpm_tag, &rpm_asset);
     let repo_api = format!("https://api.github.com/repos/{}", BUILD_XOA_HL_REPO);
-    let provenance = image_publication::create_provenance_commit(client, &repo_api, build_xoa_hl_sha, &build).await?;
+    let provenance =
+        image_publication::create_provenance_commit(client, &repo_api, build_xoa_hl_sha, &build)
+            .await?;
 
     // Reserve the identity explicitly; an existing tag must never be retargeted.
-    client.post(format!("{repo_api}/git/refs"))
+    client
+        .post(format!("{repo_api}/git/refs"))
         .json(&serde_json::json!({"ref": format!("refs/tags/{tag}"), "sha": provenance}))
-        .send().await?.error_for_status().context("Image tag already exists or could not be reserved")?;
+        .send()
+        .await?
+        .error_for_status()
+        .context("Image tag already exists or could not be reserved")?;
 
     let create_url = format!(
         "https://api.github.com/repos/{}/releases",
@@ -2934,7 +2946,10 @@ VM_MEMORY_MB="4096"
 
     #[test]
     fn template_records_exact_image_identity() {
-        let config = BuildConfig { image_tag: "xoa-image-20261028-010203000000001-abcdef0".into(), ..Default::default() };
+        let config = BuildConfig {
+            image_tag: "xoa-image-20261028-010203000000001-abcdef0".into(),
+            ..Default::default()
+        };
         let template = generate_packer_template(&config);
         assert!(template.contains("/etc/xoa-hl-image-tag"));
         assert!(template.contains(&config.image_tag));
