@@ -3034,19 +3034,27 @@ VM_MEMORY_MB="4096"
         let template: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&config)).unwrap();
         let steps = template["provisioners"].as_array().unwrap();
-        let stamp = steps.iter().find(|step| step["inline"].to_string().contains("/etc/xoa-hl-image-tag")).unwrap();
+        let stamp = steps
+            .iter()
+            .find(|step| step["inline"].to_string().contains("/etc/xoa-hl-image-tag"))
+            .unwrap();
         let root = std::env::temp_dir().join(format!("image-stamp-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let about = root.join("about");
         let exact = root.join("exact");
         for command in stamp["inline"].as_array().unwrap() {
-            let command = command.as_str().unwrap()
+            let command = command
+                .as_str()
+                .unwrap()
                 .replace("/etc/xoa-hl-vm-release", about.to_str().unwrap())
                 .replace("/etc/xoa-hl-image-tag", exact.to_str().unwrap());
             let status = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(format!("rpm() {{ echo 47.gabcdef0.xcpng8.3.el9; }}; {command}"))
-                .status().unwrap();
+                .arg(format!(
+                    "rpm() {{ echo 47.gabcdef0.xcpng8.3.el9; }}; {command}"
+                ))
+                .status()
+                .unwrap();
             assert!(status.success());
         }
         assert_eq!(std::fs::read_to_string(&exact).unwrap().trim(), tag);
