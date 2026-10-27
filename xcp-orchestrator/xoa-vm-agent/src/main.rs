@@ -19,12 +19,11 @@ use anyhow::{bail, Context, Result};
 
 use chrono::{DateTime, Utc};
 use shared::{
-    append_changelog_entry, append_xoa_release_matrix_entry, create_and_push_tag, create_github_client,
-    fetch_release_by_tag, fetch_releases,
-    fetch_repo_head_sha, fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, list_active_runs,
-    load_credential, load_github_token, locate_tag_triggered_run, only_non_build_changes,
-    parse_ce_tag, query_run_conclusion, AgentStatus, ComponentVersionState, ReleaseInfo,
-    WorkflowStatus,
+    append_changelog_entry, append_xoa_release_matrix_entry, create_and_push_tag,
+    create_github_client, fetch_release_by_tag, fetch_releases, fetch_repo_head_sha,
+    fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, list_active_runs, load_credential,
+    load_github_token, locate_tag_triggered_run, only_non_build_changes, parse_ce_tag,
+    query_run_conclusion, AgentStatus, ComponentVersionState, ReleaseInfo, WorkflowStatus,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -140,6 +139,9 @@ struct XoaHlVersionState {
     /// Tag of the last published XVA image release.
     #[serde(default, alias = "last_tag")]
     pub image_tag: String,
+    /// Exact RPM consumed by that image, independent of later RPM build attempts.
+    #[serde(default)]
+    pub image_rpm_tag: String,
     #[serde(default, alias = "last_built_at")]
     pub image_built_at: Option<DateTime<Utc>>,
     /// RPM release state: upstream version, ce counter, last `v{version}-ce{N}`
@@ -510,12 +512,23 @@ async fn main() -> Result<()> {
     let client = create_github_client(&token)?;
 
     if record_matrix {
-        if version_state.image_tag.is_empty() || version_state.rpm.last_tag.is_empty() {
-            bail!("--record-matrix needs a saved image and xoa-hl RPM tag");
+        if version_state.image_tag.is_empty() {
+            bail!("--record-matrix needs a saved image");
         }
-        record_image_matrix(&client, &version_state.image_tag, &version_state.rpm.last_tag).await?;
+        if !record_image_matrix(
+            &client,
+            &version_state.image_tag,
+            &version_state.image_rpm_tag,
+        )
+        .await?
+        {
+            bail!("saved image has no recorded RPM provenance; do not infer it from current RPM state");
+        }
         status.status = WorkflowStatus::Success;
-        status.detail = format!("Recorded image {} in release matrix", version_state.image_tag);
+        status.detail = format!(
+            "Recorded image {} in release matrix",
+            version_state.image_tag
+        );
         status.write_to_file(STATUS_FILE)?;
         return Ok(());
     }
@@ -567,9 +580,12 @@ async fn main() -> Result<()> {
             &repo_head_sha[..7],
             &build_xoa_hl_head_sha[..7]
         );
-        if !version_state.rpm.last_tag.is_empty() {
-            record_image_matrix(&client, &version_state.image_tag, &version_state.rpm.last_tag).await?;
-        }
+        record_image_matrix(
+            &client,
+            &version_state.image_tag,
+            &version_state.image_rpm_tag,
+        )
+        .await?;
         status.status = WorkflowStatus::Skipped;
         status.detail = format!("No changes (SHA: {})", &repo_head_sha[..7]);
         status.write_to_file(STATUS_FILE)?;
@@ -598,9 +614,11 @@ async fn main() -> Result<()> {
                         "Image {} already published for HEAD (SHA: {}), skipping.",
                         image.tag_name, short_sha
                     );
-                    if !version_state.rpm.last_tag.is_empty() {
-                        record_image_matrix(&client, &image.tag_name, &version_state.rpm.last_tag).await?;
-                    }
+                    // A discovered image must identify its own RPM. Mutable RPM state
+                    // can belong to a later failed build and is not image provenance.
+                    record_image_matrix(&client, &image.tag_name, "").await?;
+                    version_state.image_rpm_tag =
+                        parse_image_rpm_tag(&image.body)?.unwrap_or_default();
                     version_state.image_xoa_hl_sha = repo_head_sha.clone();
                     version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
                     version_state.image_tag = image.tag_name.clone();
@@ -982,10 +1000,19 @@ async fn main() -> Result<()> {
     );
     status.write_to_file(STATUS_FILE)?;
 
-    let published = match upload_asset(&client, &upload_url, &release.assets_url, &xva_path).await {
-        Ok(()) => publish_release(&client, &release).await,
-        Err(e) => Err(e),
-    };
+    let published = async {
+        upload_asset(&client, &upload_url, &release.assets_url, &xva_path).await?;
+        // Record only the RPM actually handed to Packer, after its image upload.
+        let rpm_name = Path::new(&config.xoa_hl_rpm_url).file_name()
+            .context("RPM URL has no filename")?.to_string_lossy();
+        let body = format!(
+            "XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}\nSource commit (build-xoa-hl): {}\nxoa-hl RPM tag: `{}`\nxoa-hl RPM: `{}`\n",
+            image_source_sha, build_xoa_hl_head_sha, rpm_tag, rpm_name
+        );
+        client.patch(&release.url).json(&serde_json::json!({ "body": body }))
+            .send().await?.error_for_status()?;
+        publish_release(&client, &release).await
+    }.await;
     let release_url = match published {
         Ok(url) => url,
         Err(e) => {
@@ -1011,6 +1038,7 @@ async fn main() -> Result<()> {
     version_state.image_xoa_hl_sha = image_source_sha.clone();
     version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
     version_state.image_tag = image_tag.clone(); // FIX #12: was never set
+    version_state.image_rpm_tag = rpm_tag.clone();
     version_state.image_built_at = Some(Utc::now());
     version_state
         .save()
@@ -1036,24 +1064,94 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn record_image_matrix(client: &reqwest::Client, image_tag: &str, rpm_tag: &str) -> Result<()> {
+/// Published provenance wins over mutable agent state. Reject malformed/duplicate markers.
+fn parse_image_rpm_tag(body: &str) -> Result<Option<String>> {
+    let markers: Vec<_> = body
+        .lines()
+        .filter(|l| l.starts_with("xoa-hl RPM tag:"))
+        .collect();
+    let filenames: Vec<_> = body
+        .lines()
+        .filter(|l| l.starts_with("xoa-hl RPM:"))
+        .collect();
+    if markers.is_empty() && filenames.is_empty() {
+        return Ok(None);
+    }
+    if markers.len() != 1 {
+        bail!("duplicate image RPM provenance");
+    }
+    if filenames.len() != 1
+        || !filenames[0].starts_with("xoa-hl RPM: `xoa-hl-")
+        || !filenames[0].ends_with(".rpm`")
+    {
+        bail!("missing or malformed image RPM filename");
+    }
+    let tag = markers[0]
+        .strip_prefix("xoa-hl RPM tag: `")
+        .and_then(|v| v.strip_suffix('`'))
+        .context("malformed image RPM provenance")?;
+    if !tag.starts_with('v')
+        || !tag.contains("-ce")
+        || !tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        bail!("invalid image RPM release tag");
+    }
+    Ok(Some(tag.to_string()))
+}
+
+async fn record_image_matrix(
+    client: &reqwest::Client,
+    image_tag: &str,
+    rpm_tag: &str,
+) -> Result<bool> {
     let release = fetch_release_by_tag(client, "build-xoa-hl", image_tag)
         .await?
         .with_context(|| format!("published image {} not found", image_tag))?;
     if release.draft {
         bail!("image {} is still a draft", image_tag);
     }
-    let images: Vec<_> = release.assets.iter()
+    let images: Vec<_> = release
+        .assets
+        .iter()
         .filter(|asset| asset.name.ends_with(".xva") || asset.name.ends_with(".xva.gz"))
         .collect();
     if images.len() != 1 {
-        bail!("image {} has {} XVA assets; resolve #261 before recording it", image_tag, images.len());
+        bail!(
+            "image {} has {} XVA assets; resolve #261 before recording it",
+            image_tag,
+            images.len()
+        );
+    }
+    let published_tag = parse_image_rpm_tag(&release.body)?;
+    let rpm_tag = published_tag.as_deref().unwrap_or(rpm_tag);
+    if rpm_tag.is_empty() {
+        warn!("Image {} predates recorded RPM provenance; leaving its RPM unknown. Rebuild to establish it.", image_tag);
+        return Ok(false);
+    }
+    if let Some(filename) = release.body.lines().find_map(|l| {
+        l.strip_prefix("xoa-hl RPM: `")
+            .and_then(|v| v.strip_suffix('`'))
+    }) {
+        let actual = shared::github::fetch_release_rpm_name(client, "xoa-hl", rpm_tag).await?;
+        if filename != format!("{}.rpm", actual) {
+            bail!(
+                "Image {} RPM filename disagrees with release {}",
+                image_tag,
+                rpm_tag
+            );
+        }
     }
     append_xoa_release_matrix_entry(client, image_tag, rpm_tag, &images[0].name).await?;
-    append_changelog_entry(client, "build-xoa-hl", image_tag, &[
-        ("build-xoa-hl", image_tag), ("xoa-hl", rpm_tag),
-    ]).await?;
-    Ok(())
+    append_changelog_entry(
+        client,
+        "build-xoa-hl",
+        image_tag,
+        &[("build-xoa-hl", image_tag), ("xoa-hl", rpm_tag)],
+    )
+    .await?;
+    Ok(true)
 }
 
 // ── PHASE 2 helpers ───────────────────────────────────────────────────────────
@@ -2157,11 +2255,22 @@ async fn create_github_release(
         .json()
         .await
         .context("Failed to parse the release list")?;
-    if let Some(r) = releases.into_iter().find(|r| r.tag_name == tag) {
+    if let Some(mut r) = releases.into_iter().find(|r| r.tag_name == tag) {
         info!(
             "Release {} already exists (draft: {}), reusing: {}",
             tag, r.draft, r.html_url
         );
+        // Hide a release while replacing its image and provenance together.
+        if !r.draft {
+            r = client
+                .patch(&r.url)
+                .json(&serde_json::json!({ "draft": true }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+        }
         return Ok(r);
     }
 
@@ -2245,7 +2354,10 @@ struct Asset {
 
 /// The published URL must be independent of Packer's per-job VM/XVA name.
 fn canonical_image_asset_name(path: &Path) -> Result<&'static str> {
-    let name = path.file_name().context("XVA path has no filename")?.to_string_lossy();
+    let name = path
+        .file_name()
+        .context("XVA path has no filename")?
+        .to_string_lossy();
     if name.ends_with(".xva.gz") {
         Ok("XOA-hl.xva.gz")
     } else if name.ends_with(".xva") {
@@ -2397,13 +2509,23 @@ async fn upload_asset_once(
     // A previous build may have uploaded qa-xoa-build-N.xva or xoa-almalinux.xva.
     // Once the canonical asset is complete, remove every other image so XO Lite's
     // first-XVA selection cannot resolve an older build (#261).
-    for stale in existing.iter().filter(|a| a.state == "uploaded" && is_image_asset(&a.name) && a.id != new.id && old.map(|o| o.id) != Some(a.id)) {
+    for stale in existing.iter().filter(|a| {
+        a.state == "uploaded"
+            && is_image_asset(&a.name)
+            && a.id != new.id
+            && old.map(|o| o.id) != Some(a.id)
+    }) {
         client
             .delete(&stale.url)
             .send()
             .await?
             .error_for_status()
-            .with_context(|| format!("Failed to remove superseded XVA {} ({})", stale.name, stale.id))?;
+            .with_context(|| {
+                format!(
+                    "Failed to remove superseded XVA {} ({})",
+                    stale.name, stale.id
+                )
+            })?;
         info!("Removed superseded XVA {} ({})", stale.name, stale.id);
     }
     Ok(())
@@ -2420,9 +2542,18 @@ mod tests {
 
     #[test]
     fn published_asset_name_is_stable_across_build_vm_names() {
-        assert_eq!(canonical_image_asset_name(Path::new("qa-xoa-build-36.xva")).unwrap(), "XOA-hl.xva");
-        assert_eq!(canonical_image_asset_name(Path::new("qa-xoa-build-37.xva")).unwrap(), "XOA-hl.xva");
-        assert_eq!(canonical_image_asset_name(Path::new("qa-xoa-build-38.xva.gz")).unwrap(), "XOA-hl.xva.gz");
+        assert_eq!(
+            canonical_image_asset_name(Path::new("qa-xoa-build-36.xva")).unwrap(),
+            "XOA-hl.xva"
+        );
+        assert_eq!(
+            canonical_image_asset_name(Path::new("qa-xoa-build-37.xva")).unwrap(),
+            "XOA-hl.xva"
+        );
+        assert_eq!(
+            canonical_image_asset_name(Path::new("qa-xoa-build-38.xva.gz")).unwrap(),
+            "XOA-hl.xva.gz"
+        );
         assert!(canonical_image_asset_name(Path::new("qa-xoa-build-39.txt")).is_err());
     }
 
@@ -2494,6 +2625,25 @@ mod tests {
             sha,
             "newsha"
         ));
+    }
+
+    #[test]
+    fn image_provenance_is_optional_for_legacy_but_strict_when_present() {
+        assert_eq!(parse_image_rpm_tag("old image").unwrap(), None);
+        assert_eq!(parse_image_rpm_tag("xoa-hl RPM tag: `v5.113.2_e281c536-ce47`\nxoa-hl RPM: `xoa-hl-5.113.2_e281c536-47.gca44911.xcpng8.3.el9.x86_64.rpm`").unwrap(), Some("v5.113.2_e281c536-ce47".into()));
+        assert!(parse_image_rpm_tag("xoa-hl RPM tag: `v5.113.2_e281c536-ce47`").is_err());
+        assert!(parse_image_rpm_tag("xoa-hl RPM tag: broken").is_err());
+        assert!(parse_image_rpm_tag("xoa-hl RPM tag: `v1-ce1`\nxoa-hl RPM tag: `v1-ce2`").is_err());
+        // The image pin is serialized independently of the mutable RPM state.
+        let mut state = XoaHlVersionState {
+            image_rpm_tag: "v1-ce1".into(),
+            ..Default::default()
+        };
+        state.rpm.last_tag = "v1-ce2".into();
+        let restored: XoaHlVersionState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.image_rpm_tag, "v1-ce1");
+        assert_eq!(restored.rpm.last_tag, "v1-ce2");
     }
 
     #[test]
