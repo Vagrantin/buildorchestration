@@ -1,0 +1,52 @@
+name: Release matrix publisher agents 0.3.12
+on:
+  push:
+    branches: ['release/matrix-publisher-0.3.12']
+    paths: ['.github/workflows/release-matrix-publisher.yml']
+permissions:
+  contents: write
+env:
+  TARGET: x86_64-unknown-linux-musl
+defaults:
+  run:
+    working-directory: xcp-orchestrator
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: cdc611022414ff2ff3396bc3468ca644f5d825dd
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: xcp-orchestrator
+      - run: cargo test --locked
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target "$TARGET" --bin iso-agent --bin xoa-vm-agent
+      - name: Package the exact reviewed source
+        run: |
+          test "$(git rev-parse HEAD)" = cdc611022414ff2ff3396bc3468ca644f5d825dd
+          mkdir -p dist
+          for binary in iso-agent xoa-vm-agent; do
+            cp "target/$TARGET/release/$binary" "dist/$binary-$TARGET"
+            (cd dist && sha256sum "$binary-$TARGET" > "$binary-$TARGET.sha256")
+          done
+          file dist/*-"$TARGET" | grep -E "statically linked|static-pie linked"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matrix-publisher-binaries
+          path: xcp-orchestrator/dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: xcp-orchestrator-v0.3.12
+          target_commitish: cdc611022414ff2ff3396bc3468ca644f5d825dd
+          name: XCP orchestrator 0.3.12
+          body: |
+            Release matrix publisher fixes for Vagrantin/xcp-hl#15.
+            Source: cdc611022414ff2ff3396bc3468ca644f5d825dd (buildorchestration#39).
+            Repairs incomplete matrix rows and records the exact image RPM provenance.
+            Binaries and checksums built/tested in GitHub Actions from that immutable source.
+          files: xcp-orchestrator/dist/*
