@@ -15,6 +15,8 @@
 //! 10. Persist version state
 //! 11. Write final status
 
+mod image_publication;
+
 use anyhow::{bail, Context, Result};
 
 use chrono::{DateTime, Utc};
@@ -194,6 +196,7 @@ struct BuildConfig {
     xoa_hl_rpm_url: String,
     /// xoa-hl release tag the RPM comes from, written into /etc/xoa-hl-vm-release.
     xoa_hl_tag: String,
+    image_tag: String,
     xe_guest_utilities_url: String,
     xe_guest_utilities_xenstore_url: String,
     min_free_disk_gb: u64,
@@ -216,6 +219,7 @@ impl Default for BuildConfig {
             reuse_iso_vdi: false,
             xoa_hl_rpm_url: String::new(),
             xoa_hl_tag: String::new(),
+            image_tag: String::new(),
             xe_guest_utilities_url:
                 "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-10.0.0-1.x86_64.rpm"
                     .to_string(),
@@ -877,6 +881,8 @@ async fn main() -> Result<()> {
         );
     }
 
+    config.image_tag = generate_image_tag(&image_source_sha);
+
     // ── PHASE 6: Generate build files ────────────────────────────────────────
     info!("PHASE 6: Generating build files...");
     status.phase = "phase_6_generate_files".to_string();
@@ -977,7 +983,7 @@ async fn main() -> Result<()> {
     status.phase = "phase_9_upload_asset".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    let image_tag = generate_image_tag(&image_source_sha);
+    let image_tag = config.image_tag.clone();
     let image_name = format!("XOA HomeLab Edition - {}", image_tag);
 
     let release = match create_github_release(
@@ -986,6 +992,8 @@ async fn main() -> Result<()> {
         &image_name,
         &image_source_sha,
         &build_xoa_hl_head_sha,
+        &rpm_tag,
+        &config.xoa_hl_rpm_url,
     )
     .await
     {
@@ -1735,6 +1743,7 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     ]}},
     {{"type":"shell","inline":[
       {stamp},
+      {image_stamp},
       "cat /etc/xoa-hl-vm-release"
     ]}},
     {{"type":"file","source":"scripts/xoa-first-boot.sh","destination":"/root/xoa-first-boot.sh"}},
@@ -1791,6 +1800,9 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         xe_url = config.xe_guest_utilities_url,
         rpm_url = config.xoa_hl_rpm_url,
         stamp = serde_json::Value::from(release_stamp_command(&config.xoa_hl_tag)),
+        image_stamp = serde_json::Value::from(format!(
+            "printf '%s\\n' '{}' > /etc/xoa-hl-image-tag", config.image_tag
+        )),
         output_dir = OUTPUT_DIR,
     )
 }
@@ -2226,9 +2238,7 @@ async fn locate_xva() -> Result<PathBuf> {
 // ── PHASE 9: Create release and upload ────────────────────────────────────────
 
 fn generate_image_tag(head_sha: &str) -> String {
-    let date = Utc::now().format("%Y%m%d");
-    let short = &head_sha[..7.min(head_sha.len())];
-    format!("{}{}-{}", IMAGE_TAG_PREFIX, date, short)
+    image_publication::image_tag_at(head_sha, Utc::now())
 }
 
 /// Does this release carry the published VM image for the given commits?
@@ -2260,23 +2270,22 @@ struct ReleaseHandle {
     tag_name: String,
 }
 
-/// Create the image release as a draft, or reuse the one for this tag (idempotent).
+/// Reserve a new image identity and create its release as a draft.
 ///
 /// A draft is invisible to anonymous readers (release-watch, Deploy XOA), so a
 /// failed upload never leaves a published release without its XVA;
 /// `publish_release` makes it public once the asset is in place.
 ///
-/// The tag is created by the GitHub API on that repo's default branch. It
-/// cannot be anchored to `target_sha`: that is an `xoa-hl` commit, which does
-/// not exist here, the source commit is recorded in the tag suffix and the
-/// release body instead. `build_xoa_hl_sha` (this repo's own HEAD) is
-/// recorded in the body only, `is_image_release_for` matches on it.
+/// Each tag targets a fresh provenance commit parented to the exact builder source.
+/// Public release identities and bytes are never reused for another image build.
 async fn create_github_release(
     client: &reqwest::Client,
     tag: &str,
     name: &str,
     target_sha: &str,
     build_xoa_hl_sha: &str,
+    rpm_tag: &str,
+    rpm_url: &str,
 ) -> Result<ReleaseHandle> {
     // releases/tags/{tag} hides drafts, so look in the authenticated list.
     let list_url = format!(
@@ -2293,24 +2302,18 @@ async fn create_github_release(
         .json()
         .await
         .context("Failed to parse the release list")?;
-    if let Some(mut r) = releases.into_iter().find(|r| r.tag_name == tag) {
-        info!(
-            "Release {} already exists (draft: {}), reusing: {}",
-            tag, r.draft, r.html_url
-        );
-        // Hide a release while replacing its image and provenance together.
-        if !r.draft {
-            r = client
-                .patch(&r.url)
-                .json(&serde_json::json!({ "draft": true }))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-        }
-        return Ok(r);
+    if releases.iter().any(|r| r.tag_name == tag) {
+        bail!("Image build tag {} already exists; refusing to replace its release", tag);
     }
+    let rpm_asset = Path::new(rpm_url).file_name().context("RPM URL has no filename")?.to_string_lossy();
+    let build = image_publication::manifest(tag, target_sha, build_xoa_hl_sha, rpm_tag, &rpm_asset);
+    let repo_api = format!("https://api.github.com/repos/{}", BUILD_XOA_HL_REPO);
+    let provenance = image_publication::create_provenance_commit(client, &repo_api, build_xoa_hl_sha, &build).await?;
+
+    // Reserve the identity explicitly; an existing tag must never be retargeted.
+    client.post(format!("{repo_api}/git/refs"))
+        .json(&serde_json::json!({"ref": format!("refs/tags/{tag}"), "sha": provenance}))
+        .send().await?.error_for_status().context("Image tag already exists or could not be reserved")?;
 
     let create_url = format!(
         "https://api.github.com/repos/{}/releases",
@@ -2318,6 +2321,7 @@ async fn create_github_release(
     );
     let payload = serde_json::json!({
         "tag_name":          tag,
+        "target_commitish":  provenance,
         "name":              name,
         "body":              format!(
             "XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}\nSource commit (build-xoa-hl): {}",
@@ -2926,6 +2930,14 @@ VM_MEMORY_MB="4096"
             .status()
             .expect("python3 is required by the image builder");
         assert!(status.success());
+    }
+
+    #[test]
+    fn template_records_exact_image_identity() {
+        let config = BuildConfig { image_tag: "xoa-image-20261028-010203000000001-abcdef0".into(), ..Default::default() };
+        let template = generate_packer_template(&config);
+        assert!(template.contains("/etc/xoa-hl-image-tag"));
+        assert!(template.contains(&config.image_tag));
     }
 
     #[test]
