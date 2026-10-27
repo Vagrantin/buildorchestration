@@ -654,7 +654,7 @@ async fn main() -> Result<(), OrchestratorError> {
             status.url = xoa_url;
         }
         status.write_to_file(STATUS_FILE)?;
-        return Ok(());
+        return Err(OrchestratorError::ComponentBuildFailed(status.detail.clone()));
     }
 
     // Persist SHAs only for components that actually built successfully

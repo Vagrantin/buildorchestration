@@ -67,6 +67,9 @@ pub enum OrchestratorError {
     #[error("{0}")]
     BumpCheckFailed(String),
 
+    #[error("{0}")]
+    ComponentBuildFailed(String),
+
     #[error("Invalid version format: {0}")]
     VersionFormat(String),
 
