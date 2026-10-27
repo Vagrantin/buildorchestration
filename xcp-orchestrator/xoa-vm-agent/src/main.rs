@@ -854,7 +854,7 @@ async fn main() -> Result<()> {
     status.phase = "phase_4_sync_repo".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = sync_repository().await {
+    if let Err(e) = sync_repository(&build_xoa_hl_head_sha).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Repository sync failed: {}", e);
         status.write_to_file(STATUS_FILE)?;
@@ -1442,46 +1442,55 @@ async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
 
 // ── PHASE 4: Sync repository ──────────────────────────────────────────────────
 
-async fn sync_repository() -> Result<()> {
-    let repo_path = Path::new(REPO_DIR);
-    info!("Syncing {}", repo_path.display());
+async fn sync_repository(expected_sha: &str) -> Result<()> {
+    sync_builder_at(
+        Path::new(REPO_DIR),
+        &format!("https://github.com/{}", BUILD_XOA_HL_REPO),
+        expected_sha,
+    )
+    .await
+}
 
+async fn sync_builder_at(repo_path: &Path, source: &str, expected_sha: &str) -> Result<()> {
+    if expected_sha.len() != 40 || !expected_sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("Builder source must be an exact Git commit SHA");
+    }
     if !repo_path.exists() {
+        if let Some(parent) = repo_path.parent() {
+            async_fs::create_dir_all(parent).await?;
+        }
         let status = AsyncCommand::new("git")
-            .args([
-                "clone",
-                &format!("https://github.com/{}", BUILD_XOA_HL_REPO),
-            ])
+            .args(["clone", "--no-checkout", source])
             .arg(repo_path)
             .status()
             .await
             .context("git clone failed")?;
         if !status.success() {
-            bail!("git clone exited with {:?}", status.code());
-        }
-    } else {
-        let fetch = AsyncCommand::new("git")
-            .arg("fetch")
-            .current_dir(repo_path)
-            .status()
-            .await
-            .context("git fetch failed")?;
-        if !fetch.success() {
-            bail!("git fetch exited with {:?}", fetch.code());
-        }
-
-        let reset = AsyncCommand::new("git")
-            .args(["reset", "--hard", "origin/main"])
-            .current_dir(repo_path)
-            .status()
-            .await
-            .context("git reset failed")?;
-        if !reset.success() {
-            bail!("git reset exited with {:?}", reset.code());
+            bail!("git clone failed");
         }
     }
-
-    info!("Repository synchronized");
+    for arguments in [
+        vec!["fetch", "--depth", "1", "origin", expected_sha],
+        vec!["checkout", "--detach", expected_sha],
+    ] {
+        let status = AsyncCommand::new("git")
+            .args(arguments)
+            .current_dir(repo_path)
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("Could not check out pinned builder source {}", expected_sha);
+        }
+    }
+    let status = AsyncCommand::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(repo_path)
+        .output()
+        .await?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        bail!("Builder checkout has local changes or untracked files; refusing ambiguous provenance");
+    }
+    info!("Builder repository checked out at {}", expected_sha);
     Ok(())
 }
 
@@ -2592,6 +2601,33 @@ async fn upload_asset_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn builder_checkout_uses_recorded_commit_after_source_head_moves() {
+        let root = std::env::temp_dir().join(format!("builder-pin-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()));
+        let source = root.join("source");
+        let checkout = root.join("checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git").current_dir(&source).args(args).output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            String::from_utf8_lossy(&result.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(source.join("input"), "recorded").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "recorded"]);
+        let recorded = git(&["rev-parse", "HEAD"]);
+        std::fs::write(source.join("input"), "later").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "later"]);
+        sync_builder_at(&checkout, source.to_str().unwrap(), &recorded).await.unwrap();
+        assert_eq!(std::fs::read_to_string(checkout.join("input")).unwrap(), "recorded");
+        std::fs::write(checkout.join("unexpected"), "local").unwrap();
+        assert!(sync_builder_at(&checkout, source.to_str().unwrap(), &recorded).await.is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use shared::ReleaseAsset;
 
     #[test]
