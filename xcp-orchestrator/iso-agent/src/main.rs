@@ -11,7 +11,7 @@ use chrono::Utc;
 use shared::{
     append_changelog_entry, append_release_matrix_entry, create_and_push_tag, create_github_client, delete_tag,
     dispatch_workflow, fetch_latest_release_ref, fetch_latest_upstream_xolite_tag,
-    fetch_pinned_xolite_tag, fetch_release_rpm_name, fetch_iso_release_rpm_provenance, fetch_repo_head_sha,
+    fetch_pinned_xolite_tag, fetch_release_by_tag, fetch_release_rpm_name, fetch_iso_release_rpm_provenance, fetch_repo_head_sha,
     fetch_upstream_xolite_version, fetch_xoa_proxy_version, load_github_token,
     locate_dispatch_triggered_run, locate_tag_triggered_run, only_non_build_changes, parse_ce_tag,
     parse_plain_version_tag, query_run_conclusion, AgentStatus, ComponentVersionState,
@@ -94,6 +94,18 @@ fn issued_counter(actual_tag: &str, requested: u32) -> u32 {
         .map(|(_, counter)| counter)
         .or_else(|| parse_plain_version_tag(actual_tag).map(|(_, counter)| counter))
         .unwrap_or(requested)
+}
+
+/// Remove an ISO tag whose build failed, unless a release already exists on it.
+async fn rollback_unreleased_iso_tag(client: &reqwest::Client, tag: &str) {
+    match fetch_release_by_tag(client, "xcp-ng-ce-iso", tag).await {
+        Ok(None) => match delete_tag(client, "xcp-ng-ce-iso", tag).await {
+            Ok(()) => warn!("ISO build failed; removed tag {} so a later run can reissue it", tag),
+            Err(d) => warn!("ISO build failed and tag {} could not be removed ({}); delete it by hand", tag, d),
+        },
+        Ok(Some(_)) => warn!("ISO build failed but tag {} has a release; keeping it", tag),
+        Err(e) => warn!("ISO build failed; could not check releases for tag {} ({}); keeping it", tag, e),
+    }
 }
 
 fn needs_iso_build(
@@ -902,6 +914,9 @@ async fn main() -> Result<(), OrchestratorError> {
             } else {
                 status.phase = "failed".to_string();
                 status.detail = format!("ISO build ended with: {}", iso_final_status);
+                if iso_final_status == WorkflowStatus::Failure {
+                    rollback_unreleased_iso_tag(&client, &actual_iso_tag).await;
+                }
                 status.write_to_file(STATUS_FILE)?;
                 return Err(OrchestratorError::ComponentBuildFailed(status.detail.clone()));
             }
