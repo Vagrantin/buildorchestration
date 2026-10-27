@@ -2,6 +2,14 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased
+
+- **xoa-vm-agent**: copy the required credential RPC/finalizer helpers and run
+  finalization last in the production Packer template (xcp-hl#310/#311). Missing
+  provisioning sources now fail build preparation. Pair with the image
+  provisioning fix in build-xoa-hl; release the agent and repin Jenkins before
+  producing the fixed XVA. No existing appliance data is removed.
+
 ## Unreleased — release matrix provenance (xcp-hl#15)
 
 - Record the exact consumed xoa-hl RPM tag/filename in each image release after
