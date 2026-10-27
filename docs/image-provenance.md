@@ -6,7 +6,9 @@ the middle UTC build identifier distinguishes same-day rebuilds. Existing tags
 remain readable. API consumers still order publication by `published_at`.
 
 The identity is selected once before Packer starts, reused during Packer retries,
-and stamped into `/etc/xoa-hl-image-tag`. A new agent invocation creates a new
+and stamped into `/etc/xoa-hl-image-tag`. It is also appended to the legacy
+About-page stamp, so the existing About API displays the exact identity while
+retaining its human-readable build/RPM provenance. A new agent invocation creates a new
 identity. The RPM's release tag and the legacy human-readable VM stamp remain
 separate from the exact image tag.
 
