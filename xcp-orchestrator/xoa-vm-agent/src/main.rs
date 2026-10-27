@@ -1488,7 +1488,9 @@ async fn sync_builder_at(repo_path: &Path, source: &str, expected_sha: &str) -> 
         .output()
         .await?;
     if !status.status.success() || !status.stdout.is_empty() {
-        bail!("Builder checkout has local changes or untracked files; refusing ambiguous provenance");
+        bail!(
+            "Builder checkout has local changes or untracked files; refusing ambiguous provenance"
+        );
     }
     info!("Builder repository checked out at {}", expected_sha);
     Ok(())
@@ -2604,27 +2606,64 @@ mod tests {
 
     #[tokio::test]
     async fn builder_checkout_uses_recorded_commit_after_source_head_moves() {
-        let root = std::env::temp_dir().join(format!("builder-pin-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()));
+        let root = std::env::temp_dir().join(format!(
+            "builder-pin-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
         let source = root.join("source");
         let checkout = root.join("checkout");
         std::fs::create_dir_all(&source).unwrap();
         let git = |args: &[&str]| {
-            let result = std::process::Command::new("git").current_dir(&source).args(args).output().unwrap();
-            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            let result = std::process::Command::new("git")
+                .current_dir(&source)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
             String::from_utf8_lossy(&result.stdout).trim().to_string()
         };
         git(&["init", "-q"]);
         std::fs::write(source.join("input"), "recorded").unwrap();
         git(&["add", "."]);
-        git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "recorded"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "recorded",
+        ]);
         let recorded = git(&["rev-parse", "HEAD"]);
         std::fs::write(source.join("input"), "later").unwrap();
         git(&["add", "."]);
-        git(&["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "later"]);
-        sync_builder_at(&checkout, source.to_str().unwrap(), &recorded).await.unwrap();
-        assert_eq!(std::fs::read_to_string(checkout.join("input")).unwrap(), "recorded");
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "later",
+        ]);
+        sync_builder_at(&checkout, source.to_str().unwrap(), &recorded)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("input")).unwrap(),
+            "recorded"
+        );
         std::fs::write(checkout.join("unexpected"), "local").unwrap();
-        assert!(sync_builder_at(&checkout, source.to_str().unwrap(), &recorded).await.is_err());
+        assert!(
+            sync_builder_at(&checkout, source.to_str().unwrap(), &recorded)
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
