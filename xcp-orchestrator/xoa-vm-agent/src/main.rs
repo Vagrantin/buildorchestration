@@ -15,6 +15,8 @@
 //! 10. Persist version state
 //! 11. Write final status
 
+mod image_publication;
+
 use anyhow::{bail, Context, Result};
 
 use chrono::{DateTime, Utc};
@@ -194,6 +196,7 @@ struct BuildConfig {
     xoa_hl_rpm_url: String,
     /// xoa-hl release tag the RPM comes from, written into /etc/xoa-hl-vm-release.
     xoa_hl_tag: String,
+    image_tag: String,
     xe_guest_utilities_url: String,
     xe_guest_utilities_xenstore_url: String,
     min_free_disk_gb: u64,
@@ -216,6 +219,7 @@ impl Default for BuildConfig {
             reuse_iso_vdi: false,
             xoa_hl_rpm_url: String::new(),
             xoa_hl_tag: String::new(),
+            image_tag: String::new(),
             xe_guest_utilities_url:
                 "https://github.com/xenserver/xe-guest-utilities/releases/download/v10.0.0/xe-guest-utilities-10.0.0-1.x86_64.rpm"
                     .to_string(),
@@ -850,7 +854,7 @@ async fn main() -> Result<()> {
     status.phase = "phase_4_sync_repo".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    if let Err(e) = sync_repository().await {
+    if let Err(e) = sync_repository(&build_xoa_hl_head_sha).await {
         status.status = WorkflowStatus::Failure;
         status.detail = format!("Repository sync failed: {}", e);
         status.write_to_file(STATUS_FILE)?;
@@ -876,6 +880,8 @@ async fn main() -> Result<()> {
             config.xcpng_ip, e
         );
     }
+
+    config.image_tag = generate_image_tag(&image_source_sha);
 
     // ── PHASE 6: Generate build files ────────────────────────────────────────
     info!("PHASE 6: Generating build files...");
@@ -969,7 +975,6 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-
     // ── PHASE 9: Create release and upload XVA ────────────────────────────────
     // FIX #11: was calling upload_to_github_release() which assumed a release
     //          already existed. Now we explicitly create (or reuse) one first.
@@ -977,7 +982,7 @@ async fn main() -> Result<()> {
     status.phase = "phase_9_upload_asset".to_string();
     status.write_to_file(STATUS_FILE)?;
 
-    let image_tag = generate_image_tag(&image_source_sha);
+    let image_tag = config.image_tag.clone();
     let image_name = format!("XOA HomeLab Edition - {}", image_tag);
 
     let release = match create_github_release(
@@ -986,6 +991,8 @@ async fn main() -> Result<()> {
         &image_name,
         &image_source_sha,
         &build_xoa_hl_head_sha,
+        &rpm_tag,
+        &config.xoa_hl_rpm_url,
     )
     .await
     {
@@ -1435,46 +1442,57 @@ async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
 
 // ── PHASE 4: Sync repository ──────────────────────────────────────────────────
 
-async fn sync_repository() -> Result<()> {
-    let repo_path = Path::new(REPO_DIR);
-    info!("Syncing {}", repo_path.display());
+async fn sync_repository(expected_sha: &str) -> Result<()> {
+    sync_builder_at(
+        Path::new(REPO_DIR),
+        &format!("https://github.com/{}", BUILD_XOA_HL_REPO),
+        expected_sha,
+    )
+    .await
+}
 
+async fn sync_builder_at(repo_path: &Path, source: &str, expected_sha: &str) -> Result<()> {
+    if expected_sha.len() != 40 || !expected_sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("Builder source must be an exact Git commit SHA");
+    }
     if !repo_path.exists() {
+        if let Some(parent) = repo_path.parent() {
+            async_fs::create_dir_all(parent).await?;
+        }
         let status = AsyncCommand::new("git")
-            .args([
-                "clone",
-                &format!("https://github.com/{}", BUILD_XOA_HL_REPO),
-            ])
+            .args(["clone", "--no-checkout", source])
             .arg(repo_path)
             .status()
             .await
             .context("git clone failed")?;
         if !status.success() {
-            bail!("git clone exited with {:?}", status.code());
-        }
-    } else {
-        let fetch = AsyncCommand::new("git")
-            .arg("fetch")
-            .current_dir(repo_path)
-            .status()
-            .await
-            .context("git fetch failed")?;
-        if !fetch.success() {
-            bail!("git fetch exited with {:?}", fetch.code());
-        }
-
-        let reset = AsyncCommand::new("git")
-            .args(["reset", "--hard", "origin/main"])
-            .current_dir(repo_path)
-            .status()
-            .await
-            .context("git reset failed")?;
-        if !reset.success() {
-            bail!("git reset exited with {:?}", reset.code());
+            bail!("git clone failed");
         }
     }
-
-    info!("Repository synchronized");
+    for arguments in [
+        vec!["fetch", "--depth", "1", "origin", expected_sha],
+        vec!["checkout", "--detach", expected_sha],
+    ] {
+        let status = AsyncCommand::new("git")
+            .args(arguments)
+            .current_dir(repo_path)
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("Could not check out pinned builder source {}", expected_sha);
+        }
+    }
+    let status = AsyncCommand::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(repo_path)
+        .output()
+        .await?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        bail!(
+            "Builder checkout has local changes or untracked files; refusing ambiguous provenance"
+        );
+    }
+    info!("Builder repository checked out at {}", expected_sha);
     Ok(())
 }
 
@@ -1735,6 +1753,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     ]}},
     {{"type":"shell","inline":[
       {stamp},
+      {image_stamp},
+      {about_stamp},
       "cat /etc/xoa-hl-vm-release"
     ]}},
     {{"type":"file","source":"scripts/xoa-first-boot.sh","destination":"/root/xoa-first-boot.sh"}},
@@ -1791,6 +1811,14 @@ fn generate_packer_template(config: &BuildConfig) -> String {
         xe_url = config.xe_guest_utilities_url,
         rpm_url = config.xoa_hl_rpm_url,
         stamp = serde_json::Value::from(release_stamp_command(&config.xoa_hl_tag)),
+        image_stamp = serde_json::Value::from(format!(
+            "printf '%s\\n' '{}' > /etc/xoa-hl-image-tag",
+            config.image_tag
+        )),
+        about_stamp = serde_json::Value::from(format!(
+            "printf 'image %s\\n' '{}' >> /etc/xoa-hl-vm-release",
+            config.image_tag
+        )),
         output_dir = OUTPUT_DIR,
     )
 }
@@ -2226,9 +2254,7 @@ async fn locate_xva() -> Result<PathBuf> {
 // ── PHASE 9: Create release and upload ────────────────────────────────────────
 
 fn generate_image_tag(head_sha: &str) -> String {
-    let date = Utc::now().format("%Y%m%d");
-    let short = &head_sha[..7.min(head_sha.len())];
-    format!("{}{}-{}", IMAGE_TAG_PREFIX, date, short)
+    image_publication::image_tag_at(head_sha, Utc::now())
 }
 
 /// Does this release carry the published VM image for the given commits?
@@ -2260,23 +2286,22 @@ struct ReleaseHandle {
     tag_name: String,
 }
 
-/// Create the image release as a draft, or reuse the one for this tag (idempotent).
+/// Reserve a new image identity and create its release as a draft.
 ///
 /// A draft is invisible to anonymous readers (release-watch, Deploy XOA), so a
 /// failed upload never leaves a published release without its XVA;
 /// `publish_release` makes it public once the asset is in place.
 ///
-/// The tag is created by the GitHub API on that repo's default branch. It
-/// cannot be anchored to `target_sha`: that is an `xoa-hl` commit, which does
-/// not exist here, the source commit is recorded in the tag suffix and the
-/// release body instead. `build_xoa_hl_sha` (this repo's own HEAD) is
-/// recorded in the body only, `is_image_release_for` matches on it.
+/// Each tag targets a fresh provenance commit parented to the exact builder source.
+/// Public release identities and bytes are never reused for another image build.
 async fn create_github_release(
     client: &reqwest::Client,
     tag: &str,
     name: &str,
     target_sha: &str,
     build_xoa_hl_sha: &str,
+    rpm_tag: &str,
+    rpm_url: &str,
 ) -> Result<ReleaseHandle> {
     // releases/tags/{tag} hides drafts, so look in the authenticated list.
     let list_url = format!(
@@ -2293,24 +2318,30 @@ async fn create_github_release(
         .json()
         .await
         .context("Failed to parse the release list")?;
-    if let Some(mut r) = releases.into_iter().find(|r| r.tag_name == tag) {
-        info!(
-            "Release {} already exists (draft: {}), reusing: {}",
-            tag, r.draft, r.html_url
+    if releases.iter().any(|r| r.tag_name == tag) {
+        bail!(
+            "Image build tag {} already exists; refusing to replace its release",
+            tag
         );
-        // Hide a release while replacing its image and provenance together.
-        if !r.draft {
-            r = client
-                .patch(&r.url)
-                .json(&serde_json::json!({ "draft": true }))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-        }
-        return Ok(r);
     }
+    let rpm_asset = Path::new(rpm_url)
+        .file_name()
+        .context("RPM URL has no filename")?
+        .to_string_lossy();
+    let build = image_publication::manifest(tag, target_sha, build_xoa_hl_sha, rpm_tag, &rpm_asset);
+    let repo_api = format!("https://api.github.com/repos/{}", BUILD_XOA_HL_REPO);
+    let provenance =
+        image_publication::create_provenance_commit(client, &repo_api, build_xoa_hl_sha, &build)
+            .await?;
+
+    // Reserve the identity explicitly; an existing tag must never be retargeted.
+    client
+        .post(format!("{repo_api}/git/refs"))
+        .json(&serde_json::json!({"ref": format!("refs/tags/{tag}"), "sha": provenance}))
+        .send()
+        .await?
+        .error_for_status()
+        .context("Image tag already exists or could not be reserved")?;
 
     let create_url = format!(
         "https://api.github.com/repos/{}/releases",
@@ -2318,6 +2349,7 @@ async fn create_github_release(
     );
     let payload = serde_json::json!({
         "tag_name":          tag,
+        "target_commitish":  provenance,
         "name":              name,
         "body":              format!(
             "XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}\nSource commit (build-xoa-hl): {}",
@@ -2576,6 +2608,70 @@ async fn upload_asset_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn builder_checkout_uses_recorded_commit_after_source_head_moves() {
+        let root = std::env::temp_dir().join(format!(
+            "builder-pin-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let source = root.join("source");
+        let checkout = root.join("checkout");
+        std::fs::create_dir_all(&source).unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .current_dir(&source)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            String::from_utf8_lossy(&result.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(source.join("input"), "recorded").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "recorded",
+        ]);
+        let recorded = git(&["rev-parse", "HEAD"]);
+        std::fs::write(source.join("input"), "later").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "later",
+        ]);
+        sync_builder_at(&checkout, source.to_str().unwrap(), &recorded)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("input")).unwrap(),
+            "recorded"
+        );
+        std::fs::write(checkout.join("unexpected"), "local").unwrap();
+        assert!(
+            sync_builder_at(&checkout, source.to_str().unwrap(), &recorded)
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use shared::ReleaseAsset;
 
     #[test]
@@ -2926,6 +3022,57 @@ VM_MEMORY_MB="4096"
             .status()
             .expect("python3 is required by the image builder");
         assert!(status.success());
+    }
+
+    #[test]
+    fn exact_identity_is_visible_to_both_guest_metrics_and_existing_about_api() {
+        let tag = "xoa-image-20261028-010203000000001-abcdef0";
+        let config = BuildConfig {
+            image_tag: tag.into(),
+            ..Default::default()
+        };
+        let template: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&config)).unwrap();
+        let steps = template["provisioners"].as_array().unwrap();
+        let stamp = steps
+            .iter()
+            .find(|step| step["inline"].to_string().contains("/etc/xoa-hl-image-tag"))
+            .unwrap();
+        let root = std::env::temp_dir().join(format!("image-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let about = root.join("about");
+        let exact = root.join("exact");
+        for command in stamp["inline"].as_array().unwrap() {
+            let command = command
+                .as_str()
+                .unwrap()
+                .replace("/etc/xoa-hl-vm-release", about.to_str().unwrap())
+                .replace("/etc/xoa-hl-image-tag", exact.to_str().unwrap());
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "rpm() {{ echo 47.gabcdef0.xcpng8.3.el9; }}; {command}"
+                ))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        assert_eq!(std::fs::read_to_string(&exact).unwrap().trim(), tag);
+        let text = std::fs::read_to_string(&about).unwrap();
+        assert!(text.starts_with("built "));
+        assert!(text.ends_with(&format!("image {tag}\n")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn template_records_exact_image_identity() {
+        let config = BuildConfig {
+            image_tag: "xoa-image-20261028-010203000000001-abcdef0".into(),
+            ..Default::default()
+        };
+        let template = generate_packer_template(&config);
+        assert!(template.contains("/etc/xoa-hl-image-tag"));
+        assert!(template.contains(&config.image_tag));
     }
 
     #[test]

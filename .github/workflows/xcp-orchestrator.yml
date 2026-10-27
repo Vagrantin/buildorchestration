@@ -30,6 +30,10 @@ jobs:
         with:
           workspaces: xcp-orchestrator
       - run: cargo test --locked
+      - name: Validate image publisher formatting
+        run: |
+          rustfmt --edition 2021 xoa-vm-agent/src/main.rs
+          git diff --exit-code -- xoa-vm-agent/src
 
   # Static musl build (rustls, no OpenSSL), so the binaries run in any agent image.
   build:
