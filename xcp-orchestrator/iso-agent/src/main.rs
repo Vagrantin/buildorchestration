@@ -902,6 +902,8 @@ async fn main() -> Result<(), OrchestratorError> {
             } else {
                 status.phase = "failed".to_string();
                 status.detail = format!("ISO build ended with: {}", iso_final_status);
+                status.write_to_file(STATUS_FILE)?;
+                return Err(OrchestratorError::ComponentBuildFailed(status.detail.clone()));
             }
             status.write_to_file(STATUS_FILE)?;
         }
