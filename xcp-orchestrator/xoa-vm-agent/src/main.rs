@@ -1595,7 +1595,7 @@ async fn copy_provisioning_files(repo: &Path, build_dir: &Path) -> Result<()> {
         async_fs::create_dir_all(dst.parent().unwrap()).await?;
         async_fs::copy(&src, &dst)
             .await
-            .with_context(|| format!("Required provisioning file missing or unreadable: {}", script))?;
+            .with_context(|| format!("Required provisioning file unavailable: {}", script))?;
         info!("Copied {}", script);
     }
     Ok(())
