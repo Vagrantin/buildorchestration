@@ -310,9 +310,13 @@ pub async fn fetch_latest_release_ref(
     })?;
     let releases: Vec<ReleaseListItem> =
         parse_github_response(res, &format!("fetch_latest_release_ref for {}", repo)).await?;
-    if releases.iter().any(|r| !r.draft && r.published_at.is_none()) {
+    if releases
+        .iter()
+        .any(|r| !r.draft && r.published_at.is_none())
+    {
         return Err(OrchestratorError::VersionFormat(format!(
-            "published release of {} has no published_at timestamp", repo
+            "published release of {} has no published_at timestamp",
+            repo
         )));
     }
     let Some(tag) = newest_built_release(&releases) else {
@@ -527,20 +531,22 @@ mod tests {
     }
 
     use super::{
-        format_xoa_matrix_entry, matrix_has_entry, matrix_has_image_entry,
-        newest_built_release, next_tag_candidate, parse_ce_tag,
-        parse_pinned_xolite_tag, parse_plain_version_tag, parse_upstream_xo,
-        split_leading_comments, workflow_push_runs_url, ReleaseInfo, ReleaseListItem,
-        UpstreamXoPin,
+        format_xoa_matrix_entry, matrix_has_entry, matrix_has_image_entry, newest_built_release,
+        next_tag_candidate, parse_ce_tag, parse_pinned_xolite_tag, parse_plain_version_tag,
+        parse_upstream_xo, split_leading_comments, workflow_push_runs_url, ReleaseInfo,
+        ReleaseListItem, UpstreamXoPin,
     };
 
     #[test]
     fn xoa_matrix_entry_records_the_published_asset_and_pin() {
         let row = format_xoa_matrix_entry(
-            "xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40",
+            "xoa-image-20261022-a280852",
+            "v5.113.2_e281c536-ce40",
             "xoa-hl-5.113.2_e281c536-40.ga280852.xcpng8.3.el9.x86_64",
-            "XOA-hl.xva", "2026-10-22",
-        ).unwrap();
+            "XOA-hl.xva",
+            "2026-10-22",
+        )
+        .unwrap();
         assert!(row.contains("asset: \"XOA-hl.xva\""));
         assert!(row.contains("xoa_hl_version: \"v5.113.2_e281c536\""));
         assert!(row.contains("rpm_tag: \"v5.113.2_e281c536-ce40\""));
@@ -554,12 +560,34 @@ mod tests {
     fn xoa_matrix_entry_rejects_unsafe_or_unpinned_values() {
         for (tag, rpm, asset) in [
             ("xoa-image-20261022-a280852", "v5.113.2-ce40", "XOA-hl.xva"),
-            ("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "bad\".xva"),
-            ("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "notes.txt"),
+            (
+                "xoa-image-20261022-a280852",
+                "v5.113.2_e281c536-ce40",
+                "bad\".xva",
+            ),
+            (
+                "xoa-image-20261022-a280852",
+                "v5.113.2_e281c536-ce40",
+                "notes.txt",
+            ),
         ] {
-            assert!(format_xoa_matrix_entry(tag, rpm, "xoa-hl-5.113.2_e281c536-40.gsha.x86_64", asset, "2026-10-22").is_err());
+            assert!(format_xoa_matrix_entry(
+                tag,
+                rpm,
+                "xoa-hl-5.113.2_e281c536-40.gsha.x86_64",
+                asset,
+                "2026-10-22"
+            )
+            .is_err());
         }
-        assert!(format_xoa_matrix_entry("xoa-image-20261022-a280852", "v5.113.2_e281c536-ce40", "bad\"rpm", "XOA-hl.xva", "2026-10-22").is_err());
+        assert!(format_xoa_matrix_entry(
+            "xoa-image-20261022-a280852",
+            "v5.113.2_e281c536-ce40",
+            "bad\"rpm",
+            "XOA-hl.xva",
+            "2026-10-22"
+        )
+        .is_err());
     }
 
     /// GitHub sends `"body": null` for a release created without notes (every
@@ -731,10 +759,26 @@ mod tests {
     #[test]
     fn newest_built_release_uses_publication_order_even_when_list_order_is_wrong() {
         let list = [
-            ReleaseListItem { tag_name: "early".into(), draft: false, published_at: Some("2026-08-19T11:34:29Z".into()) },
-            ReleaseListItem { tag_name: "newest".into(), draft: false, published_at: Some("2026-08-19T13:52:52Z".into()) },
-            ReleaseListItem { tag_name: "middle".into(), draft: false, published_at: Some("2026-08-19T09:45:46Z".into()) },
-            ReleaseListItem { tag_name: "unpublished".into(), draft: true, published_at: None },
+            ReleaseListItem {
+                tag_name: "early".into(),
+                draft: false,
+                published_at: Some("2026-08-19T11:34:29Z".into()),
+            },
+            ReleaseListItem {
+                tag_name: "newest".into(),
+                draft: false,
+                published_at: Some("2026-08-19T13:52:52Z".into()),
+            },
+            ReleaseListItem {
+                tag_name: "middle".into(),
+                draft: false,
+                published_at: Some("2026-08-19T09:45:46Z".into()),
+            },
+            ReleaseListItem {
+                tag_name: "unpublished".into(),
+                draft: true,
+                published_at: None,
+            },
         ];
         assert_eq!(newest_built_release(&list), Some("newest"));
     }
@@ -1268,7 +1312,9 @@ pub async fn fetch_release_rpm_name(
 /// The ISO release body records the exact xcp-hl-release asset selected by
 /// build-iso.yml. Older ISO releases have no such provenance; never infer it
 /// from today's `/releases/latest`, which may point to a different RPM.
-pub fn parse_iso_release_rpm_provenance(body: &str) -> Result<Option<(String, String)>, OrchestratorError> {
+pub fn parse_iso_release_rpm_provenance(
+    body: &str,
+) -> Result<Option<(String, String)>, OrchestratorError> {
     fn field<'a>(body: &'a str, label: &str) -> Option<&'a str> {
         body.lines()
             .find_map(|line| line.strip_prefix(label))
@@ -1281,7 +1327,10 @@ pub fn parse_iso_release_rpm_provenance(body: &str) -> Result<Option<(String, St
     match (tag, rpm) {
         (None, None) => Ok(None),
         (Some(tag), Some(rpm)) if rpm.starts_with("xcp-hl-release-") && rpm.ends_with(".rpm") => {
-            Ok(Some((tag.to_string(), rpm.trim_end_matches(".rpm").to_string())))
+            Ok(Some((
+                tag.to_string(),
+                rpm.trim_end_matches(".rpm").to_string(),
+            )))
         }
         _ => Err(OrchestratorError::VersionFormat(
             "ISO release has incomplete or invalid xcp-hl-release RPM provenance".into(),
@@ -1295,7 +1344,10 @@ mod iso_rpm_provenance_tests {
 
     #[test]
     fn records_exact_asset_and_omits_legacy_releases() {
-        assert_eq!(parse_iso_release_rpm_provenance("Old release").unwrap(), None);
+        assert_eq!(
+            parse_iso_release_rpm_provenance("Old release").unwrap(),
+            None
+        );
         assert_eq!(
             parse_iso_release_rpm_provenance("xcp-hl-release tag: `v8.3-ce3`\nxcp-hl-release RPM: `xcp-hl-release-8.3-3.noarch.rpm`\n").unwrap(),
             Some(("v8.3-ce3".into(), "xcp-hl-release-8.3-3.noarch".into()))
@@ -1310,7 +1362,9 @@ pub async fn fetch_iso_release_rpm_provenance(
 ) -> Result<Option<(String, String)>, OrchestratorError> {
     let release = fetch_release_by_tag(client, "xcp-ng-ce-iso", iso_tag)
         .await?
-        .ok_or_else(|| OrchestratorError::VersionFormat(format!("ISO release {} not published", iso_tag)))?;
+        .ok_or_else(|| {
+            OrchestratorError::VersionFormat(format!("ISO release {} not published", iso_tag))
+        })?;
     let provenance = parse_iso_release_rpm_provenance(&release.body)?;
     if let Some((ref tag, ref rpm)) = provenance {
         let actual = fetch_release_rpm_name(client, "xcp-hl", tag).await?;
@@ -1362,10 +1416,6 @@ pub async fn append_release_matrix_entry(
         .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?;
     let current_yaml =
         String::from_utf8(current_yaml_bytes).map_err(OrchestratorError::FromUtf8)?;
-    if matrix_has_entry(&current_yaml, iso_tag) {
-        tracing::info!("Release matrix already records {}", iso_tag);
-        return Ok(());
-    }
 
     // Publication date, so a later backfill (--record-matrix) does not use the tag commit date.
     let date = iso_release_date(client, iso_tag).await.ok_or_else(|| {
@@ -1389,8 +1439,10 @@ pub async fn append_release_matrix_entry(
     }
     // The file opens with a comment block documenting the schema; entries go
     // below it, newest first.
-    let (header, entries) = split_leading_comments(&current_yaml);
-    let updated_yaml = format!("{}{}\n{}", header, new_entry.trim_end(), entries);
+    let updated_yaml = enrich_matrix_entry(&current_yaml, "iso_version", iso_tag, &new_entry)?;
+    if updated_yaml == current_yaml {
+        return Ok(());
+    }
 
     // main is protected (PR plus a green gitleaks check), so the entry goes through a pull request.
     let message = format!("docs: record release {} in matrix", iso_tag);
@@ -1459,31 +1511,40 @@ pub async fn append_xoa_release_matrix_entry(
         "xoa release matrix GET",
     )
     .await?;
-    let cleaned: String = existing.content.chars().filter(|c| !c.is_whitespace()).collect();
+    let cleaned: String = existing
+        .content
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let content = String::from_utf8(
         general_purpose::STANDARD
             .decode(cleaned)
             .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?,
     )
     .map_err(OrchestratorError::FromUtf8)?;
-    if matrix_has_image_entry(&content, image_tag) {
-        tracing::info!("XOA release matrix already records {}", image_tag);
-        return Ok(());
-    }
 
     let date = image_release_date(client, image_tag).await.ok_or_else(|| {
         OrchestratorError::VersionFormat(format!("no publication date for image {}", image_tag))
     })?;
     let rpm = fetch_release_rpm_name(client, "xoa-hl", rpm_tag).await?;
     let row = format_xoa_matrix_entry(image_tag, rpm_tag, &rpm, asset, &date)?;
-    let (header, entries) = split_leading_comments(&content);
-    let updated = format!("{}{}\n{}", header, row.trim_end(), entries);
+    let updated = enrich_matrix_entry(&content, "image_tag", image_tag, &row)?;
+    if updated == content {
+        return Ok(());
+    }
     let message = format!("docs: record XOA image {} in matrix", image_tag);
     let branch = format!("xoa-release-matrix/{}", image_tag);
     let pr = open_matrix_pr(client, &url, &branch, &message, &updated, &existing.sha).await?;
     let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
     let number = pr["number"].as_u64().unwrap_or_default();
-    wait_for_check(client, DOCS_REPO, head_sha, "gitleaks", MATRIX_CHECK_TIMEOUT).await?;
+    wait_for_check(
+        client,
+        DOCS_REPO,
+        head_sha,
+        "gitleaks",
+        MATRIX_CHECK_TIMEOUT,
+    )
+    .await?;
     merge_pr(client, DOCS_REPO, number, &message).await?;
     let _ = client
         .delete(format!(
@@ -1493,6 +1554,176 @@ pub async fn append_xoa_release_matrix_entry(
         .send()
         .await;
     Ok(())
+}
+
+/// Enrich the scalar/mapping YAML emitted by the release agents without erasing
+/// comments, unknown fields, or neighbouring entries. Refuse conflicting identities;
+/// only the asset name may change after a canonical-asset replacement on a release.
+pub fn enrich_matrix_entry(
+    yaml: &str,
+    key: &str,
+    tag: &str,
+    row: &str,
+) -> Result<String, OrchestratorError> {
+    let needle = format!("- {}: \"{}\"", key, tag);
+    let lines: Vec<&str> = yaml.split_inclusive('\n').collect();
+    let positions: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| (line.trim_end() == needle).then_some(i))
+        .collect();
+    if positions.len() > 1 {
+        return Err(OrchestratorError::VersionFormat(format!(
+            "duplicate matrix tag {}",
+            tag
+        )));
+    }
+    let Some(&start) = positions.first() else {
+        let (header, entries) = split_leading_comments(yaml);
+        return Ok(format!("{}{}\n{}", header, row.trim_end(), entries));
+    };
+    let mut end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(i, line)| line.starts_with("- ").then_some(i))
+        .unwrap_or(lines.len());
+    // A schema comment between rows belongs to neither entry.
+    while end > start + 1 && (lines[end - 1].trim().is_empty() || lines[end - 1].starts_with('#')) {
+        end -= 1;
+    }
+    fn fields(text: &str) -> Result<Vec<(String, String, usize)>, OrchestratorError> {
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        let mut result = Vec::new();
+        for (i, raw) in text.lines().enumerate() {
+            if raw.trim().is_empty() || raw.trim_start().starts_with('#') {
+                continue;
+            }
+            let indent = raw.len() - raw.trim_start().len();
+            let line = raw.trim_start().trim_start_matches("- ");
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            while stack.last().is_some_and(|(n, _)| *n >= indent) {
+                stack.pop();
+            }
+            let path = stack
+                .iter()
+                .map(|(_, k)| k.as_str())
+                .chain(std::iter::once(key))
+                .collect::<Vec<_>>()
+                .join(".");
+            if result.iter().any(|(p, _, _)| p == &path) {
+                return Err(OrchestratorError::VersionFormat(format!(
+                    "duplicate matrix field {}",
+                    path
+                )));
+            }
+            let value = value.trim().to_string();
+            result.push((path, value.clone(), i));
+            if value.is_empty() {
+                stack.push((indent, key.to_string()));
+            }
+        }
+        Ok(result)
+    }
+    let old_block: String = lines[start..end].concat();
+    let new_fields = fields(row)?;
+    let mut block: Vec<String> = old_block.lines().map(str::to_string).collect();
+    let new_lines: Vec<&str> = row.lines().collect();
+    for (path, value, index) in new_fields {
+        let old_fields = fields(&block.join("\n"))?;
+        if let Some((_, old, old_index)) = old_fields.iter().find(|(p, _, _)| p == &path) {
+            if old != &value {
+                if path == "asset" {
+                    block[*old_index] = new_lines[index].to_string();
+                } else {
+                    return Err(OrchestratorError::VersionFormat(format!(
+                        "matrix {} has conflicting {}: {} versus {}",
+                        tag, path, old, value
+                    )));
+                }
+            }
+        } else {
+            let mut insert = block.len();
+            if let Some((parent, _)) = path.rsplit_once('.') {
+                let (_, _, parent_index) = old_fields
+                    .iter()
+                    .find(|(p, _, _)| p == parent)
+                    .ok_or_else(|| {
+                        OrchestratorError::VersionFormat(format!(
+                            "missing matrix parent {}",
+                            parent
+                        ))
+                    })?;
+                let parent_indent =
+                    block[*parent_index].len() - block[*parent_index].trim_start().len();
+                insert = block
+                    .iter()
+                    .enumerate()
+                    .skip(*parent_index + 1)
+                    .find_map(|(i, line)| {
+                        let indent = line.len() - line.trim_start().len();
+                        (!line.trim().is_empty()
+                            && !line.trim_start().starts_with('#')
+                            && indent <= parent_indent)
+                            .then_some(i)
+                    })
+                    .unwrap_or(block.len());
+            }
+            block.insert(insert, new_lines[index].to_string());
+        }
+    }
+    Ok(format!(
+        "{}{}\n{}",
+        lines[..start].concat(),
+        block.join("\n"),
+        lines[end..].concat()
+    ))
+}
+
+#[cfg(test)]
+mod matrix_enrichment_tests {
+    use super::enrich_matrix_entry;
+
+    #[test]
+    fn fills_old_image_identity_without_duplicate_or_lost_annotations() {
+        let old = "# schema\n- image_tag: \"image1\"\n  asset: \"qa.xva\"\n  note: \"keep\"\n# next\n- image_tag: \"image2\"\n";
+        let row = "- image_tag: \"image1\"\n  asset: \"XOA-hl.xva\"\n  rpm_tag: \"rpm1\"\n  rpm: \"package1\"\n";
+        let updated = enrich_matrix_entry(old, "image_tag", "image1", row).unwrap();
+        assert!(updated.contains("  note: \"keep\"\n"));
+        assert!(updated.contains("  rpm: \"package1\"\n# next\n- image_tag: \"image2\""));
+        assert_eq!(updated.matches("- image_tag: \"image1\"").count(), 1);
+        assert_eq!(
+            enrich_matrix_entry(&updated, "image_tag", "image1", row).unwrap(),
+            updated
+        );
+    }
+
+    #[test]
+    fn fills_nested_iso_component_without_changing_other_components() {
+        let old = "- iso_version: \"ce1\"\n  components:\n    xoa_proxy:\n      rpm: \"proxy\"\n";
+        let row = format!(
+            "{}    xcp_hl_release:\n      version: \"v1\"\n      rpm: \"release1\"\n",
+            old
+        );
+        let updated = enrich_matrix_entry(old, "iso_version", "ce1", &row).unwrap();
+        assert_eq!(updated, row);
+        assert_eq!(
+            enrich_matrix_entry(&updated, "iso_version", "ce1", &row).unwrap(),
+            row
+        );
+    }
+
+    #[test]
+    fn refuses_conflicting_identity_or_duplicate_rows() {
+        let old = "- image_tag: \"image1\"\n  rpm: \"old\"\n";
+        let row = "- image_tag: \"image1\"\n  rpm: \"different\"\n";
+        assert!(enrich_matrix_entry(old, "image_tag", "image1", row).is_err());
+        assert!(
+            enrich_matrix_entry(&format!("{}{}", old, old), "image_tag", "image1", row).is_err()
+        );
+    }
 }
 
 pub fn matrix_has_image_entry(yaml: &str, tag: &str) -> bool {
@@ -1509,24 +1740,44 @@ pub fn format_xoa_matrix_entry(
     date: &str,
 ) -> Result<String, OrchestratorError> {
     // These values are written into YAML and URLs: refuse unexpected syntax.
-    let safe = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
     let version = rpm_tag
         .strip_prefix('v')
         .and_then(|s| s.rsplit_once("-ce"))
         .filter(|(_, counter)| !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()))
         .map(|(version, _)| version)
-        .ok_or_else(|| OrchestratorError::VersionFormat(format!("invalid xoa-hl RPM tag: {}", rpm_tag)))?;
+        .ok_or_else(|| {
+            OrchestratorError::VersionFormat(format!("invalid xoa-hl RPM tag: {}", rpm_tag))
+        })?;
     let (upstream, commit) = version.split_once('_').ok_or_else(|| {
         OrchestratorError::VersionFormat(format!("missing XO pin in RPM tag: {}", rpm_tag))
     })?;
-    if !image_tag.starts_with("xoa-image-") || !safe(image_tag) || !safe(asset)
-        || !safe(rpm) || !rpm.starts_with(&format!("xoa-hl-{}-", version))
+    if !image_tag.starts_with("xoa-image-")
+        || !safe(image_tag)
+        || !safe(asset)
+        || !safe(rpm)
+        || !rpm.starts_with(&format!("xoa-hl-{}-", version))
         || !asset.ends_with(".xva") && !asset.ends_with(".xva.gz")
-        || !safe(version) || !safe(upstream) || commit.len() != XO_SHORT_SHA_LEN
+        || !safe(version)
+        || !safe(upstream)
+        || commit.len() != XO_SHORT_SHA_LEN
         || !commit.bytes().all(|b| b.is_ascii_hexdigit())
-        || date.len() != 10 || !date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() })
+        || date.len() != 10
+        || !date.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
     {
-        return Err(OrchestratorError::VersionFormat("invalid XOA matrix entry".into()));
+        return Err(OrchestratorError::VersionFormat(
+            "invalid XOA matrix entry".into(),
+        ));
     }
     Ok(format!(
         "- image_tag: \"{image_tag}\"\n  build_date: \"{date}\"\n  asset: \"{asset}\"\n  xoa_hl_version: \"v{version}\"\n  rpm_tag: \"{rpm_tag}\"\n  rpm: \"{rpm}\"\n  upstream_xo: \"{upstream}\"\n  upstream_url: \"https://github.com/vatesfr/xen-orchestra/commit/{commit}\"\n"
@@ -1534,8 +1785,13 @@ pub fn format_xoa_matrix_entry(
 }
 
 async fn image_release_date(client: &Client, tag: &str) -> Option<String> {
-    let url = format!("https://api.github.com/repos/{}/build-xoa-hl/releases/tags/{}", OWNER, tag);
-    let release = gh_json(client.get(&url), "XOA image release date").await.ok()?;
+    let url = format!(
+        "https://api.github.com/repos/{}/build-xoa-hl/releases/tags/{}",
+        OWNER, tag
+    );
+    let release = gh_json(client.get(&url), "XOA image release date")
+        .await
+        .ok()?;
     release["published_at"]
         .as_str()
         .and_then(|date| date.get(..10))
@@ -1556,7 +1812,12 @@ async fn iso_release_date(client: &Client, tag: &str) -> Option<String> {
 }
 
 const CHANGELOG_REPOS: [&str; 6] = [
-    "xcp-hl", "xoa-hl", "xolite-ce", "xoa-proxy", "xcp-ng-ce-iso", "build-xoa-hl",
+    "xcp-hl",
+    "xoa-hl",
+    "xolite-ce",
+    "xoa-proxy",
+    "xcp-ng-ce-iso",
+    "build-xoa-hl",
 ];
 
 /// Record release notes once the published release and its matrix row exist.
@@ -1570,39 +1831,74 @@ pub async fn append_changelog_entry(
 ) -> Result<(), OrchestratorError> {
     use base64::{engine::general_purpose, Engine as _};
     if !["xcp-ng-ce-iso", "build-xoa-hl"].contains(&release_repo)
-        || tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        || tag.is_empty()
+        || !tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         || components.is_empty()
-        || components.iter().any(|(repo, version)| !CHANGELOG_REPOS.contains(repo) || version.is_empty())
+        || components
+            .iter()
+            .any(|(repo, version)| !CHANGELOG_REPOS.contains(repo) || version.is_empty())
     {
-        return Err(OrchestratorError::InvalidArgument("invalid changelog release identity".into()));
+        return Err(OrchestratorError::InvalidArgument(
+            "invalid changelog release identity".into(),
+        ));
     }
 
-    let url = format!("https://api.github.com/repos/{}/{}/contents/{}", OWNER, DOCS_REPO, CHANGELOG_DATA_PATH);
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/contents/{}",
+        OWNER, DOCS_REPO, CHANGELOG_DATA_PATH
+    );
     let existing: GHFileContent = parse_github_response(
-        client.get(&url).send().await.map_err(|e|
+        client.get(&url).send().await.map_err(|e| {
             OrchestratorError::GitHubApi("read changelog data".into(), e.to_string())
-        )?, "read changelog data"
-    ).await?;
-    let content = String::from_utf8(general_purpose::STANDARD.decode(
-        existing.content.chars().filter(|c| !c.is_whitespace()).collect::<String>()
-    ).map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?)?;
+        })?,
+        "read changelog data",
+    )
+    .await?;
+    let content = String::from_utf8(
+        general_purpose::STANDARD
+            .decode(
+                existing
+                    .content
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>(),
+            )
+            .map_err(|e| OrchestratorError::Base64Decode(e.to_string()))?,
+    )?;
     let mut entries: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-    if entries.iter().any(|entry| entry["repository"] == release_repo && entry["tag"] == tag) {
+    if entries
+        .iter()
+        .any(|entry| entry["repository"] == release_repo && entry["tag"] == tag)
+    {
         tracing::info!("Changelog already records {}@{}", release_repo, tag);
         return Ok(());
     }
 
-    let release_url = format!("https://api.github.com/repos/{}/{}/releases/tags/{}", OWNER, release_repo, tag);
+    let release_url = format!(
+        "https://api.github.com/repos/{}/{}/releases/tags/{}",
+        OWNER, release_repo, tag
+    );
     let release = gh_json(client.get(release_url), "read published release").await?;
     if release["draft"] != false {
-        return Err(OrchestratorError::VersionFormat(format!("{}@{} is not published", release_repo, tag)));
+        return Err(OrchestratorError::VersionFormat(format!(
+            "{}@{} is not published",
+            release_repo, tag
+        )));
     }
-    let published = release["published_at"].as_str().ok_or_else(||
-        OrchestratorError::VersionFormat(format!("{}@{} has no publication time", release_repo, tag))
-    )?;
-    let date = published.get(..10).ok_or_else(||
-        OrchestratorError::VersionFormat(format!("{}@{} has an invalid publication time", release_repo, tag))
-    )?;
+    let published = release["published_at"].as_str().ok_or_else(|| {
+        OrchestratorError::VersionFormat(format!(
+            "{}@{} has no publication time",
+            release_repo, tag
+        ))
+    })?;
+    let date = published.get(..10).ok_or_else(|| {
+        OrchestratorError::VersionFormat(format!(
+            "{}@{} has an invalid publication time",
+            release_repo, tag
+        ))
+    })?;
     let previous = previous_release_time(client, release_repo, tag, published).await?;
     let changes = if let Some(start) = previous {
         merged_changelog_prs(client, &start, published).await?
@@ -1626,48 +1922,93 @@ pub async fn append_changelog_entry(
     let pr = open_matrix_pr(client, &url, &branch, &message, &updated, &existing.sha).await?;
     let head_sha = pr["head"]["sha"].as_str().unwrap_or_default();
     let number = pr["number"].as_u64().unwrap_or_default();
-    wait_for_check(client, DOCS_REPO, head_sha, "gitleaks", MATRIX_CHECK_TIMEOUT).await?;
+    wait_for_check(
+        client,
+        DOCS_REPO,
+        head_sha,
+        "gitleaks",
+        MATRIX_CHECK_TIMEOUT,
+    )
+    .await?;
     merge_pr(client, DOCS_REPO, number, &message).await?;
-    let _ = client.delete(format!(
-        "https://api.github.com/repos/{}/{}/git/refs/heads/{}", OWNER, DOCS_REPO, branch
-    )).send().await;
-    tracing::info!("Changelog updated with {}@{} via #{}", release_repo, tag, number);
+    let _ = client
+        .delete(format!(
+            "https://api.github.com/repos/{}/{}/git/refs/heads/{}",
+            OWNER, DOCS_REPO, branch
+        ))
+        .send()
+        .await;
+    tracing::info!(
+        "Changelog updated with {}@{} via #{}",
+        release_repo,
+        tag,
+        number
+    );
     Ok(())
 }
 
 async fn previous_release_time(
-    client: &Client, repo: &str, tag: &str, published: &str,
+    client: &Client,
+    repo: &str,
+    tag: &str,
+    published: &str,
 ) -> Result<Option<String>, OrchestratorError> {
     let mut previous: Option<String> = None;
     // Fetch enough pages for older releases, including delayed backfills.
     for page in 1..=10 {
         let url = format!("https://api.github.com/repos/{}/{}/releases", OWNER, repo);
-        let releases = gh_json(client.get(&url).query(&[("per_page", "100"), ("page", &page.to_string())]), "list releases for changelog").await?;
-        let releases = releases.as_array().ok_or_else(|| OrchestratorError::VersionFormat("invalid releases response".into()))?;
+        let releases = gh_json(
+            client
+                .get(&url)
+                .query(&[("per_page", "100"), ("page", &page.to_string())]),
+            "list releases for changelog",
+        )
+        .await?;
+        let releases = releases
+            .as_array()
+            .ok_or_else(|| OrchestratorError::VersionFormat("invalid releases response".into()))?;
         for item in releases {
-            if item["draft"] == true || item["tag_name"] == tag { continue; }
+            if item["draft"] == true || item["tag_name"] == tag {
+                continue;
+            }
             if let Some(time) = item["published_at"].as_str() {
                 if time < published && previous.as_deref().map_or(true, |old| time > old) {
                     previous = Some(time.to_string());
                 }
             }
         }
-        if releases.len() < 100 { return Ok(previous); }
+        if releases.len() < 100 {
+            return Ok(previous);
+        }
     }
-    Err(OrchestratorError::VersionFormat("release history exceeds changelog pagination limit".into()))
+    Err(OrchestratorError::VersionFormat(
+        "release history exceeds changelog pagination limit".into(),
+    ))
 }
 
 fn changelog_changes(repo: &str, items: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut changes = Vec::new();
     for item in items {
-        if item["labels"].as_array().map_or(false, |labels| labels.iter().any(|label|
-            label["name"].as_str().map_or(false, |name| name.eq_ignore_ascii_case("skip-changelog"))
-        )) { continue; }
-        let (Some(title), Some(url)) = (item["title"].as_str(), item["html_url"].as_str()) else { continue; };
+        if item["labels"].as_array().map_or(false, |labels| {
+            labels.iter().any(|label| {
+                label["name"]
+                    .as_str()
+                    .map_or(false, |name| name.eq_ignore_ascii_case("skip-changelog"))
+            })
+        }) {
+            continue;
+        }
+        let (Some(title), Some(url)) = (item["title"].as_str(), item["html_url"].as_str()) else {
+            continue;
+        };
         let prefix = format!("https://github.com/{}/{}/pull/", OWNER, repo);
-        if !title.trim().is_empty() && url.strip_prefix(&prefix).map_or(false, |number|
-            !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) && !number.starts_with('0')
-        ) {
+        if !title.trim().is_empty()
+            && url.strip_prefix(&prefix).map_or(false, |number| {
+                !number.is_empty()
+                    && number.bytes().all(|b| b.is_ascii_digit())
+                    && !number.starts_with('0')
+            })
+        {
             changes.push(serde_json::json!({"repository": repo, "title": title, "url": url}));
         }
     }
@@ -1675,24 +2016,45 @@ fn changelog_changes(repo: &str, items: &[serde_json::Value]) -> Vec<serde_json:
 }
 
 async fn merged_changelog_prs(
-    client: &Client, start: &str, end: &str,
+    client: &Client,
+    start: &str,
+    end: &str,
 ) -> Result<Vec<serde_json::Value>, OrchestratorError> {
     let mut changes = Vec::new();
     for repo in CHANGELOG_REPOS {
-        let query = format!("repo:{}/{} is:pr is:merged merged:>{} merged:<={}", OWNER, repo, start, end);
+        let query = format!(
+            "repo:{}/{} is:pr is:merged merged:>{} merged:<={}",
+            OWNER, repo, start, end
+        );
         for page in 1..=10 {
-            let search = gh_json(client.get("https://api.github.com/search/issues").query(&[
-                ("q", query.as_str()), ("per_page", "100"), ("page", &page.to_string())
-            ]), "search merged changelog PRs").await?;
+            let search = gh_json(
+                client.get("https://api.github.com/search/issues").query(&[
+                    ("q", query.as_str()),
+                    ("per_page", "100"),
+                    ("page", &page.to_string()),
+                ]),
+                "search merged changelog PRs",
+            )
+            .await?;
             if search["incomplete_results"] == true {
-                return Err(OrchestratorError::VersionFormat(format!("incomplete merged PR search for {}", repo)));
+                return Err(OrchestratorError::VersionFormat(format!(
+                    "incomplete merged PR search for {}",
+                    repo
+                )));
             }
             if search["total_count"].as_u64().unwrap_or(1001) > 1000 {
-                return Err(OrchestratorError::VersionFormat(format!("too many merged PRs for {}", repo)));
+                return Err(OrchestratorError::VersionFormat(format!(
+                    "too many merged PRs for {}",
+                    repo
+                )));
             }
-            let items = search["items"].as_array().ok_or_else(|| OrchestratorError::VersionFormat("invalid PR search response".into()))?;
+            let items = search["items"].as_array().ok_or_else(|| {
+                OrchestratorError::VersionFormat("invalid PR search response".into())
+            })?;
             changes.extend(changelog_changes(repo, items));
-            if items.len() < 100 { break; }
+            if items.len() < 100 {
+                break;
+            }
         }
     }
     changes.sort_by(|a, b| a["url"].as_str().cmp(&b["url"].as_str()));

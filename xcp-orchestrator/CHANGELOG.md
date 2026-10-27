@@ -2,6 +2,15 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## Unreleased — release matrix provenance (xcp-hl#15)
+
+- Record the exact consumed xoa-hl RPM tag/filename in each image release after
+  upload. Hide releases while replacing their image and provenance together.
+- Persist the image RPM pin independently of later RPM build attempts. Retries
+  prefer published provenance and never assign current RPM state to an old image.
+- Enrich incomplete ISO/XOA rows instead of skipping them. Preserve annotations
+  and neighbours; refuse conflicting package identities.
+
 ## 2026-10-12 (xcp-orchestrator-v0.3.9)
 
 ### Fixed
