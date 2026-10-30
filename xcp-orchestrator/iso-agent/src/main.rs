@@ -9,13 +9,14 @@
 
 use chrono::Utc;
 use shared::{
-    append_release_matrix_entry, create_and_push_tag, create_github_client, delete_tag,
-    dispatch_workflow, fetch_latest_release_ref, fetch_latest_upstream_xolite_tag,
-    fetch_pinned_xolite_tag, fetch_release_rpm_name, fetch_repo_head_sha,
-    fetch_upstream_xolite_version, fetch_xoa_proxy_version, load_github_token,
-    locate_dispatch_triggered_run, locate_tag_triggered_run, only_non_build_changes, parse_ce_tag,
-    parse_plain_version_tag, query_run_conclusion, AgentStatus, ComponentVersionState,
-    IsoVersionState, OrchestratorError, WorkflowStatus, XCPNG_TARGET_VERSION,
+    append_changelog_entry, append_release_matrix_entry, create_and_push_tag, create_github_client,
+    delete_tag, dispatch_workflow, fetch_iso_release_rpm_provenance, fetch_latest_release_ref,
+    fetch_latest_upstream_xolite_tag, fetch_pinned_xolite_tag, fetch_release_by_tag,
+    fetch_release_rpm_name, fetch_repo_head_sha, fetch_upstream_xolite_version,
+    fetch_xoa_proxy_version, load_github_token, locate_dispatch_triggered_run,
+    locate_tag_triggered_run, only_non_build_changes, parse_ce_tag, parse_plain_version_tag,
+    query_run_conclusion, AgentStatus, ComponentVersionState, IsoVersionState, OrchestratorError,
+    WorkflowStatus, XCPNG_TARGET_VERSION,
 };
 use std::fs;
 use std::path::Path;
@@ -94,6 +95,27 @@ fn issued_counter(actual_tag: &str, requested: u32) -> u32 {
         .map(|(_, counter)| counter)
         .or_else(|| parse_plain_version_tag(actual_tag).map(|(_, counter)| counter))
         .unwrap_or(requested)
+}
+
+/// Remove an ISO tag whose build failed, unless a release already exists on it.
+async fn rollback_unreleased_iso_tag(client: &reqwest::Client, tag: &str) {
+    match fetch_release_by_tag(client, "xcp-ng-ce-iso", tag).await {
+        Ok(None) => match delete_tag(client, "xcp-ng-ce-iso", tag).await {
+            Ok(()) => warn!(
+                "ISO build failed; removed tag {} so a later run can reissue it",
+                tag
+            ),
+            Err(d) => warn!(
+                "ISO build failed and tag {} could not be removed ({}); delete it by hand",
+                tag, d
+            ),
+        },
+        Ok(Some(_)) => warn!("ISO build failed but tag {} has a release; keeping it", tag),
+        Err(e) => warn!(
+            "ISO build failed; could not check releases for tag {} ({}); keeping it",
+            tag, e
+        ),
+    }
 }
 
 fn needs_iso_build(
@@ -306,6 +328,7 @@ async fn record_last_iso_in_matrix(
     let xolite_rpm = fetch_release_rpm_name(client, "xolite-ce", &iso.last_xolite_tag).await?;
     let xoa_proxy_rpm =
         fetch_release_rpm_name(client, "xoa-proxy", &iso.last_xoa_proxy_tag).await?;
+    let release_rpm = fetch_iso_release_rpm_provenance(client, &iso.last_tag).await?;
     append_release_matrix_entry(
         client,
         &iso.last_tag,
@@ -314,6 +337,20 @@ async fn record_last_iso_in_matrix(
         &xolite_rpm,
         &iso.last_xoa_proxy_tag,
         &xoa_proxy_rpm,
+        release_rpm
+            .as_ref()
+            .map(|(tag, rpm)| (tag.as_str(), rpm.as_str())),
+    )
+    .await?;
+    append_changelog_entry(
+        client,
+        "xcp-ng-ce-iso",
+        &iso.last_tag,
+        &[
+            ("xcp-ng-ce-iso", &iso.last_tag),
+            ("xolite-ce", &iso.last_xolite_tag),
+            ("xoa-proxy", &iso.last_xoa_proxy_tag),
+        ],
     )
     .await
 }
@@ -647,7 +684,9 @@ async fn main() -> Result<(), OrchestratorError> {
             status.url = xoa_url;
         }
         status.write_to_file(STATUS_FILE)?;
-        return Ok(());
+        return Err(OrchestratorError::ComponentBuildFailed(
+            status.detail.clone(),
+        ));
     }
 
     // Persist SHAs only for components that actually built successfully
@@ -871,6 +910,8 @@ async fn main() -> Result<(), OrchestratorError> {
                     fetch_release_rpm_name(&client, "xolite-ce", &xolite_version).await?;
                 let xoa_proxy_rpm =
                     fetch_release_rpm_name(&client, "xoa-proxy", &xoa_proxy_version).await?;
+                let release_rpm =
+                    fetch_iso_release_rpm_provenance(&client, &actual_iso_tag).await?;
 
                 append_release_matrix_entry(
                     &client,
@@ -880,6 +921,20 @@ async fn main() -> Result<(), OrchestratorError> {
                     &xolite_rpm,
                     &xoa_proxy_version,
                     &xoa_proxy_rpm,
+                    release_rpm
+                        .as_ref()
+                        .map(|(tag, rpm)| (tag.as_str(), rpm.as_str())),
+                )
+                .await?;
+                append_changelog_entry(
+                    &client,
+                    "xcp-ng-ce-iso",
+                    &actual_iso_tag,
+                    &[
+                        ("xcp-ng-ce-iso", &actual_iso_tag),
+                        ("xolite-ce", &xolite_version),
+                        ("xoa-proxy", &xoa_proxy_version),
+                    ],
                 )
                 .await?;
 
@@ -888,6 +943,13 @@ async fn main() -> Result<(), OrchestratorError> {
             } else {
                 status.phase = "failed".to_string();
                 status.detail = format!("ISO build ended with: {}", iso_final_status);
+                if iso_final_status == WorkflowStatus::Failure {
+                    rollback_unreleased_iso_tag(&client, &actual_iso_tag).await;
+                }
+                status.write_to_file(STATUS_FILE)?;
+                return Err(OrchestratorError::ComponentBuildFailed(
+                    status.detail.clone(),
+                ));
             }
             status.write_to_file(STATUS_FILE)?;
         }

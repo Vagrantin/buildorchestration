@@ -19,11 +19,11 @@ use anyhow::{bail, Context, Result};
 
 use chrono::{DateTime, Utc};
 use shared::{
-    create_and_push_tag, create_github_client, fetch_release_by_tag, fetch_releases,
-    fetch_repo_head_sha, fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, list_active_runs,
-    load_credential, load_github_token, locate_tag_triggered_run, only_non_build_changes,
-    parse_ce_tag, query_run_conclusion, AgentStatus, ComponentVersionState, ReleaseInfo,
-    WorkflowStatus,
+    append_changelog_entry, append_xoa_release_matrix_entry, create_and_push_tag,
+    create_github_client, fetch_release_by_tag, fetch_releases, fetch_repo_head_sha,
+    fetch_tag_commit_sha, fetch_xoa_hl_upstream_pin, list_active_runs, load_credential,
+    load_github_token, locate_tag_triggered_run, only_non_build_changes, parse_ce_tag,
+    query_run_conclusion, AgentStatus, ComponentVersionState, ReleaseInfo, WorkflowStatus,
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -139,6 +139,9 @@ struct XoaHlVersionState {
     /// Tag of the last published XVA image release.
     #[serde(default, alias = "last_tag")]
     pub image_tag: String,
+    /// Exact RPM consumed by that image, independent of later RPM build attempts.
+    #[serde(default)]
+    pub image_rpm_tag: String,
     #[serde(default, alias = "last_built_at")]
     pub image_built_at: Option<DateTime<Utc>>,
     /// RPM release state: upstream version, ce counter, last `v{version}-ce{N}`
@@ -472,14 +475,19 @@ async fn main() -> Result<()> {
     info!("Starting XOA VM Agent...");
 
     let mut force = false;
+    let mut record_matrix = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--force" => force = true,
+            "--record-matrix" => record_matrix = true,
             other => bail!(
-                "Invalid argument: {} (usage: xoa-vm-agent [--force])",
+                "Invalid argument: {} (usage: xoa-vm-agent [--force | --record-matrix])",
                 other
             ),
         }
+    }
+    if force && record_matrix {
+        bail!("--force and --record-matrix cannot be combined");
     }
     if force {
         info!("FORCE MODE: image-build skip rules will be bypassed.");
@@ -502,6 +510,28 @@ async fn main() -> Result<()> {
     let mut version_state = XoaHlVersionState::load()?;
     let token = load_github_token().context("Failed to load GitHub token")?;
     let client = create_github_client(&token)?;
+
+    if record_matrix {
+        if version_state.image_tag.is_empty() {
+            bail!("--record-matrix needs a saved image");
+        }
+        if !record_image_matrix(
+            &client,
+            &version_state.image_tag,
+            &version_state.image_rpm_tag,
+        )
+        .await?
+        {
+            bail!("saved image has no recorded RPM provenance; do not infer it from current RPM state");
+        }
+        status.status = WorkflowStatus::Success;
+        status.detail = format!(
+            "Recorded image {} in release matrix",
+            version_state.image_tag
+        );
+        status.write_to_file(STATUS_FILE)?;
+        return Ok(());
+    }
 
     // ── PHASE 1: Determine if rebuild is needed ──────────────────────────────
     info!("PHASE 1: Checking if rebuild is needed...");
@@ -550,6 +580,12 @@ async fn main() -> Result<()> {
             &repo_head_sha[..7],
             &build_xoa_hl_head_sha[..7]
         );
+        record_image_matrix(
+            &client,
+            &version_state.image_tag,
+            &version_state.image_rpm_tag,
+        )
+        .await?;
         status.status = WorkflowStatus::Skipped;
         status.detail = format!("No changes (SHA: {})", &repo_head_sha[..7]);
         status.write_to_file(STATUS_FILE)?;
@@ -578,6 +614,11 @@ async fn main() -> Result<()> {
                         "Image {} already published for HEAD (SHA: {}), skipping.",
                         image.tag_name, short_sha
                     );
+                    // A discovered image must identify its own RPM. Mutable RPM state
+                    // can belong to a later failed build and is not image provenance.
+                    record_image_matrix(&client, &image.tag_name, "").await?;
+                    version_state.image_rpm_tag =
+                        parse_image_rpm_tag(&image.body)?.unwrap_or_default();
                     version_state.image_xoa_hl_sha = repo_head_sha.clone();
                     version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
                     version_state.image_tag = image.tag_name.clone();
@@ -959,10 +1000,19 @@ async fn main() -> Result<()> {
     );
     status.write_to_file(STATUS_FILE)?;
 
-    let published = match upload_asset(&client, &upload_url, &release.assets_url, &xva_path).await {
-        Ok(()) => publish_release(&client, &release).await,
-        Err(e) => Err(e),
-    };
+    let published = async {
+        upload_asset(&client, &upload_url, &release.assets_url, &xva_path).await?;
+        // Record only the RPM actually handed to Packer, after its image upload.
+        let rpm_name = Path::new(&config.xoa_hl_rpm_url).file_name()
+            .context("RPM URL has no filename")?.to_string_lossy();
+        let body = format!(
+            "XOA HomeLab Edition VM image\nSource commit (xoa-hl): {}\nSource commit (build-xoa-hl): {}\nxoa-hl RPM tag: `{}`\nxoa-hl RPM: `{}`\n",
+            image_source_sha, build_xoa_hl_head_sha, rpm_tag, rpm_name
+        );
+        client.patch(&release.url).json(&serde_json::json!({ "body": body }))
+            .send().await?.error_for_status()?;
+        publish_release(&client, &release).await
+    }.await;
     let release_url = match published {
         Ok(url) => url,
         Err(e) => {
@@ -988,10 +1038,15 @@ async fn main() -> Result<()> {
     version_state.image_xoa_hl_sha = image_source_sha.clone();
     version_state.image_build_xoa_hl_sha = build_xoa_hl_head_sha.clone();
     version_state.image_tag = image_tag.clone(); // FIX #12: was never set
+    version_state.image_rpm_tag = rpm_tag.clone();
     version_state.image_built_at = Some(Utc::now());
     version_state
         .save()
         .context("Failed to persist version state")?;
+
+    // State is saved before the docs PR. If GitHub/CI fails, the next normal
+    // no-change run (or --record-matrix) retries without rebuilding the XVA.
+    record_image_matrix(&client, &image_tag, &rpm_tag).await?;
 
     // ── PHASE 11: Write final status ──────────────────────────────────────────
     info!("PHASE 11: Finalizing...");
@@ -1007,6 +1062,96 @@ async fn main() -> Result<()> {
 
     info!("XOA VM Agent completed successfully! Tag: {}", image_tag);
     Ok(())
+}
+
+/// Published provenance wins over mutable agent state. Reject malformed/duplicate markers.
+fn parse_image_rpm_tag(body: &str) -> Result<Option<String>> {
+    let markers: Vec<_> = body
+        .lines()
+        .filter(|l| l.starts_with("xoa-hl RPM tag:"))
+        .collect();
+    let filenames: Vec<_> = body
+        .lines()
+        .filter(|l| l.starts_with("xoa-hl RPM:"))
+        .collect();
+    if markers.is_empty() && filenames.is_empty() {
+        return Ok(None);
+    }
+    if markers.len() != 1 {
+        bail!("duplicate image RPM provenance");
+    }
+    if filenames.len() != 1
+        || !filenames[0].starts_with("xoa-hl RPM: `xoa-hl-")
+        || !filenames[0].ends_with(".rpm`")
+    {
+        bail!("missing or malformed image RPM filename");
+    }
+    let tag = markers[0]
+        .strip_prefix("xoa-hl RPM tag: `")
+        .and_then(|v| v.strip_suffix('`'))
+        .context("malformed image RPM provenance")?;
+    if !tag.starts_with('v')
+        || !tag.contains("-ce")
+        || !tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        bail!("invalid image RPM release tag");
+    }
+    Ok(Some(tag.to_string()))
+}
+
+async fn record_image_matrix(
+    client: &reqwest::Client,
+    image_tag: &str,
+    rpm_tag: &str,
+) -> Result<bool> {
+    let release = fetch_release_by_tag(client, "build-xoa-hl", image_tag)
+        .await?
+        .with_context(|| format!("published image {} not found", image_tag))?;
+    if release.draft {
+        bail!("image {} is still a draft", image_tag);
+    }
+    let images: Vec<_> = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name.ends_with(".xva") || asset.name.ends_with(".xva.gz"))
+        .collect();
+    if images.len() != 1 {
+        bail!(
+            "image {} has {} XVA assets; resolve #261 before recording it",
+            image_tag,
+            images.len()
+        );
+    }
+    let published_tag = parse_image_rpm_tag(&release.body)?;
+    let rpm_tag = published_tag.as_deref().unwrap_or(rpm_tag);
+    if rpm_tag.is_empty() {
+        warn!("Image {} predates recorded RPM provenance; leaving its RPM unknown. Rebuild to establish it.", image_tag);
+        return Ok(false);
+    }
+    if let Some(filename) = release.body.lines().find_map(|l| {
+        l.strip_prefix("xoa-hl RPM: `")
+            .and_then(|v| v.strip_suffix('`'))
+    }) {
+        let actual = shared::github::fetch_release_rpm_name(client, "xoa-hl", rpm_tag).await?;
+        if filename != format!("{}.rpm", actual) {
+            bail!(
+                "Image {} RPM filename disagrees with release {}",
+                image_tag,
+                rpm_tag
+            );
+        }
+    }
+    append_xoa_release_matrix_entry(client, image_tag, rpm_tag, &images[0].name).await?;
+    append_changelog_entry(
+        client,
+        "build-xoa-hl",
+        image_tag,
+        &[("build-xoa-hl", image_tag), ("xoa-hl", rpm_tag)],
+    )
+    .await?;
+    Ok(true)
 }
 
 // ── PHASE 2 helpers ───────────────────────────────────────────────────────────
@@ -1429,29 +1574,30 @@ async fn generate_build_files(build_dir: &Path, config: &BuildConfig) -> Result<
     )
     .await?;
 
-    // Copy helper scripts from the synced repo (non-fatal if missing)
-    let scripts = [
-        "scripts/xoa-first-boot.sh",
-        "scripts/xoa-credentials.sh",
-        "systemd/xoa-first-boot.service",
-        "systemd/xoa-credentials.service",
-    ];
-    let repo = Path::new(REPO_DIR);
-    for script in &scripts {
-        let src = repo.join(script);
-        let dst = build_dir.join(script);
-        if src.exists() {
-            async_fs::create_dir_all(dst.parent().unwrap()).await?;
-            async_fs::copy(&src, &dst)
-                .await
-                .with_context(|| format!("Failed to copy {}", script))?;
-            info!("Copied {}", script);
-        } else {
-            warn!("Script not found in repo, skipping: {}", script);
-        }
-    }
+    // Required image security helpers must never be silently skipped.
+    copy_provisioning_files(Path::new(REPO_DIR), build_dir).await?;
 
     info!("Build files generated");
+    Ok(())
+}
+
+async fn copy_provisioning_files(repo: &Path, build_dir: &Path) -> Result<()> {
+    for script in [
+        "scripts/xoa-first-boot.sh",
+        "scripts/xoa-credentials.sh",
+        "scripts/xoa-apply-credentials.mjs",
+        "scripts/xoa-finalize-state.sh",
+        "systemd/xoa-first-boot.service",
+        "systemd/xoa-credentials.service",
+    ] {
+        let src = repo.join(script);
+        let dst = build_dir.join(script);
+        async_fs::create_dir_all(dst.parent().unwrap()).await?;
+        async_fs::copy(&src, &dst)
+            .await
+            .with_context(|| format!("Required provisioning file unavailable: {}", script))?;
+        info!("Copied {}", script);
+    }
     Ok(())
 }
 
@@ -1583,6 +1729,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
     ]}},
     {{"type":"file","source":"scripts/xoa-first-boot.sh","destination":"/root/xoa-first-boot.sh"}},
     {{"type":"file","source":"scripts/xoa-credentials.sh","destination":"/root/xoa-credentials.sh"}},
+    {{"type":"file","source":"scripts/xoa-apply-credentials.mjs","destination":"/root/xoa-apply-credentials.mjs"}},
+    {{"type":"file","source":"scripts/xoa-finalize-state.sh","destination":"/root/xoa-finalize-state.sh"}},
     {{"type":"file","source":"systemd/xoa-first-boot.service","destination":"/etc/systemd/system/xoa-first-boot.service"}},
     {{"type":"file","source":"systemd/xoa-credentials.service","destination":"/etc/systemd/system/xoa-credentials.service"}},
     {{"type":"shell","inline":[
@@ -1600,7 +1748,8 @@ fn generate_packer_template(config: &BuildConfig) -> String {
       "rm -rf /var/cache/dnf/ /var/log/*.log /var/log/journal/* /var/lib/dnf/history* /usr/share/doc/* /usr/share/man/* /usr/share/info/* /usr/share/licenses/*",
       "rm -f /boot/*rescue*",
       "echo -n > /etc/machine-id"
-    ]}}
+    ]}},
+    {{"type":"shell","inline":["bash /root/xoa-finalize-state.sh"]}}
   ]
 }}"#,
         xcpng_ip = config.xcpng_ip,
@@ -2110,11 +2259,22 @@ async fn create_github_release(
         .json()
         .await
         .context("Failed to parse the release list")?;
-    if let Some(r) = releases.into_iter().find(|r| r.tag_name == tag) {
+    if let Some(mut r) = releases.into_iter().find(|r| r.tag_name == tag) {
         info!(
             "Release {} already exists (draft: {}), reusing: {}",
             tag, r.draft, r.html_url
         );
+        // Hide a release while replacing its image and provenance together.
+        if !r.draft {
+            r = client
+                .patch(&r.url)
+                .json(&serde_json::json!({ "draft": true }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+        }
         return Ok(r);
     }
 
@@ -2166,7 +2326,7 @@ async fn publish_release(client: &reqwest::Client, release: &ReleaseHandle) -> R
     }
     let published: Published = client
         .patch(&release.url)
-        .json(&serde_json::json!({ "draft": false }))
+        .json(&serde_json::json!({ "draft": false, "make_latest": "true" }))
         .send()
         .await
         .context("Failed to publish the release")?
@@ -2196,25 +2356,23 @@ struct Asset {
     state: String,
 }
 
-/// Release asset name of the image, fixed so a rebuild replaces it (Vagrantin/xcp-hl#261).
-fn image_asset_name(local_name: &str) -> &'static str {
-    if local_name.ends_with(".xva.gz") {
-        "XOA-hl.xva.gz"
+/// The published URL must be independent of Packer's per-job VM/XVA name.
+fn canonical_image_asset_name(path: &Path) -> Result<&'static str> {
+    let name = path
+        .file_name()
+        .context("XVA path has no filename")?
+        .to_string_lossy();
+    if name.ends_with(".xva.gz") {
+        Ok("XOA-hl.xva.gz")
+    } else if name.ends_with(".xva") {
+        Ok("XOA-hl.xva")
     } else {
-        "XOA-hl.xva"
+        bail!("Unsupported XVA asset extension: {}", name)
     }
 }
 
 fn is_image_asset(name: &str) -> bool {
     name.ends_with(".xva") || name.ends_with(".xva.gz")
-}
-
-/// Uploaded images other than `keep`: earlier builds under another name, removed once `keep` is in place.
-fn superseded_images<'a>(assets: &'a [Asset], keep: &str) -> Vec<&'a Asset> {
-    assets
-        .iter()
-        .filter(|a| a.state == "uploaded" && a.name != keep && is_image_asset(&a.name))
-        .collect()
 }
 
 /// Uploads the XVA, retrying a failed attempt from scratch.
@@ -2262,17 +2420,10 @@ async fn upload_asset_once(
         .with_context(|| format!("Cannot stat {}", xva_path.display()))?
         .len();
 
-    let local_name = xva_path
-        .file_name()
-        .context("XVA path has no filename")?
-        .to_string_lossy()
-        .to_string();
-    // The local file is named after the per-build VM; the release asset keeps one name.
-    let file_name = image_asset_name(&local_name).to_string();
+    let file_name = canonical_image_asset_name(xva_path)?;
 
     info!(
-        "Uploading {} as {} ({:.2} GB)...",
-        local_name,
+        "Uploading {} ({:.2} GB)...",
         file_name,
         file_size as f64 / (1024.0_f64.powi(3))
     );
@@ -2313,7 +2464,7 @@ async fn upload_asset_once(
     let upload_name = if old.is_some() {
         temp_name.as_str()
     } else {
-        file_name.as_str()
+        file_name
     };
 
     let file = async_fs::File::open(xva_path)
@@ -2336,11 +2487,11 @@ async fn upload_asset_once(
         bail!("GitHub asset upload failed ({}): {}", code, body);
     }
 
+    let new: Asset = res
+        .json()
+        .await
+        .context("Failed to parse the uploaded asset")?;
     if let Some(old) = old {
-        let new: Asset = res
-            .json()
-            .await
-            .context("Failed to parse the uploaded asset")?;
         client
             .delete(&old.url)
             .send()
@@ -2359,7 +2510,15 @@ async fn upload_asset_once(
             file_name, old.id, new.id
         );
     }
-    for stale in superseded_images(&existing, &file_name) {
+    // A previous build may have uploaded qa-xoa-build-N.xva or xoa-almalinux.xva.
+    // Once the canonical asset is complete, remove every other image so XO Lite's
+    // first-XVA selection cannot resolve an older build (#261).
+    for stale in existing.iter().filter(|a| {
+        a.state == "uploaded"
+            && is_image_asset(&a.name)
+            && a.id != new.id
+            && old.map(|o| o.id) != Some(a.id)
+    }) {
         client
             .delete(&stale.url)
             .send()
@@ -2367,11 +2526,11 @@ async fn upload_asset_once(
             .error_for_status()
             .with_context(|| {
                 format!(
-                    "Failed to delete superseded image {} ({})",
+                    "Failed to remove superseded XVA {} ({})",
                     stale.name, stale.id
                 )
             })?;
-        info!("Deleted superseded image {} ({})", stale.name, stale.id);
+        info!("Removed superseded XVA {} ({})", stale.name, stale.id);
     }
     Ok(())
 }
@@ -2384,6 +2543,27 @@ async fn upload_asset_once(
 mod tests {
     use super::*;
     use shared::ReleaseAsset;
+
+    #[test]
+    fn published_asset_name_is_stable_across_build_vm_names() {
+        assert_eq!(
+            canonical_image_asset_name(Path::new("XOA-hl.xva")).unwrap(),
+            "XOA-hl.xva"
+        );
+        assert_eq!(
+            canonical_image_asset_name(Path::new("qa-xoa-build-36.xva")).unwrap(),
+            "XOA-hl.xva"
+        );
+        assert_eq!(
+            canonical_image_asset_name(Path::new("qa-xoa-build-37.xva")).unwrap(),
+            "XOA-hl.xva"
+        );
+        assert_eq!(
+            canonical_image_asset_name(Path::new("qa-xoa-build-38.xva.gz")).unwrap(),
+            "XOA-hl.xva.gz"
+        );
+        assert!(canonical_image_asset_name(Path::new("qa-xoa-build-39.txt")).is_err());
+    }
 
     fn release(tag: &str, asset_names: &[&str]) -> ReleaseInfo {
         release_with_body(tag, asset_names, "")
@@ -2456,33 +2636,22 @@ mod tests {
     }
 
     #[test]
-    fn image_asset_name_is_fixed_whatever_the_build_vm() {
-        assert_eq!(image_asset_name("qa-xoa-build-48.xva"), "XOA-hl.xva");
-        assert_eq!(image_asset_name("XOA-hl.xva"), "XOA-hl.xva");
-        assert_eq!(image_asset_name("qa-xoa-build-7.xva.gz"), "XOA-hl.xva.gz");
-    }
-
-    #[test]
-    fn superseded_images_are_other_uploaded_images_only() {
-        let asset = |id, name: &str, state: &str| Asset {
-            id,
-            name: name.to_string(),
-            url: format!("https://api.example/assets/{}", id),
-            state: state.to_string(),
+    fn image_provenance_is_optional_for_legacy_but_strict_when_present() {
+        assert_eq!(parse_image_rpm_tag("old image").unwrap(), None);
+        assert_eq!(parse_image_rpm_tag("xoa-hl RPM tag: `v5.113.2_e281c536-ce47`\nxoa-hl RPM: `xoa-hl-5.113.2_e281c536-47.gca44911.xcpng8.3.el9.x86_64.rpm`").unwrap(), Some("v5.113.2_e281c536-ce47".into()));
+        assert!(parse_image_rpm_tag("xoa-hl RPM tag: `v5.113.2_e281c536-ce47`").is_err());
+        assert!(parse_image_rpm_tag("xoa-hl RPM tag: broken").is_err());
+        assert!(parse_image_rpm_tag("xoa-hl RPM tag: `v1-ce1`\nxoa-hl RPM tag: `v1-ce2`").is_err());
+        // The image pin is serialized independently of the mutable RPM state.
+        let mut state = XoaHlVersionState {
+            image_rpm_tag: "v1-ce1".into(),
+            ..Default::default()
         };
-        let assets = vec![
-            asset(1, "qa-xoa-build-36.xva", "uploaded"),
-            asset(2, "qa-xoa-build-37.xva", "uploaded"),
-            asset(3, "XOA-hl.xva", "uploaded"),
-            asset(4, "XOA-hl.xva.new", "uploaded"),
-            asset(5, "qa-xoa-build-38.xva", "starter"),
-            asset(6, "SHA256SUMS", "uploaded"),
-        ];
-        let ids: Vec<u64> = superseded_images(&assets, "XOA-hl.xva")
-            .iter()
-            .map(|a| a.id)
-            .collect();
-        assert_eq!(ids, vec![1, 2]);
+        state.rpm.last_tag = "v1-ce2".into();
+        let restored: XoaHlVersionState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.image_rpm_tag, "v1-ce1");
+        assert_eq!(restored.rpm.last_tag, "v1-ce2");
     }
 
     #[test]
@@ -2721,6 +2890,34 @@ VM_MEMORY_MB="4096"
         let json: serde_json::Value =
             serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
         assert_eq!(json["builders"][0]["keep_vm"], "always");
+    }
+
+    #[tokio::test]
+    async fn provisioning_files_are_required_and_finalization_is_last() {
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_packer_template(&BuildConfig::default())).unwrap();
+        let steps = json["provisioners"].as_array().unwrap();
+        assert_eq!(
+            steps.last().unwrap()["inline"][0],
+            "bash /root/xoa-finalize-state.sh"
+        );
+        let root = std::env::temp_dir().join(format!("provisioning-test-{}", std::process::id()));
+        let repo = root.join("repo");
+        let output = root.join("build");
+        for step in steps.iter().filter(|s| s["type"] == "file") {
+            let path = repo.join(step["source"].as_str().unwrap());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fixture").unwrap();
+        }
+        copy_provisioning_files(&repo, &output).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output.join("scripts/xoa-apply-credentials.mjs")).unwrap(),
+            "fixture"
+        );
+        std::fs::remove_file(repo.join("scripts/xoa-apply-credentials.mjs")).unwrap();
+        let error = copy_provisioning_files(&repo, &output).await.unwrap_err();
+        assert!(error.to_string().contains("xoa-apply-credentials.mjs"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

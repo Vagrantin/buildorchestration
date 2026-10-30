@@ -2,17 +2,26 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
-## 2026-10-23 (xcp-orchestrator-v0.3.10)
+## Unreleased
 
-### Fixed
+- **xoa-vm-agent**: resolve the older #261 change against the canonical asset
+  naming and superseded-image cleanup already shipped in the provenance work.
+  Preserve strict extension validation and cover an already canonical XVA name.
 
-- **xoa-vm-agent**: the image is uploaded as `XOA-hl.xva` (`XOA-hl.xva.gz`
-  when compressed), whatever the local Packer file is called. Since the build
-  VM is named `qa-xoa-build-<N>` (Vagrantin/jenkins-infra#96), each rebuild
-  added a second image to the same `xoa-image-*` release. Other uploaded
-  images on that release are now deleted once the new one is in place, so
-  Deploy XOA, which takes the first `.xva`, cannot pick an older build
-  (Vagrantin/xcp-hl#261).
+- **xoa-vm-agent**: copy the required credential RPC/finalizer helpers and run
+  finalization last in the production Packer template (xcp-hl#310/#311). Missing
+  provisioning sources now fail build preparation. Pair with the image
+  provisioning fix in build-xoa-hl; release the agent and repin Jenkins before
+  producing the fixed XVA. No existing appliance data is removed.
+
+## Unreleased — release matrix provenance (xcp-hl#15)
+
+- Record the exact consumed xoa-hl RPM tag/filename in each image release after
+  upload. Hide releases while replacing their image and provenance together.
+- Persist the image RPM pin independently of later RPM build attempts. Retries
+  prefer published provenance and never assign current RPM state to an old image.
+- Enrich incomplete ISO/XOA rows instead of skipping them. Preserve annotations
+  and neighbours; refuse conflicting package identities.
 
 ## 2026-10-12 (xcp-orchestrator-v0.3.9)
 

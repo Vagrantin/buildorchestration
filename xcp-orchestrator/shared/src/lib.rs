@@ -27,6 +27,8 @@ pub const DOCS_REPO: &str = "xcp-hl";
 
 /// Path to releases data file in docs repo
 pub const RELEASES_DATA_PATH: &str = "docs/_data/releases.yml";
+pub const XOA_RELEASES_DATA_PATH: &str = "docs/_data/xoa_releases.yml";
+pub const CHANGELOG_DATA_PATH: &str = "docs/_data/changelog.json";
 
 /// Target XCP-ng base release version
 pub const XCPNG_TARGET_VERSION: &str = "8.3";
@@ -64,6 +66,9 @@ pub enum OrchestratorError {
 
     #[error("{0}")]
     BumpCheckFailed(String),
+
+    #[error("{0}")]
+    ComponentBuildFailed(String),
 
     #[error("Invalid version format: {0}")]
     VersionFormat(String),
