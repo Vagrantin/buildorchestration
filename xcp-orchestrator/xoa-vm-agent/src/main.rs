@@ -2547,6 +2547,10 @@ mod tests {
     #[test]
     fn published_asset_name_is_stable_across_build_vm_names() {
         assert_eq!(
+            canonical_image_asset_name(Path::new("XOA-hl.xva")).unwrap(),
+            "XOA-hl.xva"
+        );
+        assert_eq!(
             canonical_image_asset_name(Path::new("qa-xoa-build-36.xva")).unwrap(),
             "XOA-hl.xva"
         );

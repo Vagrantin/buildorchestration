@@ -4,6 +4,10 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 
 ## Unreleased
 
+- **xoa-vm-agent**: resolve the older #261 change against the canonical asset
+  naming and superseded-image cleanup already shipped in the provenance work.
+  Preserve strict extension validation and cover an already canonical XVA name.
+
 - **xoa-vm-agent**: copy the required credential RPC/finalizer helpers and run
   finalization last in the production Packer template (xcp-hl#310/#311). Missing
   provisioning sources now fail build preparation. Pair with the image
