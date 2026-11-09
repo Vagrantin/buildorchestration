@@ -960,6 +960,16 @@ async fn main() -> Result<()> {
     };
     info!("XVA located: {}", xva_path.display());
 
+    // Packer retains the diagnostic build VM name in ova.xml (#291).
+    // Normalize the artifact before any release/upload; the live VM keeps its name.
+    if let Err(e) = normalize_xva_label(&xva_path).await {
+        status.status = WorkflowStatus::Failure;
+        status.detail = format!("XVA label normalization failed: {:#}", e);
+        status.write_to_file(STATUS_FILE)?;
+        return Err(e);
+    }
+
+
     // ── PHASE 9: Create release and upload XVA ────────────────────────────────
     // FIX #11: was calling upload_to_github_release() which assumed a release
     //          already existed. Now we explicitly create (or reuse) one first.
@@ -1788,6 +1798,30 @@ fn generate_packer_template(config: &BuildConfig) -> String {
 // ── PHASE 7: Run Packer ───────────────────────────────────────────────────────
 
 /// Runs Packer; returns the uuid of the VM it created, read from its "Created instance" line.
+/// Stream-rewrite only ova.xml, preserving disk/checksum bytes and gzip mode.
+/// Embedded in the agent so a stale build-xoa-hl checkout cannot omit the fix.
+async fn normalize_xva_label(path: &Path) -> Result<()> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(900),
+        AsyncCommand::new("python3")
+            .args(["-I", "-c", include_str!("normalize_xva.py")])
+            .arg(path)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("XVA label normalization timed out")?
+    .context("Failed to run XVA label normalizer")?;
+    if !output.status.success() {
+        bail!(
+            "XVA label normalization failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    info!("{}", String::from_utf8_lossy(&output.stdout).trim());
+    Ok(())
+}
+
 async fn run_packer(build_dir: &Path) -> Result<Option<String>> {
     let packer_file = build_dir.join("almalinux-build.json");
 
@@ -2883,6 +2917,19 @@ VM_MEMORY_MB="4096"
     fn build_config_load_from_missing_path_uses_defaults() {
         let config = BuildConfig::load_from("/nonexistent/xoa-build.config").unwrap();
         assert_eq!(config.xcpng_ip, BuildConfig::default().xcpng_ip);
+    }
+
+    #[test]
+    fn exported_vm_label_and_disk_payload_regressions() {
+        let status = std::process::Command::new("python3")
+            .arg("-I")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/test_normalize_xva.py"
+            ))
+            .status()
+            .expect("python3 is required by the image builder");
+        assert!(status.success());
     }
 
     #[test]
