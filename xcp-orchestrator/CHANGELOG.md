@@ -2,6 +2,14 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 0.3.9.2 (xcp-orchestrator-v0.3.9.2, xoa-vm-agent only)
+
+Release branch release/xoa-vm-agent-0.3.9.2: 0.3.9.1 plus buildorchestration#43
+only. Later changes on main are not part of it.
+
+- **xoa-vm-agent**: published images carry the VM name `XOA-hl` instead of the
+  build VM's name (xcp-hl#291). Disk data and the build VM are unchanged.
+
 ## 0.3.9.1 (xcp-orchestrator-v0.3.9.1, xoa-vm-agent only)
 
 Release branch release/xoa-vm-agent-0.3.9.1: xcp-orchestrator-v0.3.9 plus the
