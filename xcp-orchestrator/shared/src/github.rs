@@ -1379,6 +1379,8 @@ pub async fn fetch_iso_release_rpm_provenance(
 }
 
 /// Append an entry to the release matrix
+// One argument per matrix column.
+#[allow(clippy::too_many_arguments)]
 pub async fn append_release_matrix_entry(
     client: &Client,
     iso_tag: &str,
@@ -1972,7 +1974,7 @@ async fn previous_release_time(
                 continue;
             }
             if let Some(time) = item["published_at"].as_str() {
-                if time < published && previous.as_deref().map_or(true, |old| time > old) {
+                if time < published && previous.as_deref().is_none_or(|old| time > old) {
                     previous = Some(time.to_string());
                 }
             }
@@ -1989,11 +1991,11 @@ async fn previous_release_time(
 fn changelog_changes(repo: &str, items: &[serde_json::Value]) -> Vec<serde_json::Value> {
     let mut changes = Vec::new();
     for item in items {
-        if item["labels"].as_array().map_or(false, |labels| {
+        if item["labels"].as_array().is_some_and(|labels| {
             labels.iter().any(|label| {
                 label["name"]
                     .as_str()
-                    .map_or(false, |name| name.eq_ignore_ascii_case("skip-changelog"))
+                    .is_some_and(|name| name.eq_ignore_ascii_case("skip-changelog"))
             })
         }) {
             continue;
@@ -2003,7 +2005,7 @@ fn changelog_changes(repo: &str, items: &[serde_json::Value]) -> Vec<serde_json:
         };
         let prefix = format!("https://github.com/{}/{}/pull/", OWNER, repo);
         if !title.trim().is_empty()
-            && url.strip_prefix(&prefix).map_or(false, |number| {
+            && url.strip_prefix(&prefix).is_some_and(|number| {
                 !number.is_empty()
                     && number.bytes().all(|b| b.is_ascii_digit())
                     && !number.starts_with('0')
