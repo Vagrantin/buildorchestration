@@ -4,6 +4,10 @@ All notable changes to the XCP-orchestrator workspace are documented in this fil
 
 ## Unreleased
 
+- **xoa-vm-agent**: check free disk space before pushing the xoa-hl RPM tag, not
+  only after. Jenkins build #93 published an RPM, then had no room for its image.
+  The failure message shows one decimal; unreadable `df` output is an error.
+
 - **xoa-vm-agent**: resolve the older #261 change against the canonical asset
   naming and superseded-image cleanup already shipped in the provenance work.
   Preserve strict extension validation and cover an already canonical XVA name.

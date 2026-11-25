@@ -646,6 +646,15 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Before any tag: run #93 published an RPM, then had no room for its image.
+    if let Err(e) = check_disk_space(config.min_free_disk_gb).await {
+        error!("Not starting the build: {:#}", e);
+        status.status = WorkflowStatus::Failure;
+        status.detail = format!("Not started, no RPM tag pushed: {:#}", e);
+        status.write_to_file(STATUS_FILE)?;
+        return Err(e);
+    }
+
     // ── PHASE 2: Ensure an RPM release exists for HEAD ────────────────────────
     info!("PHASE 2: Resolving the xoa-hl RPM release...");
     status.phase = "phase_2_rpm_release".to_string();
@@ -834,6 +843,7 @@ async fn main() -> Result<()> {
     };
 
     // ── PHASE 3: Validate prerequisites ──────────────────────────────────────
+    // Includes the disk again: waiting for the RPM build can take hours.
     info!("PHASE 3: Validating prerequisites...");
     status.phase = "phase_3_validate_prerequisites".to_string();
     status.write_to_file(STATUS_FILE)?;
@@ -1330,6 +1340,58 @@ async fn wait_for_workflow(
     }
 }
 
+// ── Disk space ───────────────────────────────────────────────────────────────
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Nearest existing ancestor: on a fresh host the build directory comes later.
+fn existing_ancestor(path: &Path) -> &Path {
+    path.ancestors()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| Path::new("/"))
+}
+
+/// Available bytes from `df -Pk` output (one header line, one data line).
+fn parse_df_available(df_text: &str) -> Result<u64> {
+    let avail_kb = df_text
+        .lines()
+        .nth(1)
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|field| field.parse::<u64>().ok())
+        .with_context(|| format!("Unreadable df output: {:?}", df_text))?;
+    Ok(avail_kb * 1024)
+}
+
+fn require_free_space(avail_bytes: u64, min_free_disk_gb: u64) -> Result<()> {
+    if avail_bytes < min_free_disk_gb * GIB {
+        bail!(
+            "Insufficient disk space, required {}GB, have {:.1}GB",
+            min_free_disk_gb,
+            // Rounded down, so a failing value never prints as the minimum.
+            (avail_bytes as f64 / GIB as f64 * 10.0).floor() / 10.0,
+        );
+    }
+    Ok(())
+}
+
+async fn check_disk_space(min_free_disk_gb: u64) -> Result<()> {
+    info!("Checking disk space...");
+    let df_out = AsyncCommand::new("df")
+        .arg("-Pk")
+        .arg(existing_ancestor(Path::new(BUILD_DIR)))
+        .output()
+        .await
+        .context("Failed to run df")?;
+    if !df_out.status.success() {
+        bail!("df failed: {}", String::from_utf8_lossy(&df_out.stderr));
+    }
+
+    let avail_bytes = parse_df_available(&String::from_utf8_lossy(&df_out.stdout))?;
+    require_free_space(avail_bytes, min_free_disk_gb)?;
+    info!("Disk: {}GB available", avail_bytes / GIB);
+    Ok(())
+}
+
 // ── PHASE 3: Validate Prerequisites ──────────────────────────────────────────
 
 async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
@@ -1374,31 +1436,7 @@ async fn validate_prerequisites(min_free_disk_gb: u64) -> Result<()> {
     }
     info!("xenserver plugin: present");
 
-    // Check disk space
-    info!("Checking disk space...");
-    let df_out = AsyncCommand::new("df")
-        .arg("-k")
-        .arg(BUILD_DIR)
-        .output()
-        .await
-        .context("Failed to run df")?;
-
-    let df_text = String::from_utf8_lossy(&df_out.stdout);
-    if let Some(line) = df_text.lines().nth(1) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 {
-            let avail_kb: u64 = parts[3].parse().unwrap_or(0);
-            let avail_bytes = avail_kb * 1024;
-            if avail_bytes < min_free_disk_gb * 1024 * 1024 * 1024 {
-                bail!(
-                    "Insufficient disk space, required {}GB, have {}GB",
-                    min_free_disk_gb,
-                    avail_bytes / (1024 * 1024 * 1024),
-                );
-            }
-            info!("Disk: {}GB available", avail_bytes / (1024 * 1024 * 1024));
-        }
-    }
+    check_disk_space(min_free_disk_gb).await?;
 
     // FIX #14: was a stub that unconditionally logged "port available".
     //          Now attempts a real bind; if the port is already in use the bind fails.
@@ -2868,6 +2906,52 @@ VM_MEMORY_MB="4096"
             config.xe_guest_utilities_xenstore_url,
             d.xe_guest_utilities_xenstore_url
         );
+    }
+
+    #[test]
+    fn df_available_is_read_in_bytes() {
+        let df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                  /dev/mapper/vg-root 73334784 52936692 20398108 73% /\n";
+        assert_eq!(parse_df_available(df).unwrap(), 20_398_108 * 1024);
+    }
+
+    #[test]
+    fn unreadable_df_output_is_an_error_not_a_pass() {
+        assert!(parse_df_available("").is_err());
+        assert!(parse_df_available("Filesystem 1024-blocks\n").is_err());
+        assert!(parse_df_available("h\n/dev/x 1 2 - 3% /\n").is_err());
+    }
+
+    #[test]
+    fn free_space_boundary_and_message() {
+        assert!(require_free_space(20 * GIB, 20).is_ok());
+        assert!(require_free_space(20 * GIB - 1, 20).is_err());
+        // The free space that failed build/xoa-vm-agent #93.
+        let msg = require_free_space(20_888_662_016, 20)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("required 20GB, have 19.4GB"), "{msg}");
+        // Never prints the minimum as the failing value.
+        let msg = require_free_space(20 * GIB - 1, 20)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("have 19.9GB"), "{msg}");
+    }
+
+    #[test]
+    fn disk_is_checked_before_the_rpm_tag() {
+        let source = include_str!("main.rs");
+        let body = &source[source.find("async fn main()").unwrap()..];
+        let check = body.find("check_disk_space(").unwrap();
+        let tag = body.find("create_and_push_tag(").unwrap();
+        assert!(check < tag, "a run without room must not push a tag");
+    }
+
+    #[test]
+    fn missing_build_directory_falls_back_to_its_parent() {
+        let dir = std::env::temp_dir();
+        assert_eq!(existing_ancestor(&dir.join("no-such-dir/a/b")), dir);
+        assert_eq!(existing_ancestor(&dir), dir);
     }
 
     #[test]
