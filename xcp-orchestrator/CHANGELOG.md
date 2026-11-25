@@ -2,6 +2,20 @@
 
 All notable changes to the XCP-orchestrator workspace are documented in this file.
 
+## 0.3.9.3 (xcp-orchestrator-v0.3.9.3, xoa-vm-agent only)
+
+Release branch release/xoa-vm-agent-0.3.9.3: main at buildorchestration#43 and #46,
+so it also carries every Unreleased entry below.
+
+- **xoa-vm-agent**: check free disk space before pushing the xoa-hl RPM tag, not
+  only after (buildorchestration#46). Jenkins build #93 published an RPM, then had
+  no room for its image. The failure message shows one decimal, rounded down;
+  unreadable `df` output is now an error.
+
+- **xoa-vm-agent**: published images carry the VM name `XOA-hl` instead of the
+  build VM's name (buildorchestration#43, xcp-hl#291). Disk data and the build VM
+  are unchanged.
+
 ## Unreleased
 
 - **xoa-vm-agent**: check free disk space before pushing the xoa-hl RPM tag, not
